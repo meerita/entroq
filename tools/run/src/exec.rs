@@ -14,6 +14,10 @@
 //! directory is inside the run record and never inside the repository. An unrecorded tier
 //! sets nothing, and a tool that finds nothing set writes no artifact.
 //!
+//! A preparation command and a host-tool probe are the two things here that no budget covers
+//! and no record captures. A preparation command builds what a segment then measures, so a
+//! compile does not spend the budget the segment needs for the work it records.
+//!
 //! This module does not own the budget. It enforces the one it is given.
 
 use std::ffi::OsString;
@@ -31,6 +35,44 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The variable that names the directory a segment's evidence goes to.
 pub const SEGMENT_DIR: &str = "ENTROQ_SEGMENT_DIR";
+
+/// One step, resolved to the exact argv it runs.
+///
+/// A static segment states its argv at compile time. A segment the caller composes states
+/// paths it learns at run time, such as the corpus directory one fuzz invocation reads.
+pub struct Invocation {
+    program: String,
+    args: Vec<String>,
+}
+
+impl Invocation {
+    pub fn new(program: &str, args: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            program: String::from(program),
+            args: args.into_iter().collect(),
+        }
+    }
+
+    fn of(step: &Step) -> Self {
+        Self::new(step.program, step.args.iter().map(|arg| String::from(*arg)))
+    }
+
+    /// The exact argv, program first, in the shape a manifest records it.
+    pub fn argv(&self) -> Vec<String> {
+        let mut argv = vec![self.program.clone()];
+        argv.extend(self.args.iter().cloned());
+        argv
+    }
+
+    fn describe(&self) -> String {
+        let mut line = self.program.clone();
+        for arg in &self.args {
+            line.push(' ');
+            line.push_str(arg);
+        }
+        line
+    }
+}
 
 /// Where a segment's raw output goes.
 ///
@@ -80,7 +122,24 @@ pub fn run_segment(
     budget: Duration,
     output: &Output,
 ) -> Result<(Outcome, Duration)> {
-    let logs = open_output(segment, output)?;
+    let steps: Vec<Invocation> = segment.steps.iter().map(Invocation::of).collect();
+    run_steps(&steps, working_dir, budget, output)
+}
+
+/// Runs every step in order, stopping at the first step that does not pass.
+///
+/// This is `run_segment` for a segment the caller composed rather than declared.
+///
+/// # Errors
+///
+/// Fails when the output directory cannot be written or a step cannot be started.
+pub fn run_steps(
+    steps: &[Invocation],
+    working_dir: &Path,
+    budget: Duration,
+    output: &Output,
+) -> Result<(Outcome, Duration)> {
+    let logs = open_output(steps, output)?;
 
     let evidence = match output {
         Output::Directory(dir) => Some(dir.as_path()),
@@ -88,7 +147,7 @@ pub fn run_segment(
     };
 
     let started = Instant::now();
-    for step in segment.steps {
+    for step in steps {
         let remaining = budget.saturating_sub(started.elapsed());
         let outcome = run_step(step, working_dir, remaining, logs.as_ref(), evidence)?;
         if !outcome.is_pass() {
@@ -98,8 +157,50 @@ pub fn run_segment(
     Ok((Outcome::Pass, started.elapsed()))
 }
 
+/// Runs one preparation command to completion, and reports whether it succeeded.
+///
+/// A preparation command is not a validation step, so no budget covers it and nothing
+/// records it. Its output goes to the terminal.
+///
+/// # Errors
+///
+/// Fails when the command cannot be started or waited for.
+pub fn prepare(invocation: &Invocation, working_dir: &Path) -> Result<bool> {
+    let description = invocation.describe();
+    Command::new(resolve(&invocation.program))
+        .args(&invocation.args)
+        .current_dir(working_dir)
+        .stdin(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .map_err(|e| Error::io(format!("run `{description}`"), e))
+}
+
+/// Runs one command with its output discarded, and reports whether it succeeded.
+///
+/// This is how the runner asks whether a host tool is present before it depends on one.
+///
+/// # Errors
+///
+/// Fails when the command cannot be started or waited for. A command that is absent is not
+/// an error here: it is a `false`.
+pub fn probe(invocation: &Invocation, working_dir: &Path) -> Result<bool> {
+    match Command::new(resolve(&invocation.program))
+        .args(&invocation.args)
+        .current_dir(working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) => Ok(status.success()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(Error::io(format!("run `{}`", invocation.describe()), e)),
+    }
+}
+
 /// Prepares the raw-output destination, and records the exact argv a directory captures.
-fn open_output(segment: &Segment, output: &Output) -> Result<Option<(File, File)>> {
+fn open_output(steps: &[Invocation], output: &Output) -> Result<Option<(File, File)>> {
     let Output::Directory(dir) = output else {
         return Ok(None);
     };
@@ -109,10 +210,9 @@ fn open_output(segment: &Segment, output: &Output) -> Result<Option<(File, File)
         std::fs::remove_dir_all(dir).map_err(|e| Error::at("clear", dir, e))?;
     }
     std::fs::create_dir_all(dir).map_err(|e| Error::at("create", dir, e))?;
-    let commands = segment
-        .steps
+    let commands = steps
         .iter()
-        .map(describe)
+        .map(Invocation::describe)
         .collect::<Vec<_>>()
         .join("\n");
     let command_path = dir.join("command.txt");
@@ -125,13 +225,13 @@ fn open_output(segment: &Segment, output: &Output) -> Result<Option<(File, File)
 }
 
 fn run_step(
-    step: &Step,
+    step: &Invocation,
     working_dir: &Path,
     budget: Duration,
     logs: Option<&(File, File)>,
     evidence: Option<&Path>,
 ) -> Result<Outcome> {
-    let description = describe(step);
+    let description = step.describe();
     if budget.is_zero() {
         return Ok(Outcome::Timeout { step: description });
     }
@@ -140,9 +240,9 @@ fn run_step(
         Some((out, err)) => (clone_log(out, &description)?, clone_log(err, &description)?),
         None => (Stdio::inherit(), Stdio::inherit()),
     };
-    let mut command = Command::new(resolve(step.program));
+    let mut command = Command::new(resolve(&step.program));
     let _ = command
-        .args(step.args)
+        .args(&step.args)
         .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(out)
@@ -199,15 +299,6 @@ pub fn resolve(program: &str) -> OsString {
     OsString::from(program)
 }
 
-fn describe(step: &Step) -> String {
-    let mut line = String::from(step.program);
-    for arg in step.args {
-        line.push(' ');
-        line.push_str(arg);
-    }
-    line
-}
-
 fn open_log(path: &Path) -> Result<File> {
     OpenOptions::new()
         .create(true)
@@ -224,7 +315,7 @@ fn clone_log(file: &File, description: &str) -> Result<Stdio> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Outcome, Output, describe, run_segment};
+    use super::{Invocation, Outcome, Output, run_segment};
     use crate::tier::{Segment, Step};
     use std::path::Path;
     use std::time::Duration;
@@ -235,7 +326,10 @@ mod tests {
             program: "cargo",
             args: &["fmt", "--all", "--", "--check"],
         };
-        assert_eq!(describe(&step), "cargo fmt --all -- --check");
+        assert_eq!(
+            Invocation::of(&step).describe(),
+            "cargo fmt --all -- --check"
+        );
     }
 
     #[test]

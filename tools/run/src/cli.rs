@@ -18,7 +18,9 @@ entroq-run: the Entroq validation runner.
 Usage:
   entroq-run run    --tier <tier> [--suite <suite>] [--runs <dir>] [--topic <name>]
   entroq-run resume --tier <tier> [--suite <suite>]  --runs <dir>
-  entroq-run fuzz   --target <name> --runs <dir>
+  entroq-run fuzz list
+  entroq-run fuzz build --target <name>
+  entroq-run fuzz run   --target <name> --runs <dir>
   entroq-run help
 
 Tiers:
@@ -50,6 +52,14 @@ and the budget does not move to accommodate it.
 --runs is required for every recorded tier. Its record lands in
 <runs>/<tier>/<date>-<NN>-<topic>/ and never inside the repository.
 
+Fuzzing is cumulative, not long. `fuzz run` advances one target by one bounded segment and
+stops. Its corpus lives at <runs>/fuzz-corpus/<target>/, and a crash reproducer lands at
+<runs>/fuzz-corpus/<target>/artifacts/. Both are outside the repository, and both survive
+the invocation. Never delete a corpus to start clean: it is coverage that many segments
+already paid for. `fuzz build` compiles one driver, so the segment that follows spends its
+budget on fuzzing rather than on a compiler. `fuzz list` states every target and whether a
+driver exists for it.
+
 Every segment of a recorded campaign is given ENTROQ_SEGMENT_DIR, the directory its raw
 output and any artifact it produces belong in. A benchmark segment writes its result document
 there. No segment writes inside the repository.
@@ -74,6 +84,16 @@ pub enum Mode {
     Resume,
 }
 
+/// A fuzz action the runner was asked to take.
+pub enum Fuzz {
+    /// State every target and whether a driver exists for it.
+    List,
+    /// Compile one driver.
+    Build { target: String },
+    /// Advance one target by one bounded segment.
+    Advance { target: String, runs: PathBuf },
+}
+
 /// A campaign the runner was asked to run.
 pub struct Request {
     pub tier: Tier,
@@ -84,12 +104,8 @@ pub struct Request {
 
 pub enum Invocation {
     Help,
-    Campaign {
-        request: Request,
-        mode: Mode,
-    },
-    /// The runner recognizes the request, and this revision cannot serve it.
-    Unavailable(String),
+    Campaign { request: Request, mode: Mode },
+    Fuzz(Fuzz),
 }
 
 /// Parses an invocation.
@@ -105,11 +121,64 @@ pub fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
         "help" | "--help" | "-h" => Ok(Invocation::Help),
         "run" => campaign(args, Mode::Fresh),
         "resume" => campaign(args, Mode::Resume),
-        "fuzz" => Ok(Invocation::Unavailable(String::from(
-            "fuzz: no fuzz target exists at this revision, so there is nothing to advance",
-        ))),
+        "fuzz" => fuzz(args),
         other => Err(Error::Usage(format!(
             "unknown command `{other}`. Run `entroq-run help`."
+        ))),
+    }
+}
+
+fn fuzz(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
+    let action = args
+        .next()
+        .ok_or_else(|| Error::Usage(String::from("fuzz needs an action: list, build, or run")))?;
+    let action = text(&action, "fuzz action")?;
+
+    let mut target: Option<String> = None;
+    let mut runs: Option<PathBuf> = None;
+    while let Some(arg) = args.next() {
+        match text(&arg, "argument")?.as_str() {
+            "--target" => target = Some(text(&next(&mut args, "--target")?, "--target")?),
+            "--runs" => runs = Some(PathBuf::from(next(&mut args, "--runs")?)),
+            other => {
+                return Err(Error::Usage(format!(
+                    "unexpected argument `{other}`. Run `entroq-run help`."
+                )));
+            }
+        }
+    }
+    let named = || {
+        target
+            .clone()
+            .ok_or_else(|| Error::Usage(String::from("--target is required")))
+    };
+    match action.as_str() {
+        "list" => {
+            if target.is_some() || runs.is_some() {
+                return Err(Error::Usage(String::from(
+                    "fuzz list takes no argument. Run `entroq-run help`.",
+                )));
+            }
+            Ok(Invocation::Fuzz(Fuzz::List))
+        }
+        "build" => {
+            if runs.is_some() {
+                return Err(Error::Usage(String::from(
+                    "fuzz build records nothing, so --runs has nothing to write",
+                )));
+            }
+            Ok(Invocation::Fuzz(Fuzz::Build { target: named()? }))
+        }
+        "run" => Ok(Invocation::Fuzz(Fuzz::Advance {
+            target: named()?,
+            runs: runs.ok_or_else(|| {
+                Error::Usage(String::from(
+                    "a fuzz segment is recorded, so --runs is required",
+                ))
+            })?,
+        })),
+        other => Err(Error::Usage(format!(
+            "unknown fuzz action `{other}`. Use list, build, or run."
         ))),
     }
 }
@@ -217,7 +286,7 @@ fn text(value: &OsString, what: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Invocation, Mode, parse};
+    use super::{Fuzz, Invocation, Mode, parse};
     use crate::tier::{Suite, Tier};
     use std::ffi::OsString;
 
@@ -372,9 +441,61 @@ mod tests {
         assert!(invoke(&["run", "--tier", "dev", "--runs", "../runs", "--fast"]).is_err());
     }
 
+    fn fuzz(args: &[&str]) -> Option<Fuzz> {
+        match invoke(args) {
+            Ok(Invocation::Fuzz(action)) => Some(action),
+            _ => None,
+        }
+    }
+
     #[test]
-    fn a_capability_this_revision_lacks_is_named_not_guessed() {
-        assert!(matches!(invoke(&["fuzz"]), Ok(Invocation::Unavailable(_))));
+    fn a_fuzz_segment_names_its_target_and_its_run_root() {
+        let advance = match fuzz(&["fuzz", "run", "--target", "mechanism", "--runs", "../runs"]) {
+            Some(Fuzz::Advance { target, runs }) => Some((target, runs.display().to_string())),
+            _ => None,
+        };
+        assert_eq!(
+            advance,
+            Some((String::from("mechanism"), String::from("../runs")))
+        );
+    }
+
+    #[test]
+    fn a_fuzz_segment_is_recorded_so_it_requires_a_run_root() {
+        assert!(invoke(&["fuzz", "run", "--target", "mechanism"]).is_err());
+    }
+
+    #[test]
+    fn every_fuzz_action_that_names_a_target_requires_one() {
+        assert!(invoke(&["fuzz", "run", "--runs", "../runs"]).is_err());
+        assert!(invoke(&["fuzz", "build"]).is_err());
+    }
+
+    #[test]
+    fn a_driver_build_records_nothing_so_it_refuses_a_run_root() {
+        assert!(
+            invoke(&[
+                "fuzz",
+                "build",
+                "--target",
+                "mechanism",
+                "--runs",
+                "../runs"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_target_listing_takes_no_argument() {
+        assert!(matches!(fuzz(&["fuzz", "list"]), Some(Fuzz::List)));
+        assert!(invoke(&["fuzz", "list", "--target", "mechanism"]).is_err());
+    }
+
+    #[test]
+    fn a_fuzz_action_nobody_defined_is_rejected() {
+        assert!(invoke(&["fuzz"]).is_err());
+        assert!(invoke(&["fuzz", "minimize", "--target", "mechanism"]).is_err());
     }
 
     #[test]

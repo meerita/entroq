@@ -214,6 +214,94 @@ impl Manifest<'_> {
     }
 }
 
+/// What one fuzz invocation was asked to do, written before its segment runs.
+///
+/// A fuzz campaign is one segment over one target, so its manifest states the target, the
+/// corpus the segment continues from, and what earlier segments already spent on that
+/// target. Coverage comes from many bounded segments across many days, so the accumulated
+/// figure is the one a reader needs.
+pub struct FuzzManifest<'a> {
+    pub campaign: &'a str,
+    pub tier: Tier,
+    pub topic: &'a str,
+    pub created: &'a str,
+    pub revision: &'a Revision,
+    pub target: &'a str,
+    pub covers: &'a str,
+    pub coverage: &'a str,
+    pub segment: &'a str,
+    pub description: &'a str,
+    pub steps: &'a [Vec<String>],
+    pub corpus: &'a Path,
+    pub artifacts: &'a Path,
+    pub corpus_files: usize,
+    pub prior_segments: usize,
+    pub prior_seconds: f64,
+    pub fuzz_seconds: u64,
+    pub inputs: &'a InputSet,
+    pub environment: &'a Environment,
+}
+
+impl FuzzManifest<'_> {
+    fn to_json(&self) -> Value {
+        json!({
+            "campaign": self.campaign,
+            "tier": self.tier.name(),
+            "suite": "fuzz",
+            "topic": self.topic,
+            "created": self.created,
+            "revision": {
+                "commit": self.revision.commit,
+                "short": self.revision.short(),
+                "dirty": self.revision.dirty,
+            },
+            "encoder_version": Value::Null,
+            "coverage": self.coverage,
+            "target": {
+                "name": self.target,
+                "covers": self.covers,
+            },
+            "segments": [{
+                "id": self.segment,
+                "description": self.description,
+                "steps": self.steps.iter().map(|argv| {
+                    Value::Array(argv.iter().map(|arg| Value::from(arg.as_str())).collect())
+                }).collect::<Vec<_>>(),
+            }],
+            "corpus": {
+                "directory": self.corpus.display().to_string(),
+                "artifact_directory": self.artifacts.display().to_string(),
+                "files_before": self.corpus_files,
+            },
+            "accumulated_before": {
+                "segments": self.prior_segments,
+                "seconds": self.prior_seconds,
+            },
+            "input_set": {
+                "description": self.inputs.description,
+                "file_count": self.inputs.file_count,
+                "byte_count": self.inputs.byte_count,
+                "digest": self.inputs.digest,
+            },
+            "budget": {
+                "segment_seconds": SEGMENT_BUDGET.as_secs(),
+                "campaign_seconds": Value::Null,
+                "fuzz_seconds": self.fuzz_seconds,
+                "input": "the accumulated corpus, plus what libFuzzer derives from it",
+            },
+            "environment": {
+                "os": self.environment.os,
+                "arch": self.environment.arch,
+                "host": self.environment.host,
+                "rustc": self.environment.rustc,
+                "cargo": self.environment.cargo,
+                "runner": self.environment.runner,
+            },
+            "authorization": Value::Null,
+        })
+    }
+}
+
 /// One campaign's record directory.
 pub struct Record {
     dir: PathBuf,
@@ -236,34 +324,47 @@ impl Record {
         Ok(Self { dir, campaign })
     }
 
-    /// Opens the most recent campaign record for a topic at a tier.
+    /// Every campaign record for a topic at a tier, oldest first.
     ///
-    /// A tier directory holds every campaign that ran at that tier, and two suites can run
-    /// at one tier, so the topic is what picks the campaign a resume continues.
+    /// A tier directory holds every campaign that ran at that tier, and more than one suite
+    /// can run at one tier, so the topic is what selects the campaigns of one activity.
     ///
     /// # Errors
     ///
     /// Fails when the tier directory cannot be read.
-    pub fn latest(runs: &Path, tier: Tier, topic: &str) -> Result<Option<Self>> {
+    pub fn all(runs: &Path, tier: Tier, topic: &str) -> Result<Vec<Self>> {
         let tier_dir = runs.join(tier.name());
         if !tier_dir.is_dir() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
+        let suffix = format!("-{topic}");
         let mut names = Vec::new();
         for entry in fs::read_dir(&tier_dir).map_err(|e| Error::at("read", &tier_dir, e))? {
             let entry = entry.map_err(|e| Error::at("read", &tier_dir, e))?;
             if entry.path().is_dir()
                 && let Some(name) = entry.file_name().to_str()
-                && name.ends_with(&format!("-{topic}"))
+                && name.ends_with(&suffix)
             {
                 names.push(String::from(name));
             }
         }
         names.sort();
-        Ok(names.pop().map(|campaign| Self {
-            dir: tier_dir.join(&campaign),
-            campaign,
-        }))
+        Ok(names
+            .into_iter()
+            .map(|campaign| Self {
+                dir: tier_dir.join(&campaign),
+                campaign,
+            })
+            .collect())
+    }
+
+    /// Opens the most recent campaign record for a topic at a tier.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the tier directory cannot be read.
+    pub fn latest(runs: &Path, tier: Tier, topic: &str) -> Result<Option<Self>> {
+        Ok(Self::all(runs, tier, topic)?.pop())
     }
 
     pub fn campaign(&self) -> &str {
@@ -280,8 +381,21 @@ impl Record {
     ///
     /// Fails when the manifest cannot be written.
     pub fn write_manifest(&self, manifest: &Manifest<'_>) -> Result<()> {
+        self.write_json(&manifest.to_json())
+    }
+
+    /// Writes the manifest of a fuzz campaign.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the manifest cannot be written.
+    pub fn write_fuzz_manifest(&self, manifest: &FuzzManifest<'_>) -> Result<()> {
+        self.write_json(&manifest.to_json())
+    }
+
+    fn write_json(&self, value: &Value) -> Result<()> {
         let path = self.dir.join(MANIFEST);
-        let text = serde_json::to_string_pretty(&manifest.to_json())
+        let text = serde_json::to_string_pretty(value)
             .map_err(|e| Error::record(MANIFEST, e.to_string()))?;
         fs::write(&path, format!("{text}\n")).map_err(|e| Error::at("write", &path, e))
     }
@@ -466,6 +580,17 @@ mod tests {
             .flatten()
             .map(|record| String::from(record.campaign()));
         assert_eq!(found.as_deref(), Some(lab.campaign()));
+    }
+
+    #[test]
+    fn every_campaign_of_a_topic_is_listed_oldest_first() {
+        let runs = scratch("all");
+        let first = create_topic(&runs, "2026-09-11", "fuzz-mechanism");
+        let second = create_topic(&runs, "2026-09-12", "fuzz-mechanism");
+        let _other = create_topic(&runs, "2026-09-12", "workspace-gate");
+        let found = Record::all(&runs, Tier::Gate, "fuzz-mechanism").unwrap_or_default();
+        let names: Vec<&str> = found.iter().map(Record::campaign).collect();
+        assert_eq!(names, vec![first.campaign(), second.campaign()]);
     }
 
     #[test]

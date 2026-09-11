@@ -5,6 +5,7 @@
 //! and this module never produces one.
 
 use crate::campaign::Outcome;
+use crate::fuzz::Outcome as FuzzOutcome;
 use crate::record::Entry;
 use crate::workspace::{Environment, InputSet};
 
@@ -52,6 +53,151 @@ pub fn console(outcome: &Outcome) -> String {
         duration = seconds(outcome.duration.as_secs_f64()),
         status = outcome.status.as_str(),
     )
+}
+
+/// The block one fuzz segment prints when it ends.
+///
+/// It carries the campaign block every recorded run carries, and three lines a fuzz reader
+/// needs on top: where the corpus is and how it grew, whether the segment left a reproducer,
+/// and how much time the target has accumulated across every segment so far.
+pub fn fuzz_console(outcome: &FuzzOutcome) -> String {
+    format!(
+        "Campaign: {campaign}\n\
+         Tier: dev\n\
+         Suite: fuzz\n\
+         Target: {target}\n\
+         Revision: {revision}\n\
+         Segments: {satisfied}/1, 0 reused\n\
+         Duration: {duration}\n\
+         Status: {status}\n\
+         Record: {record}\n\
+         Blockers: {blockers}\n\
+         Corpus: {corpus}, {after}, {added} added\n\
+         Reproducers: {artifacts}\n\
+         Accumulated: {accumulated} over {segments}\n",
+        campaign = outcome.campaign,
+        target = outcome.target,
+        revision = outcome.revision,
+        satisfied = usize::from(outcome.attempt_status.is_satisfied()),
+        duration = seconds(outcome.duration_s),
+        status = outcome.status.as_str(),
+        record = outcome.record.display(),
+        blockers = blocker(outcome),
+        corpus = outcome.corpus.display(),
+        after = plural(outcome.files_after, "file"),
+        added = outcome.files_after.saturating_sub(outcome.files_before),
+        artifacts = reproducers(&outcome.artifacts),
+        accumulated = seconds(outcome.seconds_total),
+        segments = plural(outcome.segments_total, "segment"),
+    )
+}
+
+/// The summary a fuzz segment writes when it seals.
+pub fn fuzz_summary(
+    outcome: &FuzzOutcome,
+    inputs: &InputSet,
+    environment: &Environment,
+    coverage: &str,
+    limits: &str,
+) -> String {
+    let lines = vec![
+        format!("# {}", outcome.campaign),
+        String::new(),
+        String::from("Tier: dev"),
+        String::from("Suite: fuzz"),
+        format!("Status: {}", outcome.status.as_str()),
+        format!("Revision: {}", outcome.revision),
+        format!("Target: {}", outcome.target),
+        format!(
+            "Inputs: {} files, {} bytes, {}",
+            inputs.file_count, inputs.byte_count, inputs.digest
+        ),
+        String::from("Segments: 1/1 satisfied, 0 reused"),
+        format!("Duration: {}", seconds(outcome.duration_s)),
+        format!("libFuzzer budget: {} s", outcome.fuzz_seconds),
+        format!(
+            "Host: {} {}, {}",
+            environment.os, environment.arch, environment.host
+        ),
+        format!("Toolchain: {}, {}", environment.rustc, environment.cargo),
+        String::new(),
+        String::from("## Corpus"),
+        String::new(),
+        format!("Directory: `{}`", outcome.corpus.display()),
+        format!(
+            "Inputs: {} before, {} after, {} added",
+            outcome.files_before,
+            outcome.files_after,
+            outcome.files_after.saturating_sub(outcome.files_before)
+        ),
+        format!("Reproducers: {}", reproducers(&outcome.artifacts)),
+        String::new(),
+        String::from(
+            "The corpus persists between invocations, outside the repository. Do not delete \
+             it to start clean. It is coverage that many segments paid for.",
+        ),
+        String::new(),
+        String::from("## Accumulated"),
+        String::new(),
+        format!(
+            "{} over {}, including this one.",
+            seconds(outcome.seconds_total),
+            plural(outcome.segments_total, "segment")
+        ),
+        String::new(),
+        String::from(
+            "Each figure is the wall clock of one recorded segment. The driver is built \
+             before the segment starts, so the segment measures fuzzing rather than a \
+             compiler.",
+        ),
+        String::new(),
+        String::from("## Segments"),
+        String::new(),
+        String::from("| segment | status | attempt | duration | evidence |"),
+        String::from("|---|---|---|---|---|"),
+        format!(
+            "| {} | {} | 01 | {} | `{}` |",
+            outcome.segment,
+            outcome.attempt_status,
+            seconds(outcome.duration_s),
+            crate::record::Record::attempt_path(&outcome.segment, 1)
+        ),
+        String::new(),
+        String::from("## Limits"),
+        String::new(),
+        String::from(coverage),
+        String::new(),
+        String::from(limits),
+        String::new(),
+    ];
+    lines.join("\n")
+}
+
+/// The exact segment that stopped a fuzz campaign, and what its step reported.
+fn blocker(outcome: &FuzzOutcome) -> String {
+    if outcome.attempt_status.is_satisfied() {
+        return String::from("none");
+    }
+    outcome.note.as_ref().map_or_else(
+        || outcome.segment.clone(),
+        |note| format!("{}, {note}", outcome.segment),
+    )
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("{count} {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+fn reproducers(artifacts: &[String]) -> String {
+    if artifacts.is_empty() {
+        String::from("none")
+    } else {
+        artifacts.join(", ")
+    }
 }
 
 /// The one line a campaign prints as each segment ends.
@@ -204,6 +350,13 @@ mod tests {
             Some("exceeded the budget"),
         );
         assert!(line.contains("exceeded the budget"));
+    }
+
+    #[test]
+    fn a_count_of_one_reads_in_the_singular() {
+        assert_eq!(super::plural(1, "segment"), "1 segment");
+        assert_eq!(super::plural(0, "segment"), "0 segments");
+        assert_eq!(super::plural(2, "segment"), "2 segments");
     }
 
     #[test]

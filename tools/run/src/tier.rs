@@ -18,6 +18,13 @@ use std::time::Duration;
 /// segment pass: the cost is reduced, or the segment is split.
 pub const SEGMENT_BUDGET: Duration = Duration::from_secs(120);
 
+/// The wall clock one fuzz invocation gives libFuzzer.
+///
+/// Fuzzing is cumulative, so one invocation buys one bounded segment and stops. The value
+/// sits well inside the segment budget, because the corpus load, the driver check, and the
+/// process exit all happen inside the same segment.
+pub const FUZZ_SEGMENT_SECONDS: u64 = 60;
+
 const SMOKE_CAMPAIGN_BUDGET: Duration = Duration::from_secs(30);
 const DEV_CAMPAIGN_BUDGET: Duration = Duration::from_secs(120);
 
@@ -606,7 +613,7 @@ impl Tier {
 
 #[cfg(test)]
 mod tests {
-    use super::{SEGMENT_BUDGET, Suite, Tier};
+    use super::{Duration, SEGMENT_BUDGET, Suite, Tier};
 
     const TIERS: [Tier; 4] = [Tier::Smoke, Tier::Dev, Tier::Gate, Tier::Publication];
     const SUITES: [Suite; 4] = [Suite::Workspace, Suite::Lab, Suite::Corpus, Suite::Bench];
@@ -801,6 +808,11 @@ mod tests {
     fn the_corpus_suite_says_it_measured_no_compression() {
         assert!(Suite::Corpus.coverage().contains("compresses a byte"));
         assert!(Suite::Corpus.limits().contains("no throughput"));
+    }
+
+    #[test]
+    fn a_fuzz_invocation_stops_well_inside_the_segment_budget() {
+        assert!(Duration::from_secs(super::FUZZ_SEGMENT_SECONDS) < SEGMENT_BUDGET);
     }
 
     #[test]

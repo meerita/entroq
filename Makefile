@@ -3,8 +3,8 @@
 # Each target delegates to the tool that owns the implementation. Do not
 # duplicate delegated logic here.
 #
-# The fuzz drivers do not exist yet, so `fuzz` says so and fails. Every other
-# target works.
+# `fuzz` advances one fuzz target by one bounded segment. It needs cargo-fuzz,
+# which `cargo install cargo-fuzz` provides. No other target needs it.
 #
 # `lab` builds the competitor laboratory. It needs a network, a C and C++
 # compiler, cmake, and git. No other target needs any of them, so a host
@@ -66,9 +66,10 @@
 #           Required: no.
 #           Default:  dev
 #
-#   TARGET  The fuzz target to advance by one segment.
-#           Scope:    fuzz.
-#           Required: yes, for fuzz.
+#   TARGET  The fuzz target to advance by one segment. `fuzz-list` states
+#           every target and whether a driver exists for it.
+#           Scope:    fuzz, fuzz-driver.
+#           Required: yes, for fuzz and for fuzz-driver.
 #
 #   PLATFORM
 #           The platform an integration lane runs on: linux/amd64 or
@@ -91,7 +92,7 @@ PLATFORM ?=
 # Repository tooling, versioned with the code whose gates it runs.
 RUNNER = $(CARGO) run --quiet --release --package entroq-run --
 
-.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume lab lab-resume corpus corpus-resume fuzz bench-harness bench bench-resume report validate ci ci-validate clean
+.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume lab lab-resume corpus corpus-resume fuzz-list fuzz-driver fuzz bench-harness bench bench-resume report validate ci ci-validate clean
 
 help:
 	@echo "build      compile the workspace"
@@ -107,6 +108,7 @@ help:
 	@echo "lab-resume   continue the current lab campaign where it stopped"
 	@echo "corpus     materialize the corpus into CORPUS, one segment per group"
 	@echo "corpus-resume  continue the current corpus campaign where it stopped"
+	@echo "fuzz-list  list every fuzz target and whether a driver exists for it"
 	@echo "fuzz       advance one fuzz target by one bounded segment (TARGET=<name>)"
 	@echo "bench      benchmark campaign at TIER, one segment per competitor"
 	@echo "bench-resume continue the current benchmark campaign where it stopped"
@@ -176,9 +178,31 @@ corpus:
 corpus-resume:
 	CORPUS=$(CORPUS) $(RUNNER) resume --suite corpus --tier gate --runs $(RUNS)
 
-fuzz:
+# Fuzzing. One invocation is one bounded segment, never one long run. Coverage
+# comes from many segments across many days, so each segment continues from the
+# corpus the previous ones left and the record states the accumulated time.
+#
+# The corpus lives at $(RUNS)/fuzz-corpus/<target>/ and a crash reproducer at
+# $(RUNS)/fuzz-corpus/<target>/artifacts/. Both are outside the repository, so
+# the working tree stays clean and neither is lost to a `git clean`. Never
+# delete a corpus to start clean. It is coverage that many segments paid for.
+#
+# The driver is built before the segment starts. A compile inside the segment
+# would spend the budget on the compiler rather than on fuzzing.
+#
+# Every driver is built with the sanitizer set to none. The pinned toolchain is
+# stable, and AddressSanitizer needs nightly. The coverage instrumentation
+# libFuzzer needs is stable, so a bounded segment still runs.
+
+fuzz-list:
+	@$(RUNNER) fuzz list
+
+fuzz-driver:
 	@test -n "$(TARGET)" || { echo "make fuzz: set TARGET=<fuzz target>" >&2; exit 1; }
-	$(RUNNER) fuzz --target $(TARGET) --runs $(RUNS)
+	$(RUNNER) fuzz build --target $(TARGET)
+
+fuzz: fuzz-driver
+	$(RUNNER) fuzz run --target $(TARGET) --runs $(RUNS)
 
 # The benchmark. One segment per competitor, and one per competitor and size
 # class at a segmented tier, so a segment holds one budget and a resumed campaign

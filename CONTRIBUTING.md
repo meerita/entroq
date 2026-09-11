@@ -46,6 +46,8 @@ make gate-resume  # continue the current gate campaign where it stopped
 make validate     # format check, lint, and the dev tier
 ```
 
+Fuzzing runs in bounded segments too. The Fuzzing section below states how.
+
 A lower tier never substitutes for a higher one. A dev-tier result is not a gate result.
 
 A recorded run writes its record outside the repository, under `../runs` by default. Set
@@ -120,6 +122,40 @@ To see the registry, including the source, checksum, and license of every entry:
 ```sh
 cargo run --release --package entroq-bench -- corpus list --all
 ```
+
+## Fuzzing
+
+Every parser and every decoder entry point has a fuzz target. A target is declared before
+its driver exists, so the set is fixed and no driver appears without a place in it. A driver
+arrives with the code it covers.
+
+```sh
+make fuzz-list                 # every target, and whether a driver exists for it
+make fuzz TARGET=<name>        # advance one target by one bounded segment
+```
+
+`make fuzz` needs cargo-fuzz. Install it with `cargo install cargo-fuzz`. No other target
+needs it.
+
+Every driver is built with the sanitizer set to none. The pinned toolchain is stable and
+AddressSanitizer needs nightly. The coverage instrumentation libFuzzer needs is stable, so a
+bounded segment still runs. A memory error that only a sanitizer detects is not detected
+here.
+
+Fuzzing is cumulative, not long. One invocation is one bounded segment and then it stops.
+Coverage comes from many segments across many days, so each run record states the time the
+target has accumulated across every segment so far. That figure is the one to read, not the
+duration of one segment.
+
+Each target keeps its corpus at `../runs/fuzz-corpus/<target>/`, outside the repository. The
+next segment continues from it instead of starting cold. Set `RUNS` to change that path.
+
+Never delete a corpus to start clean. It is coverage that many segments already paid for,
+and deleting it discards every hour spent on the target.
+
+A crash writes its reproducer to `../runs/fuzz-corpus/<target>/artifacts/`, beside the
+corpus. Minimize it, commit it as a regression fixture, and fix the defect it found. The
+fixture lands before the fix does.
 
 ## Integration
 

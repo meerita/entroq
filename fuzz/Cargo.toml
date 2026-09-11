@@ -1,0 +1,38 @@
+# The fuzz drivers.
+#
+# This crate is its own workspace. libFuzzer generates the program entry point,
+# so a driver carries `unsafe` that the codec workspace denies, and cargo-fuzz
+# builds it with its own profile, its own flags, and its own lock file.
+#
+# The pinned toolchain is stable, and AddressSanitizer needs nightly. Every
+# driver is therefore built with the sanitizer set to none. The coverage
+# instrumentation libFuzzer needs is stable, so a bounded segment still runs.
+
+[package]
+name         = "entroq-fuzz"
+version      = "0.0.0"
+edition      = "2024"
+rust-version = "1.98.1"
+license      = "MIT OR Apache-2.0"
+publish      = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# A crash reproducer is only useful with a symbolized stack, so a driver keeps
+# line tables.
+[profile.release]
+debug = 1
+
+[[bin]]
+name  = "mechanism"
+path  = "fuzz_targets/mechanism.rs"
+test  = false
+doc   = false
+bench = false
