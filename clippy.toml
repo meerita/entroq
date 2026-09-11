@@ -1,0 +1,10 @@
+msrv = "1.98.1"
+
+avoid-breaking-exported-api = true
+
+too-many-arguments-threshold = 6
+type-complexity-threshold = 200
+cognitive-complexity-threshold = 20
+
+disallowed-methods = []
+disallowed-types = []
