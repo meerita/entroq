@@ -45,6 +45,15 @@
 #           Required: no.
 #           Default:  ../corpus
 #
+#   RESULTS The recorded results a report reads. A path to one result
+#           document, or to a directory searched for every `result.json`
+#           under it, which a run record directory is. Name one campaign: a
+#           frontier cannot hold one operating point twice, so results from
+#           two campaigns of the same tier are read separately.
+#           Scope:    report.
+#           Required: yes, for report.
+#           Default:  none.
+#
 #   RUNS    The run record root. Recorded tiers write their manifest,
 #           journal, and raw segment output here. It is outside the
 #           repository on purpose: the repository carries code, not evidence.
@@ -82,7 +91,7 @@ PLATFORM ?=
 # Repository tooling, versioned with the code whose gates it runs.
 RUNNER = $(CARGO) run --quiet --release --package entroq-run --
 
-.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume lab lab-resume corpus corpus-resume fuzz bench-harness bench bench-resume validate ci ci-validate clean
+.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume lab lab-resume corpus corpus-resume fuzz bench-harness bench bench-resume report validate ci ci-validate clean
 
 help:
 	@echo "build      compile the workspace"
@@ -101,6 +110,7 @@ help:
 	@echo "fuzz       advance one fuzz target by one bounded segment (TARGET=<name>)"
 	@echo "bench      benchmark campaign at TIER, one segment per competitor"
 	@echo "bench-resume continue the current benchmark campaign where it stopped"
+	@echo "report     mark the dominated points in RESULTS=<record dir>"
 	@echo "validate   fmt-check, lint, and the dev tier"
 	@echo "ci         fmt-check, lint, build, and the smoke tier, in a clean container"
 	@echo "ci-validate  validate in a clean container, recorded"
@@ -195,6 +205,23 @@ bench: bench-harness
 
 bench-resume: bench-harness
 	CORPUS=$(CORPUS) $(RUNNER) resume --suite bench --tier $(TIER) --runs $(RUNS)
+
+# The report. It reads the results a campaign recorded, rejects any document it
+# does not understand whole, and marks every operating point another point
+# dominates on each axis that has data.
+#
+# It is one command rather than a campaign segment. A segment may not depend on
+# another segment of the same campaign, and a report over a campaign's results
+# depends on every measurement segment in it. So the campaign measures, and the
+# report runs afterwards against the records it wrote.
+#
+# Standard output is the document and nothing else, so `make report > file`
+# writes a document a parser reads. The lines a person reads go to standard
+# error.
+
+report:
+	@test -n "$(RESULTS)" || { echo "make report: set RESULTS=<result file or directory>" >&2; exit 1; }
+	@$(CARGO) run --quiet --release --package entroq-bench -- report pareto --results $(RESULTS)
 
 validate: fmt-check lint test
 

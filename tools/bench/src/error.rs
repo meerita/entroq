@@ -24,6 +24,9 @@ pub enum Error {
     /// A competitor library refused the work, or the harness cannot measure what it was
     /// asked to measure.
     Measure { context: String, message: String },
+    /// A recorded result is not a document this tool fully understands, so nothing may be
+    /// read out of it.
+    Report { context: String, message: String },
 }
 
 impl Error {
@@ -68,6 +71,13 @@ impl Error {
             message: message.into(),
         }
     }
+
+    pub fn report(context: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Report {
+            context: context.into(),
+            message: message.into(),
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -78,7 +88,8 @@ impl fmt::Display for Error {
             Self::Tool { command, message } => write!(f, "`{command}` {message}"),
             Self::Lab { context, message }
             | Self::Corpus { context, message }
-            | Self::Measure { context, message } => {
+            | Self::Measure { context, message }
+            | Self::Report { context, message } => {
                 write!(f, "{context}: {message}")
             }
         }

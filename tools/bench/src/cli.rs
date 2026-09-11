@@ -26,6 +26,8 @@ Usage:
   entroq-bench corpus list      <what>
   entroq-bench measure        --tier <tier> --codec <name> [--class <name>]
                               [--segment <id>] [--lab <dir>] [--corpus <dir>]
+  entroq-bench report parse   --results <path> [--results <path>]...
+  entroq-bench report pareto  --results <path> [--results <path>]...
   entroq-bench help
 
 `lab build` fetches one competitor at its pinned commit, builds it as a static library with
@@ -75,6 +77,31 @@ campaign names one class per segment so each segment fits its budget.
 Entroq has no codec path at this revision, so every result states an empty Entroq column and
 why it is empty.
 
+`report parse` reads every recorded result under the paths given and reports what it read.
+A result is read whole or rejected: a document carrying a field the parser does not declare,
+or omitting one it does, fails rather than being read in part, because a field skipped is a
+metric dropped and a dropped metric reads as an absent one.
+
+`report pareto` reads the same results and marks every operating point another point
+dominates. A point is dominated when another point on the same chart is
+equal or better in both dimensions and strictly better in one. A point equal in both is not
+dominated.
+
+Axes:
+  ratio against encode throughput
+  ratio against decode throughput
+  ratio against encode CPU
+  ratio against decode CPU
+  ratio against memory, as the bytes a codec's own state holds
+
+One chart holds one tier, one host, one corpus entry, and one thread count, and every plotted
+point states its tier. An axis no result carries a number for reports no data with the reason
+the results gave, and no other metric stands in its place.
+
+A path that names a directory is searched for every file named `result.json`, so a run record
+directory yields the results of every segment in it. Name one campaign: two measurements of
+one operating point are two measurements, and a frontier cannot hold one of them twice.
+
 Selecting entries, for every corpus action:
   --all             every registered entry
   --group <name>    every entry of one group
@@ -88,6 +115,9 @@ Size classes:
 
 Corpus groups:
   project, enwik, sourcecode, gutenberg
+
+Report inputs:
+  --results <path>  a result document, or a directory holding them. Repeatable.
 
 Environment:
   LAB      the competitor codec workspace, when --lab does not name it.
@@ -126,6 +156,29 @@ pub enum Invocation {
         corpus: Option<PathBuf>,
     },
     Measure(Box<Request>),
+    Report {
+        action: ReportAction,
+        results: Vec<PathBuf>,
+    },
+}
+
+/// What a report invocation does with the results it read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportAction {
+    /// Report what was read, and how much of each document was checked.
+    Parse,
+    /// Report the frontier, and every point another point dominates.
+    Pareto,
+}
+
+impl ReportAction {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "parse" => Some(Self::Parse),
+            "pareto" => Some(Self::Pareto),
+            _ => None,
+        }
+    }
 }
 
 /// What a corpus invocation does to the entries it selected.
@@ -163,6 +216,7 @@ pub fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
         "lab" => lab(args),
         "corpus" => corpus(args),
         "measure" => measure(args),
+        "report" => report(args),
         other => Err(Error::Usage(format!(
             "unknown command `{other}`. Run `entroq-bench help`."
         ))),
@@ -276,6 +330,34 @@ fn corpus(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
         selection,
         corpus,
     })
+}
+
+fn report(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
+    let action = args
+        .next()
+        .ok_or_else(|| Error::Usage(String::from("report: name an action: parse or pareto")))?;
+    let action = ReportAction::parse(&text(&action, "action")?).ok_or_else(|| {
+        Error::Usage(String::from("report: unknown action. Use parse or pareto."))
+    })?;
+
+    let mut results: Vec<PathBuf> = Vec::new();
+    while let Some(arg) = args.next() {
+        match text(&arg, "argument")?.as_str() {
+            "--results" => results.push(PathBuf::from(next(&mut args, "--results")?)),
+            other => {
+                return Err(Error::Usage(format!(
+                    "unexpected argument `{other}`. Run `entroq-bench help`."
+                )));
+            }
+        }
+    }
+    if results.is_empty() {
+        return Err(Error::Usage(String::from(
+            "report: name what to read with --results <path>. A report over every result a \
+             host happens to hold is a report nobody chose.",
+        )));
+    }
+    Ok(Invocation::Report { action, results })
 }
 
 fn measure(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
@@ -644,6 +726,65 @@ mod tests {
         assert!(failure.is_err());
         let message = failure.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(message.contains("does not cover"), "{message}");
+    }
+
+    fn report(args: &[&str]) -> Option<(super::ReportAction, Vec<String>)> {
+        match invoke(args) {
+            Ok(Invocation::Report { action, results }) => Some((
+                action,
+                results
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+            )),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_report_names_its_action_and_every_result_it_reads() {
+        assert_eq!(
+            report(&["report", "parse", "--results", "/tmp/a"]),
+            Some((super::ReportAction::Parse, vec![String::from("/tmp/a")]))
+        );
+        assert_eq!(
+            report(&[
+                "report",
+                "pareto",
+                "--results",
+                "/tmp/a",
+                "--results",
+                "/tmp/b"
+            ]),
+            Some((
+                super::ReportAction::Pareto,
+                vec![String::from("/tmp/a"), String::from("/tmp/b")]
+            ))
+        );
+    }
+
+    #[test]
+    fn a_report_over_nothing_in_particular_is_rejected() {
+        let failure = invoke(&["report", "pareto"]);
+        let message = failure.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("--results"), "{message}");
+        assert!(invoke(&["report"]).is_err());
+        assert!(invoke(&["report", "plot", "--results", "/tmp/a"]).is_err());
+    }
+
+    #[test]
+    fn the_help_states_the_five_axes_and_what_dominated_means() {
+        for field in [
+            "ratio against encode throughput",
+            "ratio against decode throughput",
+            "ratio against encode CPU",
+            "ratio against decode CPU",
+            "ratio against memory",
+            "equal or better in both dimensions",
+            "--results",
+        ] {
+            assert!(HELP.contains(field), "the help is missing `{field}`");
+        }
     }
 
     #[test]

@@ -10,6 +10,11 @@
 //! from recorded seeds, fetches the registered public corpora, and checks both against the
 //! checksums the registry pins.
 //!
+//! The report: it reads the results a measurement recorded, whole or not at all, and marks
+//! every operating point another point dominates on each axis that has data. It links no
+//! competitor, so a host that never built the laboratory still reads what one that did
+//! recorded.
+//!
 //! The measurement: it drives each competitor in-process, through the library the laboratory
 //! built and the build script linked, and emits one machine-readable result per segment.
 //! Every metric is reported as measured, with the call that produced it, or as unavailable,
@@ -43,15 +48,19 @@ mod manifest;
 #[cfg(lab_linked)]
 mod measure;
 mod metric;
+mod pareto;
+mod parse;
 mod plan;
 mod registry;
+mod report;
 #[cfg(lab_linked)]
 mod result;
 mod shape;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use cli::{CorpusAction, Invocation};
+use cli::{CorpusAction, Invocation, ReportAction};
 
 /// The tool could not produce the build, the rebuild, or the measurement.
 const EXIT_FAILURE: u8 = 1;
@@ -104,7 +113,34 @@ fn run() -> error::Result<ExitCode> {
             measure(&request)?;
             Ok(ExitCode::SUCCESS)
         }
+        Invocation::Report { action, results } => {
+            report(action, &results)?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
+}
+
+/// Reads every recorded result the invocation named, and emits what it was asked for.
+///
+/// # Errors
+///
+/// Fails when a result cannot be read, when one is not a document the parser fully
+/// understands, or when the results put one operating point on one chart twice.
+fn report(action: ReportAction, results: &[PathBuf]) -> error::Result<()> {
+    let documents = report::read(results)?;
+    let produced_at = environment::timestamp()?;
+    match action {
+        ReportAction::Parse => {
+            report::emit(&report::parsed(&documents, &produced_at))?;
+            report::log_parse(&documents);
+        }
+        ReportAction::Pareto => {
+            let charts = pareto::charts(&documents)?;
+            report::emit(&report::frontier(&documents, &charts, &produced_at))?;
+            report::log_frontier(&charts);
+        }
+    }
+    Ok(())
 }
 
 /// Measures one segment and emits its result.

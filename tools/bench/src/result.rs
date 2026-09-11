@@ -6,6 +6,9 @@
 //! and the entries the tier's budget left out. The log is for a person watching a segment
 //! run; it carries no number that the document does not.
 //!
+//! The schema identifier this document declares belongs to the parser that reads it, because
+//! a host that never linked the laboratory still reads a recorded result.
+//!
 //! The document always goes to standard output. When the runner names a directory for the
 //! segment's evidence, it is written there as well, beside the raw output the runner
 //! captures.
@@ -19,10 +22,8 @@ use serde_json::{Value, json};
 use crate::counters;
 use crate::error::{Error, Result};
 use crate::measure::{Measurement, Outcome, Sampling};
+use crate::parse::SCHEMA;
 use crate::plan::Request;
-
-/// The schema a parser matches on. A change to the document's shape changes this.
-pub const SCHEMA: &str = "entroq.bench.result/1";
 
 /// The file a segment's document is written to inside its evidence directory.
 const FILE: &str = "result.json";
