@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
-use crate::tier::{InputBudget, SEGMENT_BUDGET, Segment, Tier};
+use crate::tier::{InputBudget, SEGMENT_BUDGET, Segment, Suite, Tier};
 use crate::workspace::{Environment, InputSet, Revision};
 
 const MANIFEST: &str = "manifest.json";
@@ -141,6 +141,7 @@ impl Entry {
 pub struct Manifest<'a> {
     pub campaign: &'a str,
     pub tier: Tier,
+    pub suite: Suite,
     pub topic: &'a str,
     pub created: &'a str,
     pub revision: &'a Revision,
@@ -178,6 +179,7 @@ impl Manifest<'_> {
         json!({
             "campaign": self.campaign,
             "tier": self.tier.name(),
+            "suite": self.suite.name(),
             "topic": self.topic,
             "created": self.created,
             "revision": {
@@ -234,12 +236,15 @@ impl Record {
         Ok(Self { dir, campaign })
     }
 
-    /// Opens the most recent campaign record for a tier.
+    /// Opens the most recent campaign record for a topic at a tier.
+    ///
+    /// A tier directory holds every campaign that ran at that tier, and two suites can run
+    /// at one tier, so the topic is what picks the campaign a resume continues.
     ///
     /// # Errors
     ///
     /// Fails when the tier directory cannot be read.
-    pub fn latest(runs: &Path, tier: Tier) -> Result<Option<Self>> {
+    pub fn latest(runs: &Path, tier: Tier, topic: &str) -> Result<Option<Self>> {
         let tier_dir = runs.join(tier.name());
         if !tier_dir.is_dir() {
             return Ok(None);
@@ -249,6 +254,7 @@ impl Record {
             let entry = entry.map_err(|e| Error::at("read", &tier_dir, e))?;
             if entry.path().is_dir()
                 && let Some(name) = entry.file_name().to_str()
+                && name.ends_with(&format!("-{topic}"))
             {
                 names.push(String::from(name));
             }
@@ -391,7 +397,11 @@ mod tests {
     }
 
     fn create(runs: &Path, date: &str) -> Record {
-        let record = Record::create(runs, Tier::Gate, date, "workspace-gate");
+        create_topic(runs, date, "workspace-gate")
+    }
+
+    fn create_topic(runs: &Path, date: &str, topic: &str) -> Record {
+        let record = Record::create(runs, Tier::Gate, date, topic);
         assert!(record.is_ok());
         record.unwrap_or_else(|_| Record {
             dir: PathBuf::new(),
@@ -428,7 +438,7 @@ mod tests {
         let _first = create(&runs, "2026-09-11");
         let _second = create(&runs, "2026-09-11");
         let third = create(&runs, "2026-09-12");
-        let latest = Record::latest(&runs, Tier::Gate);
+        let latest = Record::latest(&runs, Tier::Gate, "workspace-gate");
         assert!(latest.is_ok());
         let name = latest.ok().flatten().map(|r| String::from(r.campaign()));
         assert_eq!(name.as_deref(), Some(third.campaign()));
@@ -437,8 +447,33 @@ mod tests {
     #[test]
     fn no_record_means_no_latest_campaign() {
         let runs = scratch("empty");
-        let latest = Record::latest(&runs, Tier::Gate);
+        let latest = Record::latest(&runs, Tier::Gate, "workspace-gate");
         assert!(matches!(latest, Ok(None)));
+    }
+
+    #[test]
+    fn a_resume_finds_the_campaign_of_its_own_topic_not_the_newest_of_the_tier() {
+        let runs = scratch("topic");
+        let workspace = create_topic(&runs, "2026-09-11", "workspace-gate");
+        let lab = create_topic(&runs, "2026-09-12", "lab-build");
+        let found = Record::latest(&runs, Tier::Gate, "workspace-gate")
+            .ok()
+            .flatten()
+            .map(|record| String::from(record.campaign()));
+        assert_eq!(found.as_deref(), Some(workspace.campaign()));
+        let found = Record::latest(&runs, Tier::Gate, "lab-build")
+            .ok()
+            .flatten()
+            .map(|record| String::from(record.campaign()));
+        assert_eq!(found.as_deref(), Some(lab.campaign()));
+    }
+
+    #[test]
+    fn a_topic_with_no_campaign_has_nothing_to_resume() {
+        let runs = scratch("topic-absent");
+        let _existing = create_topic(&runs, "2026-09-11", "workspace-gate");
+        let found = Record::latest(&runs, Tier::Gate, "lab-build");
+        assert!(matches!(found, Ok(None)));
     }
 
     #[test]

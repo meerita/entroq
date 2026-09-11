@@ -6,6 +6,10 @@
 # The fuzz drivers and the benchmark harness do not exist yet, so `fuzz` and
 # `bench` say so and fail. Every other target works.
 #
+# `lab` builds the competitor laboratory. It needs a network, a C and C++
+# compiler, cmake, and git. No other target needs any of them, so a host
+# without them still runs every gate.
+#
 # No validation segment may exceed 120 seconds.
 #
 # Build inputs:
@@ -17,8 +21,9 @@
 #                     pins to the declared channel.
 #
 #   LAB     The competitor codec workspace. Holds the pinned, built
-#           compression systems that Entroq is compared against.
-#           Scope:    bench, and any comparison target.
+#           compression systems that Entroq is compared against. `lab`
+#           produces it. Every comparison target reads it.
+#           Scope:    lab, lab-resume, bench, and any comparison target.
 #           Required: yes, for a comparison.
 #           Default:  ../lab
 #
@@ -58,6 +63,8 @@ help:
 	@echo "test       dev tier: 120 s, 10 MiB inputs, recorded"
 	@echo "gate       gate tier: 100 MiB inputs, segmented and resumable"
 	@echo "gate-resume  continue the current gate campaign where it stopped"
+	@echo "lab        build the pinned competitors into LAB, one segment per codec"
+	@echo "lab-resume   continue the current lab campaign where it stopped"
 	@echo "fuzz       advance one fuzz target by one bounded segment (TARGET=<name>)"
 	@echo "bench      benchmark campaign at TIER"
 	@echo "validate   fmt-check, lint, and the dev tier"
@@ -92,6 +99,21 @@ gate:
 
 gate-resume:
 	$(RUNNER) resume --tier gate --runs $(RUNS)
+
+# The competitor laboratory. One segment per codec, so one build fits the
+# segment budget and a resumed campaign rebuilds only what did not pass.
+#
+# Each segment builds its competitor at its pinned commit and then rebuilds it
+# from its own recorded commands into a clean prefix. A rebuild that does not
+# reproduce the recorded bytes is recorded, not failed: a compiler and an
+# archiver embed a path and a timestamp, so two builds of one source tree can
+# behave the same and not hash the same.
+
+lab:
+	LAB=$(LAB) $(RUNNER) run --suite lab --tier gate --runs $(RUNS)
+
+lab-resume:
+	LAB=$(LAB) $(RUNNER) resume --suite lab --tier gate --runs $(RUNS)
 
 fuzz:
 	@test -n "$(TARGET)" || { echo "make fuzz: set TARGET=<fuzz target>" >&2; exit 1; }

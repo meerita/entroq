@@ -1,0 +1,18 @@
+[package]
+name = "entroq-bench"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The laboratory records the checksum of every library a result was produced with.
+# Entroq does not own a hash primitive that serves that purpose.
+#
+# No competitor binding appears here. This revision builds the laboratory; it links
+# nothing from it, so the crate compiles on a host that carries no C library.
+[dependencies]
+sha2 = "0.10"
+
+[lints]
+workspace = true

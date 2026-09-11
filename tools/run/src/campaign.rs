@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::exec::{self, Output};
 use crate::record::{Entry, Manifest, Record, Status as AttemptStatus};
 use crate::report::{self, Summary};
-use crate::tier::{COVERAGE, SEGMENT_BUDGET, Segment, Tier};
+use crate::tier::{SEGMENT_BUDGET, Segment, Suite, Tier};
 use crate::workspace::{self, Environment, InputSet, Revision};
 
 /// How a campaign ended.
@@ -50,6 +50,7 @@ impl Status {
 /// What a campaign did, in the shape a report states it.
 pub struct Outcome {
     pub tier: Tier,
+    pub suite: Suite,
     pub campaign: Option<String>,
     pub revision: String,
     pub total: usize,
@@ -86,7 +87,8 @@ pub fn execute(request: &Request, mode: Mode) -> Result<Outcome> {
     let inputs = workspace::input_set(&root)?;
     let environment = workspace::environment()?;
     let tier = request.tier;
-    let segments = tier.segments();
+    let suite = request.suite;
+    let segments = suite.segments(tier);
 
     let record = open_record(request, mode, &revision, &inputs, &environment)?;
     let prior = match record.as_ref() {
@@ -143,6 +145,7 @@ pub fn execute(request: &Request, mode: Mode) -> Result<Outcome> {
     };
     let outcome = Outcome {
         tier,
+        suite,
         campaign: record.as_ref().map(|r| String::from(r.campaign())),
         revision: revision.label(),
         total: segments.len(),
@@ -160,7 +163,8 @@ pub fn execute(request: &Request, mode: Mode) -> Result<Outcome> {
             inputs: &inputs,
             environment: &environment,
             entries: &written,
-            coverage: COVERAGE,
+            coverage: suite.coverage(),
+            limits: suite.limits(),
         };
         record.write_summary(&report::summary(&summary))?;
     }
@@ -188,21 +192,26 @@ fn open_record(
             record.write_manifest(&Manifest {
                 campaign: record.campaign(),
                 tier: request.tier,
+                suite: request.suite,
                 topic: &request.topic,
                 created: &created.timestamp(),
                 revision,
-                coverage: COVERAGE,
-                segments: request.tier.segments(),
+                coverage: request.suite.coverage(),
+                segments: request.suite.segments(request.tier),
                 inputs,
                 environment,
             })?;
             Ok(Some(record))
         }
-        Mode::Resume => Record::latest(runs, request.tier)?
+        Mode::Resume => Record::latest(runs, request.tier, &request.topic)?
             .map(Some)
             .ok_or_else(|| {
                 Error::record(
-                    format!("{} tier", request.tier.name()),
+                    format!(
+                        "the {} topic at the {} tier",
+                        request.topic,
+                        request.tier.name()
+                    ),
                     "has no campaign to resume. Start one first.",
                 )
             }),
