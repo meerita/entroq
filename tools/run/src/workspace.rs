@@ -55,8 +55,8 @@ pub struct Environment {
     pub runner: &'static str,
 }
 
-const INPUT_SET_DESCRIPTION: &str =
-    "Every file git tracks in the repository, read from the working tree.";
+const INPUT_SET_DESCRIPTION: &str = "Every file in the repository that git tracks or does not ignore, read from the working \
+tree.";
 
 /// Finds the repository the runner was invoked inside.
 ///
@@ -84,13 +84,26 @@ pub fn revision(root: &Path) -> Result<Revision> {
     })
 }
 
-/// Digests every tracked file, in the order `git` lists them.
+/// Digests every input the repository holds, in path order.
+///
+/// The set covers tracked files and untracked files that are not ignored, because an
+/// untracked source file changes what a build does. It excludes ignored files, which is what
+/// keeps build output out of the set.
 ///
 /// # Errors
 ///
-/// Fails when `git` cannot list the tracked files, or a listed file cannot be read.
+/// Fails when `git` cannot list the inputs, or a listed file cannot be read.
 pub fn input_set(root: &Path) -> Result<InputSet> {
-    let listing = git_bytes(&["ls-files", "-z"], root)?;
+    let listing = git_bytes(
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+        root,
+    )?;
     // `-z` terminates each path, so the split leaves one empty tail entry.
     let mut paths = Vec::new();
     for record in listing.split(|byte| *byte == 0) {
@@ -102,10 +115,16 @@ pub fn input_set(root: &Path) -> Result<InputSet> {
         paths.push(String::from(path));
     }
     paths.sort();
+    paths.dedup();
 
     let mut set = SetDigest::new();
     for path in &paths {
-        set.add(path, &root.join(path))?;
+        let absolute = root.join(path);
+        if absolute.is_file() {
+            set.add(path, &absolute)?;
+        } else {
+            set.add_absent(path);
+        }
     }
     let (digest, file_count, byte_count) = set.finish();
     Ok(InputSet {

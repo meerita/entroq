@@ -19,6 +19,11 @@ use crate::error::{Error, Result};
 /// Read size for digesting one input. No input is held whole in memory.
 const CHUNK_BYTES: usize = 65_536;
 
+/// Stands in for an input the set names and the working tree does not hold.
+///
+/// It is not a digest, so no file's contents can collide with it.
+const ABSENT: &str = "absent";
+
 /// Accumulates the digest of an input set, one input at a time.
 pub struct SetDigest {
     hasher: Sha256,
@@ -45,13 +50,25 @@ impl SetDigest {
     /// Fails when the input cannot be read.
     pub fn add(&mut self, relative: &str, path: &Path) -> Result<()> {
         let (digest, bytes) = digest_file(path)?;
+        self.fold(relative, &digest);
+        self.file_count = self.file_count.saturating_add(1);
+        self.byte_count = self.byte_count.saturating_add(bytes);
+        Ok(())
+    }
+
+    /// Folds a path that the set names but the working tree does not hold.
+    ///
+    /// A deleted input is part of the set's identity, so it is folded in rather than
+    /// skipped. It contributes no bytes and is not counted as a file.
+    pub fn add_absent(&mut self, relative: &str) {
+        self.fold(relative, ABSENT);
+    }
+
+    fn fold(&mut self, relative: &str, digest: &str) {
         self.hasher.update(relative.as_bytes());
         self.hasher.update(*b"\0");
         self.hasher.update(digest.as_bytes());
         self.hasher.update(*b"\n");
-        self.file_count = self.file_count.saturating_add(1);
-        self.byte_count = self.byte_count.saturating_add(bytes);
-        Ok(())
     }
 
     /// The set digest, the number of inputs, and their total size.
@@ -145,6 +162,25 @@ mod tests {
         let left = digest_of(&a, &[("one.rs", b"same")]);
         let right = digest_of(&b, &[("two.rs", b"same")]);
         assert_ne!(left.0, right.0);
+    }
+
+    #[test]
+    fn an_absent_input_still_changes_the_digest() {
+        let dir = scratch("absent");
+        let present = digest_of(&dir, &[("one.rs", b"x")]);
+        let mut set = SetDigest::new();
+        set.add_absent("one.rs");
+        let absent = set.finish();
+        assert_ne!(present.0, absent.0);
+        assert_ne!(SetDigest::new().finish().0, absent.0);
+    }
+
+    #[test]
+    fn an_absent_input_counts_no_file_and_no_bytes() {
+        let mut set = SetDigest::new();
+        set.add_absent("gone.rs");
+        let (_, files, bytes) = set.finish();
+        assert_eq!((files, bytes), (0, 0));
     }
 
     #[test]
