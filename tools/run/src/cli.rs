@@ -32,6 +32,9 @@ Suites:
   workspace    the gates every revision must pass. The default.
   lab          the competitor laboratory: one pinned build per competitor. Segmented, so
                it runs at a segmented tier only.
+  corpus       the corpus registry: the project corpus, generated from recorded seeds, and
+               every registered public corpus, fetched and checksummed. Segmented, so it
+               runs at a segmented tier only.
 
 A tier says how a campaign is bounded, recorded, and resumed. A suite says which segments
 it runs.
@@ -47,7 +50,11 @@ and the budget does not move to accommodate it.
 <runs>/<tier>/<date>-<NN>-<topic>/ and never inside the repository.
 
 Environment:
-  CARGO   the cargo binary a segment step invokes. Not required. Default: cargo.
+  CARGO    the cargo binary a segment step invokes. Not required. Default: cargo.
+  LAB      the competitor codec workspace a lab segment builds into. Not required.
+           Default: ../lab.
+  CORPUS   the corpus cache a corpus segment materializes into. Not required.
+           Default: ../corpus.
 
 Exit status:
   0  the campaign passed, and a recorded campaign sealed

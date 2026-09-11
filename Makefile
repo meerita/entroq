@@ -10,6 +10,11 @@
 # compiler, cmake, and git. No other target needs any of them, so a host
 # without them still runs every gate.
 #
+# `corpus` materializes the corpus. It generates the project corpus from
+# recorded seeds, which needs nothing, and fetches the registered public
+# corpora, which needs a network, curl, unzip, and gzip. No corpus byte is
+# committed: the registry and the method of obtaining it are.
+#
 # No validation segment may exceed 120 seconds.
 #
 # Build inputs:
@@ -26,6 +31,14 @@
 #           Scope:    lab, lab-resume, bench, and any comparison target.
 #           Required: yes, for a comparison.
 #           Default:  ../lab
+#
+#   CORPUS  The corpus cache. Holds the generated project corpus and the
+#           fetched public corpora that a measurement reads. `corpus`
+#           produces it. It is outside the repository on purpose: the
+#           registry is code, and the bytes it describes are not.
+#           Scope:    corpus, corpus-resume, bench.
+#           Required: no.
+#           Default:  ../corpus
 #
 #   RUNS    The run record root. Recorded tiers write their manifest,
 #           journal, and raw segment output here. It is outside the
@@ -55,6 +68,7 @@
 
 CARGO ?= cargo
 LAB ?= ../lab
+CORPUS ?= ../corpus
 RUNS ?= ../runs
 TIER ?= dev
 PLATFORM ?=
@@ -62,7 +76,7 @@ PLATFORM ?=
 # Repository tooling, versioned with the code whose gates it runs.
 RUNNER = $(CARGO) run --quiet --release --package entroq-run --
 
-.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume fuzz bench validate ci ci-validate clean
+.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume lab lab-resume corpus corpus-resume fuzz bench validate ci ci-validate clean
 
 help:
 	@echo "build      compile the workspace"
@@ -76,6 +90,8 @@ help:
 	@echo "gate-resume  continue the current gate campaign where it stopped"
 	@echo "lab        build the pinned competitors into LAB, one segment per codec"
 	@echo "lab-resume   continue the current lab campaign where it stopped"
+	@echo "corpus     materialize the corpus into CORPUS, one segment per group"
+	@echo "corpus-resume  continue the current corpus campaign where it stopped"
 	@echo "fuzz       advance one fuzz target by one bounded segment (TARGET=<name>)"
 	@echo "bench      benchmark campaign at TIER"
 	@echo "validate   fmt-check, lint, and the dev tier"
@@ -128,12 +144,27 @@ lab:
 lab-resume:
 	LAB=$(LAB) $(RUNNER) resume --suite lab --tier gate --runs $(RUNS)
 
+# The corpus. One segment per group, so one fetch fits the segment budget and
+# a resumed campaign re-fetches only what did not pass.
+#
+# A generated entry is written from the seed the registry records, and is then
+# generated twice into two directories to prove the seed is a pin. A fetched
+# entry is checked against its recorded checksum as the archive arrives and
+# again on the bytes it unpacks to, so a broken transfer and a drifted upstream
+# do not look alike.
+
+corpus:
+	CORPUS=$(CORPUS) $(RUNNER) run --suite corpus --tier gate --runs $(RUNS)
+
+corpus-resume:
+	CORPUS=$(CORPUS) $(RUNNER) resume --suite corpus --tier gate --runs $(RUNS)
+
 fuzz:
 	@test -n "$(TARGET)" || { echo "make fuzz: set TARGET=<fuzz target>" >&2; exit 1; }
 	$(RUNNER) fuzz --target $(TARGET) --runs $(RUNS)
 
 bench:
-	$(RUNNER) bench --tier $(TIER) --lab $(LAB) --runs $(RUNS)
+	CORPUS=$(CORPUS) $(RUNNER) bench --tier $(TIER) --lab $(LAB) --runs $(RUNS)
 
 validate: fmt-check lint test
 

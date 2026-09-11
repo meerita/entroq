@@ -11,13 +11,18 @@ use std::path::PathBuf;
 
 use crate::catalog::{self, Codec};
 use crate::error::{Error, Result};
+use crate::registry::{self, Group, Selection};
 
 pub const HELP: &str = "\
 entroq-bench: the Entroq benchmark tool.
 
 Usage:
-  entroq-bench lab build  --codec <name> [--lab <dir>]
-  entroq-bench lab verify --codec <name> [--lab <dir>]
+  entroq-bench lab build      --codec <name> [--lab <dir>]
+  entroq-bench lab verify     --codec <name> [--lab <dir>]
+  entroq-bench corpus build     <what> [--corpus <dir>]
+  entroq-bench corpus reproduce <what> [--corpus <dir>]
+  entroq-bench corpus verify    <what> [--corpus <dir>]
+  entroq-bench corpus list      <what>
   entroq-bench help
 
 `lab build` fetches one competitor at its pinned commit, builds it as a static library with
@@ -33,19 +38,47 @@ artifact a result came from. It is not a claim that the build is bit reproducibl
 
 This revision measures nothing and links nothing it builds.
 
+`corpus build` materializes every selected registry entry into the cache: a generated entry
+from its recorded seed, a fetched entry from its upstream archive. Every archive is checked
+against its recorded checksum as it arrives, and every entry against the digest the registry
+pins. An entry whose cached bytes already match is left alone.
+
+`corpus reproduce` generates every selected generated entry twice, into two directories
+neither generation shares, and fails unless both match each other and the registry. It is
+what makes a recorded seed a pin rather than a label.
+
+`corpus verify` checks cached bytes against the registry without obtaining anything.
+
+`corpus list` prints the registry, including the license of every entry, and touches no
+cache.
+
+No corpus byte is committed. The registry and the method of obtaining it are.
+
+Selecting entries, for every corpus action:
+  --all             every registered entry
+  --group <name>    every entry of one group
+  --entry <name>    one entry
+
 Competitors:
   lz4, zstd, brotli, snappy, zlib
 
+Corpus groups:
+  project, enwik, sourcecode, gutenberg
+
 Environment:
-  LAB   the competitor codec workspace, when --lab does not name it.
-        Not required. Default: ../lab, beside the repository.
+  LAB      the competitor codec workspace, when --lab does not name it.
+           Not required. Default: ../lab, beside the repository.
+  CORPUS   the corpus cache, when --corpus does not name it.
+           Not required. Default: ../corpus, beside the repository.
 
 Host tools:
-  git, cmake, a C and C++ compiler, date, and uname. A host missing one fails with its name.
+  Building the laboratory needs git, cmake, a C and C++ compiler, date, and uname.
+  Fetching a corpus entry needs curl, and unzip or gzip for an entry that is archived.
+  A host missing one fails with its name.
 
 Exit status:
-  0  the build or the rebuild succeeded, whatever the rebuild measured
-  1  the tool could not produce the build or the rebuild
+  0  the action succeeded, whatever a rebuild measured
+  1  the tool could not complete the action
 ";
 
 /// What the tool was asked to do.
@@ -59,6 +92,32 @@ pub enum Invocation {
         codec: &'static Codec,
         lab: Option<PathBuf>,
     },
+    Corpus {
+        action: CorpusAction,
+        selection: Selection,
+        corpus: Option<PathBuf>,
+    },
+}
+
+/// What a corpus invocation does to the entries it selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CorpusAction {
+    Build,
+    Reproduce,
+    Verify,
+    List,
+}
+
+impl CorpusAction {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "build" => Some(Self::Build),
+            "reproduce" => Some(Self::Reproduce),
+            "verify" => Some(Self::Verify),
+            "list" => Some(Self::List),
+            _ => None,
+        }
+    }
 }
 
 /// Parses an invocation.
@@ -73,6 +132,7 @@ pub fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
     match text(&verb, "command")?.as_str() {
         "help" | "--help" | "-h" => Ok(Invocation::Help),
         "lab" => lab(args),
+        "corpus" => corpus(args),
         other => Err(Error::Usage(format!(
             "unknown command `{other}`. Run `entroq-bench help`."
         ))),
@@ -116,6 +176,75 @@ fn lab(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
         Invocation::Build { codec, lab }
     } else {
         Invocation::Verify { codec, lab }
+    })
+}
+
+fn corpus(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
+    let action = args.next().ok_or_else(|| {
+        Error::Usage(String::from(
+            "corpus: name an action: build, reproduce, verify, or list",
+        ))
+    })?;
+    let action = CorpusAction::parse(&text(&action, "action")?).ok_or_else(|| {
+        Error::Usage(String::from(
+            "corpus: unknown action. Use build, reproduce, verify, or list.",
+        ))
+    })?;
+
+    let mut selection: Option<Selection> = None;
+    let mut corpus: Option<PathBuf> = None;
+    while let Some(arg) = args.next() {
+        let flag = text(&arg, "argument")?;
+        let chosen = match flag.as_str() {
+            "--all" => Some(Selection::All),
+            "--group" => {
+                let name = text(&next(&mut args, "--group")?, "--group")?;
+                Some(Selection::Group(Group::parse(&name).ok_or_else(|| {
+                    Error::Usage(format!(
+                        "`{name}` is not a corpus group. The registry holds {}.",
+                        registry::group_names()
+                    ))
+                })?))
+            }
+            "--entry" => {
+                let name = text(&next(&mut args, "--entry")?, "--entry")?;
+                let entry = registry::find(&name).ok_or_else(|| {
+                    Error::Usage(format!(
+                        "`{name}` is not a registered corpus entry. Run \
+                         `entroq-bench corpus list --all`."
+                    ))
+                })?;
+                Some(Selection::Entry(entry.name))
+            }
+            "--corpus" => {
+                corpus = Some(PathBuf::from(next(&mut args, "--corpus")?));
+                None
+            }
+            other => {
+                return Err(Error::Usage(format!(
+                    "unexpected argument `{other}`. Run `entroq-bench help`."
+                )));
+            }
+        };
+        if let Some(chosen) = chosen {
+            if selection.is_some() {
+                return Err(Error::Usage(String::from(
+                    "corpus: name one of --all, --group, or --entry, not two",
+                )));
+            }
+            selection = Some(chosen);
+        }
+    }
+
+    let selection = selection.ok_or_else(|| {
+        Error::Usage(String::from(
+            "corpus: select entries with --all, --group <name>, or --entry <name>",
+        ))
+    })?;
+    Ok(Invocation::Corpus {
+        action,
+        selection,
+        corpus,
     })
 }
 
@@ -216,8 +345,98 @@ mod tests {
 
     #[test]
     fn the_help_names_every_competitor_and_the_build_input() {
-        for field in ["lz4", "zstd", "brotli", "snappy", "zlib", "LAB", "../lab"] {
+        for field in [
+            "lz4",
+            "zstd",
+            "brotli",
+            "snappy",
+            "zlib",
+            "LAB",
+            "../lab",
+            "CORPUS",
+            "../corpus",
+        ] {
             assert!(HELP.contains(field), "the help is missing `{field}`");
         }
+    }
+
+    fn corpus(args: &[&str]) -> Option<(super::CorpusAction, String, Option<String>)> {
+        match invoke(args) {
+            Ok(Invocation::Corpus {
+                action,
+                selection,
+                corpus,
+            }) => Some((
+                action,
+                selection.describe(),
+                corpus.map(|p| p.display().to_string()),
+            )),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_corpus_action_carries_its_selection() {
+        assert_eq!(
+            corpus(&["corpus", "build", "--group", "project"]).map(|c| (c.0, c.1)),
+            Some((
+                super::CorpusAction::Build,
+                String::from("the project group")
+            ))
+        );
+        assert_eq!(
+            corpus(&["corpus", "verify", "--entry", "enwik8"]).map(|c| (c.0, c.1)),
+            Some((
+                super::CorpusAction::Verify,
+                String::from("the entry enwik8")
+            ))
+        );
+        assert_eq!(
+            corpus(&["corpus", "list", "--all"]).map(|c| (c.0, c.1)),
+            Some((super::CorpusAction::List, String::from("every entry")))
+        );
+    }
+
+    #[test]
+    fn a_corpus_action_keeps_the_cache_it_was_given() {
+        assert_eq!(
+            corpus(&["corpus", "build", "--all", "--corpus", "/tmp/corpus"]).and_then(|c| c.2),
+            Some(String::from("/tmp/corpus"))
+        );
+    }
+
+    #[test]
+    fn a_corpus_action_without_a_selection_is_rejected() {
+        assert!(invoke(&["corpus", "build"]).is_err());
+        assert!(invoke(&["corpus"]).is_err());
+    }
+
+    #[test]
+    fn two_selections_are_rejected_rather_than_one_silently_winning() {
+        assert!(invoke(&["corpus", "build", "--all", "--group", "project"]).is_err());
+        assert!(
+            invoke(&[
+                "corpus",
+                "build",
+                "--entry",
+                "enwik8",
+                "--entry",
+                "go-source"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_group_or_an_entry_nobody_registered_is_rejected_with_what_exists() {
+        let failure = invoke(&["corpus", "build", "--group", "silesia"]);
+        let message = failure.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("project"), "{message}");
+        assert!(invoke(&["corpus", "build", "--entry", "silesia"]).is_err());
+    }
+
+    #[test]
+    fn an_unknown_corpus_action_is_rejected() {
+        assert!(invoke(&["corpus", "delete", "--all"]).is_err());
     }
 }

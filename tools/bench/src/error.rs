@@ -19,6 +19,8 @@ pub enum Error {
     Tool { command: String, message: String },
     /// A laboratory build exists but does not hold what a later step needs.
     Lab { context: String, message: String },
+    /// A corpus entry is not the one the registry describes.
+    Corpus { context: String, message: String },
 }
 
 impl Error {
@@ -49,6 +51,13 @@ impl Error {
             message: message.into(),
         }
     }
+
+    pub fn corpus(context: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Corpus {
+            context: context.into(),
+            message: message.into(),
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -57,7 +66,9 @@ impl fmt::Display for Error {
             Self::Usage(message) => write!(f, "{message}"),
             Self::Io { context, source } => write!(f, "could not {context}: {source}"),
             Self::Tool { command, message } => write!(f, "`{command}` {message}"),
-            Self::Lab { context, message } => write!(f, "{context}: {message}"),
+            Self::Lab { context, message } | Self::Corpus { context, message } => {
+                write!(f, "{context}: {message}")
+            }
         }
     }
 }

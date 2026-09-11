@@ -75,8 +75,51 @@ result.
 A pinned build is never rebuilt in place. A new build of the same project takes a new
 version directory, so an old result keeps pointing at the build that produced it.
 
+## The corpus
+
+A measurement reads a corpus. The registry that describes every corpus entry is code; the
+bytes are not. The cache lives outside the repository, under `../corpus` by default. Set
+`CORPUS` to change that path.
+
+```sh
+make corpus          # materialize every entry, one segment per group
+make corpus-resume   # continue the current corpus campaign where it stopped
+```
+
+The registry holds two kinds of entry.
+
+A project entry is generated from a seed the registry records, through a sequence the
+repository owns. It reads no clock, no environment, and no container whose iteration order
+is unspecified, so one seed produces one set of bytes on every host. `make corpus`
+generates every project entry twice, into two directories neither generation shares, and
+fails unless both match each other and the digest the registry pins.
+
+A public entry is fetched from its distributor. Its archive is checked against the
+recorded checksum as it arrives, and the bytes it unpacks to are checked against the
+digest the registry pins. A fetch needs a network, `curl`, and `unzip` or `gzip`.
+
+Every entry states its license and what established it. An entry whose license cannot be
+established is not registered, because a published number measured on it would carry a
+redistribution claim nobody checked. Two widely used corpora are absent for that reason.
+
+Every entry falls in exactly one size class, and a benchmark tier selects a class:
+
+| Class | Size |
+|---|---|
+| `tiny` | under 1 KiB |
+| `small` | 1 KiB to 64 KiB |
+| `medium` | 64 KiB to 4 MiB |
+| `large` | 4 MiB to 100 MiB |
+| `huge` | 100 MiB and above, streamed |
+
 Prefer many distinct small inputs to one large input. Variety finds more defects per
 second than volume.
+
+To see the registry, including the source, checksum, and license of every entry:
+
+```sh
+cargo run --release --package entroq-bench -- corpus list --all
+```
 
 ## Integration
 

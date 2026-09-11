@@ -37,6 +37,38 @@ pub fn run(argv: &[String], working_dir: &Path) -> Result<()> {
     ))
 }
 
+/// Runs a command and writes its standard output to `path`, replacing whatever is there.
+///
+/// The output is streamed to the file by the operating system, so an archive member of any
+/// size passes through without the tool holding it.
+///
+/// # Errors
+///
+/// Fails when the file cannot be created, the command cannot be started, or the command
+/// exits with anything but success.
+pub fn run_into(argv: &[String], working_dir: &Path, path: &Path) -> Result<()> {
+    let (program, rest) = split(argv)?;
+    let description = describe(argv);
+    let sink = std::fs::File::create(path).map_err(|e| Error::at("create", path, e))?;
+    let status = Command::new(program)
+        .args(rest)
+        .current_dir(working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(sink))
+        .status()
+        .map_err(|e| Error::io(format!("start `{description}`"), e))?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(Error::tool(
+        description,
+        status.code().map_or_else(
+            || String::from("was terminated by a signal"),
+            |code| format!("exited {code}"),
+        ),
+    ))
+}
+
 /// Runs a command and returns its trimmed standard output.
 ///
 /// # Errors
@@ -88,8 +120,24 @@ fn split(argv: &[String]) -> Result<(&String, &[String])> {
 
 #[cfg(test)]
 mod tests {
-    use super::{argv, capture, describe, run};
+    use super::{argv, capture, describe, run, run_into};
     use std::path::Path;
+
+    #[test]
+    fn a_redirected_command_writes_its_output_to_the_file() {
+        let path = std::env::temp_dir().join("entroq-bench-exec-redirect");
+        assert!(run_into(&argv(["echo", "member"]), Path::new("."), &path).is_ok());
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("member\n")
+        );
+    }
+
+    #[test]
+    fn a_redirected_command_that_fails_is_reported() {
+        let path = std::env::temp_dir().join("entroq-bench-exec-redirect-fail");
+        assert!(run_into(&argv(["false"]), Path::new("."), &path).is_err());
+    }
 
     #[test]
     fn an_argument_vector_describes_itself_as_one_line() {

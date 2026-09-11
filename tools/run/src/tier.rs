@@ -194,6 +194,77 @@ const LAB_SEGMENTS: &[Segment] = &[
     ),
 ];
 
+/// One corpus segment: one action of the benchmark tool over one part of the registry.
+///
+/// Each group is its own segment, so one fetch fits the segment budget, one unreachable
+/// upstream blocks one group, and a resumed campaign re-fetches only what did not pass.
+macro_rules! corpus_step {
+    ($action:literal, $selector:literal, $what:literal) => {
+        Step {
+            program: "cargo",
+            args: &[
+                "run",
+                "--quiet",
+                "--release",
+                "--package",
+                "entroq-bench",
+                "--",
+                "corpus",
+                $action,
+                $selector,
+                $what,
+            ],
+        }
+    };
+}
+
+const CORPUS_SEGMENTS: &[Segment] = &[
+    Segment {
+        id: "corpus-registry",
+        description: "The registry states a source, a checksum, a size, a class, and a \
+                      license for every entry.",
+        steps: &[Step {
+            program: "cargo",
+            args: &[
+                "run",
+                "--quiet",
+                "--release",
+                "--package",
+                "entroq-bench",
+                "--",
+                "corpus",
+                "list",
+                "--all",
+            ],
+        }],
+    },
+    Segment {
+        id: "corpus-generate-project",
+        description: "Every project entry generates from its recorded seed, and generates \
+                      the same bytes twice.",
+        steps: &[
+            corpus_step!("build", "--group", "project"),
+            corpus_step!("reproduce", "--group", "project"),
+        ],
+    },
+    Segment {
+        id: "corpus-fetch-enwik8",
+        description: "The enwik8 snapshot fetches and matches its recorded checksum.",
+        steps: &[corpus_step!("build", "--entry", "enwik8")],
+    },
+    Segment {
+        id: "corpus-fetch-sourcecode",
+        description: "The pinned source tree fetches and matches its recorded checksum.",
+        steps: &[corpus_step!("build", "--group", "sourcecode")],
+    },
+    Segment {
+        id: "corpus-fetch-gutenberg",
+        description: "Every Project Gutenberg entry fetches and matches its recorded \
+                      checksum.",
+        steps: &[corpus_step!("build", "--group", "gutenberg")],
+    },
+];
+
 /// A named set of segments, and what a campaign over that set does and does not cover.
 ///
 /// A suite is what is run. A tier is how it is bounded and recorded.
@@ -203,6 +274,8 @@ pub enum Suite {
     Workspace,
     /// The competitor laboratory: one pinned build per competitor.
     Lab,
+    /// The corpus registry: the project corpus, and every registered public corpus.
+    Corpus,
 }
 
 impl Suite {
@@ -211,6 +284,7 @@ impl Suite {
         match name {
             "workspace" => Some(Self::Workspace),
             "lab" => Some(Self::Lab),
+            "corpus" => Some(Self::Corpus),
             _ => None,
         }
     }
@@ -219,6 +293,7 @@ impl Suite {
         match self {
             Self::Workspace => "workspace",
             Self::Lab => "lab",
+            Self::Corpus => "corpus",
         }
     }
 
@@ -227,6 +302,7 @@ impl Suite {
         match self {
             Self::Workspace => "workspace-gate",
             Self::Lab => "lab-build",
+            Self::Corpus => "corpus-registry",
         }
     }
 
@@ -244,6 +320,10 @@ impl Suite {
             Self::Lab => match tier {
                 Tier::Smoke | Tier::Dev => &[],
                 Tier::Gate | Tier::Publication => LAB_SEGMENTS,
+            },
+            Self::Corpus => match tier {
+                Tier::Smoke | Tier::Dev => &[],
+                Tier::Gate | Tier::Publication => CORPUS_SEGMENTS,
             },
         }
     }
@@ -264,6 +344,14 @@ impl Suite {
                  revision. A segment reports whether one competitor built at its pinned \
                  commit and rebuilt from its own recorded commands."
             }
+            Self::Corpus => {
+                "Corpus registry only. No segment compresses a byte. One segment records \
+                 the registry itself: the source, the checksum, the size, the class, and \
+                 the license of every entry. Every other segment reports whether one part \
+                 of the registry materialized into the cache and matched the checksum the \
+                 registry pins, and whether a generated entry produces the same bytes \
+                 twice from its recorded seed."
+            }
         }
     }
 
@@ -281,6 +369,16 @@ impl Suite {
                  recorded command produced against the bytes the pinned build holds; it \
                  does not prove that the two builds behave identically, and a difference \
                  in those bytes is recorded rather than failed."
+            }
+            Self::Corpus => {
+                "The campaign ran on one host and one architecture. It measured no \
+                 compression ratio and no throughput. A fetch segment proves that an \
+                 upstream artifact still serves the recorded bytes; it proves nothing \
+                 about how that artifact was produced, and its duration is a property of \
+                 the network it ran on. An entry whose license cannot be established, or \
+                 whose fetch cannot finish inside one segment budget, is not registered, \
+                 so the registry is bounded by what is licensed and obtainable rather \
+                 than by what exists."
             }
         }
     }
@@ -345,7 +443,7 @@ mod tests {
     use super::{SEGMENT_BUDGET, Suite, Tier};
 
     const TIERS: [Tier; 4] = [Tier::Smoke, Tier::Dev, Tier::Gate, Tier::Publication];
-    const SUITES: [Suite; 2] = [Suite::Workspace, Suite::Lab];
+    const SUITES: [Suite; 3] = [Suite::Workspace, Suite::Lab, Suite::Corpus];
 
     #[test]
     fn every_tier_name_round_trips() {
@@ -381,6 +479,42 @@ mod tests {
     fn an_unknown_suite_is_rejected() {
         assert!(Suite::parse("competitors").is_none());
         assert!(Suite::parse("").is_none());
+    }
+
+    #[test]
+    fn the_corpus_suite_runs_one_segment_per_corpus_group() {
+        let segments = Suite::Corpus.segments(Tier::Gate);
+        let ids: Vec<&str> = segments.iter().map(|segment| segment.id).collect();
+        for expected in [
+            "corpus-registry",
+            "corpus-generate-project",
+            "corpus-fetch-enwik8",
+            "corpus-fetch-sourcecode",
+            "corpus-fetch-gutenberg",
+        ] {
+            assert!(ids.contains(&expected), "{expected} is not a segment");
+        }
+        assert_eq!(segments.len(), 5);
+    }
+
+    #[test]
+    fn the_corpus_suite_has_no_segments_at_a_tier_that_does_not_segment() {
+        assert!(Suite::Corpus.segments(Tier::Smoke).is_empty());
+        assert!(Suite::Corpus.segments(Tier::Dev).is_empty());
+    }
+
+    #[test]
+    fn the_corpus_suite_proves_generation_before_it_proves_a_fetch() {
+        // A host with no network still runs the segments that need none, and a campaign
+        // that stops at the first failure reports the cheapest one first.
+        let ids: Vec<&str> = Suite::Corpus
+            .segments(Tier::Gate)
+            .iter()
+            .map(|segment| segment.id)
+            .collect();
+        let generate = ids.iter().position(|id| *id == "corpus-generate-project");
+        let fetch = ids.iter().position(|id| id.starts_with("corpus-fetch-"));
+        assert!(generate < fetch);
     }
 
     #[test]
@@ -432,7 +566,11 @@ mod tests {
 
     #[test]
     fn no_two_suites_share_a_topic_so_no_resume_picks_the_wrong_record() {
-        assert_ne!(Suite::Workspace.default_topic(), Suite::Lab.default_topic());
+        let mut topics: Vec<&str> = SUITES.iter().map(|suite| suite.default_topic()).collect();
+        let count = topics.len();
+        topics.sort_unstable();
+        topics.dedup();
+        assert_eq!(topics.len(), count);
     }
 
     #[test]
@@ -447,6 +585,12 @@ mod tests {
     fn the_laboratory_suite_says_it_measured_no_compression() {
         assert!(Suite::Lab.coverage().contains("compresses a byte"));
         assert!(Suite::Lab.limits().contains("no throughput"));
+    }
+
+    #[test]
+    fn the_corpus_suite_says_it_measured_no_compression() {
+        assert!(Suite::Corpus.coverage().contains("compresses a byte"));
+        assert!(Suite::Corpus.limits().contains("no throughput"));
     }
 
     #[test]
