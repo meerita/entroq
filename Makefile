@@ -1,13 +1,12 @@
 # Entroq repository entry point.
 #
-# `09-build-and-tooling.md` owns the entry point policy. Each target delegates
-# to the tool that owns the implementation. Do not duplicate delegated logic
-# here.
+# Each target delegates to the tool that owns the implementation. Do not
+# duplicate delegated logic here.
 #
-# The workspace and the validation runner do not exist until M0 creates them.
-# Until then these targets report that there is nothing to build or to run.
+# The validation runner does not exist yet, so every target that invokes it
+# fails. The build, format, and lint targets work.
 #
-# `41-validation-runs.md` owns the tiers. No segment may exceed 120 seconds.
+# No validation segment may exceed 120 seconds.
 #
 # Build inputs:
 #
