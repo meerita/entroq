@@ -44,6 +44,7 @@ make help       # list every target
 make build      # compile the workspace
 make check      # type check the workspace
 make validate   # format check, lint, and the dev validation tier
+make ci         # run the gates on a clean Linux host, in a container
 ```
 
 `make build` compiles nothing until the workspace exists.

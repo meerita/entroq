@@ -42,16 +42,27 @@
 #   TARGET  The fuzz target to advance by one segment.
 #           Scope:    fuzz.
 #           Required: yes, for fuzz.
+#
+#   PLATFORM
+#           The platform an integration lane runs on: linux/amd64 or
+#           linux/arm64.
+#           Scope:    ci, ci-validate.
+#           Required: no.
+#           Default:  the platform of the host. A platform the host must
+#                     emulate still runs, and the lane reports it as
+#                     emulated. An emulated platform is not an architecture
+#                     result.
 
 CARGO ?= cargo
 LAB ?= ../lab
 RUNS ?= ../runs
 TIER ?= dev
+PLATFORM ?=
 
 # Repository tooling, versioned with the code whose gates it runs.
 RUNNER = $(CARGO) run --quiet --release --package entroq-run --
 
-.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume fuzz bench validate clean
+.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume fuzz bench validate ci ci-validate clean
 
 help:
 	@echo "build      compile the workspace"
@@ -68,6 +79,8 @@ help:
 	@echo "fuzz       advance one fuzz target by one bounded segment (TARGET=<name>)"
 	@echo "bench      benchmark campaign at TIER"
 	@echo "validate   fmt-check, lint, and the dev tier"
+	@echo "ci         fmt-check, lint, build, and the smoke tier, in a clean container"
+	@echo "ci-validate  validate in a clean container, recorded"
 	@echo "clean      remove build artifacts"
 
 build:
@@ -123,6 +136,16 @@ bench:
 	$(RUNNER) bench --tier $(TIER) --lab $(LAB) --runs $(RUNS)
 
 validate: fmt-check lint test
+
+# Integration. The same gates run on a clean Linux host that carries the
+# pinned toolchain and nothing of the developer's machine. The container
+# mounts the repository read only, so a lane cannot write inside it.
+
+ci:
+	PLATFORM=$(PLATFORM) ci/ci.sh gates
+
+ci-validate:
+	PLATFORM=$(PLATFORM) RUNS=$(RUNS) ci/ci.sh validate
 
 clean:
 	$(CARGO) clean

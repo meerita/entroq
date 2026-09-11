@@ -78,6 +78,34 @@ version directory, so an old result keeps pointing at the build that produced it
 Prefer many distinct small inputs to one large input. Variety finds more defects per
 second than volume.
 
+## Integration
+
+The same gates run on a clean Linux host, in a container this repository builds. The
+container carries the toolchain that `rust-toolchain.toml` names, and nothing of your
+machine. It mounts the repository read only, so an integration lane cannot write inside
+the repository.
+
+```sh
+make ci           # format check, lint, build, and the smoke tier, in the container
+make ci-validate  # format check, lint, and the dev tier, in the container, recorded
+```
+
+`make ci-validate` writes its record under `RUNS`, the same as `make test`. The record
+names the container as the host that produced it.
+
+A lane runs on the platform of the host. Set `PLATFORM` to name another one.
+
+```sh
+make ci PLATFORM=linux/amd64
+```
+
+A platform that the host must emulate still runs, and the lane states that it is
+emulated. An emulated platform shows that the gates run. It is not a result for that
+architecture.
+
+Docker is the only host requirement of an integration lane. Every tier also runs directly
+on a machine without it.
+
 ## Commits and branches
 
 `master` is the integration branch. Keep it buildable and validated.

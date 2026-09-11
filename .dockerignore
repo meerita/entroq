@@ -1,0 +1,5 @@
+# The integration image carries no source. Its build needs one file, so the
+# build context holds one file. Everything else is excluded, including build
+# output, which no image layer should ever receive.
+*
+!rust-toolchain.toml
