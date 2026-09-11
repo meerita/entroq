@@ -1,0 +1,27 @@
+* text=auto eol=lf
+
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+Makefile text eol=lf
+
+# Corpus and codec artifacts are bytes. Git must not transform them.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.bin binary
+*.raw binary
+*.zst binary
+*.lz4 binary
+*.br binary
+*.gz binary
+*.snappy binary
+*.deflate binary
+*.tar binary
+*.zip binary
