@@ -90,6 +90,11 @@ fn open_output(segment: &Segment, output: &Output) -> Result<Option<(File, File)
     let Output::Directory(dir) = output else {
         return Ok(None);
     };
+    // A directory already here belongs to an attempt that was interrupted before it wrote a
+    // journal line. No line cites it, and keeping it would blend two attempts into one.
+    if dir.exists() {
+        std::fs::remove_dir_all(dir).map_err(|e| Error::at("clear", dir, e))?;
+    }
     std::fs::create_dir_all(dir).map_err(|e| Error::at("create", dir, e))?;
     let commands = segment
         .steps
@@ -193,8 +198,10 @@ fn clone_log(file: &File, description: &str) -> Result<Stdio> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Outcome, describe};
-    use crate::tier::Step;
+    use super::{Outcome, Output, describe, run_segment};
+    use crate::tier::{Segment, Step};
+    use std::path::Path;
+    use std::time::Duration;
 
     #[test]
     fn a_step_describes_its_exact_argv() {
@@ -217,6 +224,32 @@ mod tests {
             code: Some(101),
         };
         assert_eq!(outcome.note().as_deref(), Some("`cargo test` exited 101"));
+    }
+
+    #[test]
+    fn an_interrupted_attempt_does_not_leak_output_into_its_retry() {
+        let dir = std::env::temp_dir().join("entroq-run-exec-retry");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        assert!(std::fs::write(dir.join("stdout.txt"), b"interrupted attempt").is_ok());
+
+        let segment = Segment {
+            id: "echo",
+            description: "A segment that writes one known line.",
+            steps: &[Step {
+                program: "echo",
+                args: &["second"],
+            }],
+        };
+        let run = run_segment(
+            &segment,
+            Path::new("."),
+            Duration::from_secs(10),
+            &Output::Directory(dir.clone()),
+        );
+        assert!(matches!(run, Ok((Outcome::Pass, _))));
+        let stdout = std::fs::read_to_string(dir.join("stdout.txt")).unwrap_or_default();
+        assert_eq!(stdout, "second\n");
     }
 
     #[test]
