@@ -88,6 +88,7 @@ fn source(document: &Document) -> Value {
         "tier_is_publication": document.tier_is_publication,
         "codec": document.codec,
         "size_class": document.size_class,
+        "operating_point_group": document.operating_point_group,
         "produced_at": document.produced_at,
         "entroq_measured": document.entroq_measured,
         "measurements": document.rows.len(),
@@ -224,6 +225,9 @@ fn limits(documents: &[Document], charts: &[Chart]) -> Value {
              converted, or retyped.",
         ),
     ];
+    for line in integrity(documents) {
+        limits.push(line);
+    }
     for chart in charts {
         if !limits.contains(&chart.subject.tier_licence) {
             limits.push(chart.subject.tier_licence.clone());
@@ -237,6 +241,26 @@ fn limits(documents: &[Document], charts: &[Chart]) -> Value {
         }
     }
     Value::from(limits)
+}
+
+/// What each competitor's measured bytes were protected by, one line each.
+///
+/// A comparison of throughput across codecs is only fair when the work behind each number is
+/// equivalent, and a checksum is work. So the frontier states the integrity setting every
+/// point on it was produced under, rather than leaving a reader to assume they agree.
+fn integrity(documents: &[Document]) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for row in documents.iter().flat_map(|document| &document.rows) {
+        let line = format!(
+            "Integrity setting for {}, and the thread count behind every number from it: {} \
+             Threads: {}.",
+            row.display_name, row.integrity, row.threads
+        );
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    lines
 }
 
 /// Writes a document to standard output.

@@ -25,7 +25,7 @@ use crate::error::{Error, Result};
 use crate::lab;
 use crate::laboratory::{self, Check};
 use crate::metric::{Metric, Set};
-use crate::plan::{self, Points, Request, STREAM_CHUNK, Selection, Tier};
+use crate::plan::{self, Request, STREAM_CHUNK, Selection, Tier};
 use crate::registry::{ENTRIES, Entry, SizeClass};
 use crate::{alloc, counters};
 
@@ -43,6 +43,7 @@ pub struct Measurement {
     pub version: &'static str,
     pub operating_point: String,
     pub format: &'static str,
+    pub integrity: &'static str,
     pub entry: &'static str,
     pub group: &'static str,
     pub class: &'static str,
@@ -99,10 +100,7 @@ pub fn run(request: &Request) -> Result<Outcome> {
         .class
         .map_or_else(|| request.tier.classes().to_vec(), |class| vec![class]);
     let selection = plan::select(request.tier, &classes, ENTRIES);
-    let points: Vec<&str> = match request.tier.points() {
-        Points::Default => vec![request.codec.default_point],
-        Points::Every => request.codec.operating_points.to_vec(),
-    };
+    let points = plan::points(request);
 
     let mut linked_version = None;
     let mut measurements = Vec::new();
@@ -324,6 +322,7 @@ fn measure(
         version: request.codec.version,
         operating_point: String::from(point),
         format: notes.format,
+        integrity: notes.integrity,
         entry: entry.name,
         group: entry.group.name(),
         class: entry.class().name(),

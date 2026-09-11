@@ -50,6 +50,9 @@ pub fn document(request: &Request, outcome: &Outcome, produced_at: &str) -> Valu
         "tier_licence": request.tier.licence(),
         "codec": request.codec.name,
         "size_class": request.class.map_or(Value::Null, |class| Value::from(class.name())),
+        "operating_point_group": request
+            .points
+            .map_or(Value::Null, |group| Value::from(group.name)),
         "entroq": {
             "measured": false,
             "reason": ENTROQ_ABSENT,
@@ -194,6 +197,7 @@ fn measurement_json(measurement: &Measurement) -> Value {
         "version": measurement.version,
         "operating_point": measurement.operating_point,
         "format": measurement.format,
+        "integrity": measurement.integrity,
         "entry": measurement.entry,
         "group": measurement.group,
         "class": measurement.class,

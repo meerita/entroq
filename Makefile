@@ -204,9 +204,12 @@ fuzz-driver:
 fuzz: fuzz-driver
 	$(RUNNER) fuzz run --target $(TARGET) --runs $(RUNS)
 
-# The benchmark. One segment per competitor, and one per competitor and size
-# class at a segmented tier, so a segment holds one budget and a resumed campaign
-# re-measures only what did not pass.
+# The benchmark. One segment per competitor, and one per competitor, operating
+# point group, and size class at a segmented tier, so a segment holds one budget
+# and a resumed campaign re-measures only what did not pass. A segmented tier
+# measures every pinned operating point, and the cost of one point spans three
+# orders of magnitude inside one project, so the points of a competitor are
+# grouped by cost rather than measured together.
 #
 # Each segment measures its competitor in-process, through the library built into
 # $(LAB), and writes one machine-readable result into the segment's evidence

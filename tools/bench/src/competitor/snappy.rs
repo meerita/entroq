@@ -60,6 +60,9 @@ impl Session {
             format: "the Snappy block format, as snappy_compress produces it. The framing \
                      format carries a stream header and per-chunk checksums this format \
                      does not.",
+            integrity: "None. The block format defines no checksum, so none was enabled and \
+                        none was disabled. The per-chunk CRC-32C of the framing format is \
+                        outside what this measurement produced.",
             state_bytes: Method::Absent(
                 "Snappy publishes no state-size call and no allocator hook, so the working \
                  memory its C++ implementation holds is not reachable from the harness.",

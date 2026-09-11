@@ -129,6 +129,9 @@ impl Session {
             format: "the LZ4 block format, as LZ4_compress_fast_extState and \
                      LZ4_compress_HC_extStateHC produce it. The frame format carries a \
                      header and an optional checksum this format does not.",
+            integrity: "None. The block format defines no checksum, so none was enabled and \
+                        none was disabled. The optional content checksum of the frame format \
+                        is outside what this measurement produced.",
             state_bytes: Method::By("LZ4_sizeofState and LZ4_sizeofStateHC"),
             allocations: Method::By(
                 "the harness allocator, which owns the compression state the library's \

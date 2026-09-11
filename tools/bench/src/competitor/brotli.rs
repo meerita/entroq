@@ -104,6 +104,8 @@ impl Session {
         Notes {
             format: "the Brotli stream, as BrotliEncoderCompressStream produces it. The \
                      window is left at the encoder's own default for the quality.",
+            integrity: "None. Brotli defines no checksum in its format, so there is none to \
+                        enable and none to disable.",
             state_bytes: Method::By(
                 "the harness allocator, which BrotliEncoderCreateInstance is given. The \
                  project publishes no state-size call.",

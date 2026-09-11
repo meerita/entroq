@@ -4,8 +4,24 @@
 //! A competitor is pinned to the commit behind its release tag, never to the tag. A tag can
 //! move. A result that names a tag cannot say what it measured.
 //!
+//! The operating points of a competitor are grouped, because the cost of one point spans
+//! three orders of magnitude inside one project: Brotli q11 compresses a megabyte for what
+//! q0 spends on a hundred. A group is what one segment covers, so a slow point is measured
+//! beside points of its own cost rather than beside the cheap ones it would push over the
+//! segment budget. The grouping decides what fits a budget. It does not decide what is
+//! measured: every pinned point belongs to exactly one group.
+//!
 //! This module does not own the laboratory layout, the manifest, or the build. It owns only
 //! what is true of each competitor before anything is fetched.
+
+/// A set of operating points that one segment covers.
+///
+/// The name is what a segment identifier carries after the codec name, so it is stable
+/// across runs and across a resume.
+pub struct PointGroup {
+    pub name: &'static str,
+    pub points: &'static [&'static str],
+}
 
 /// One pinned competitor build.
 pub struct Codec {
@@ -24,8 +40,9 @@ pub struct Codec {
     pub options: &'static [&'static str],
     /// Every library the install step produces, relative to the prefix.
     pub libraries: &'static [&'static str],
-    /// The operating points a comparison covers, not only the default level.
-    pub operating_points: &'static [&'static str],
+    /// The operating points a comparison covers, not only the default level, grouped by
+    /// what one segment can afford to measure together.
+    pub point_groups: &'static [PointGroup],
     /// The point this project's own interface selects when a caller states no level.
     ///
     /// A tier that measures direction rather than a frontier measures this one, so a cheap
@@ -48,8 +65,15 @@ const LZ4: Codec = Codec {
         "-DLZ4_BUILD_CLI=OFF",
     ],
     libraries: &["lib/liblz4.a"],
-    operating_points: &[
-        "fast-1", "fast-3", "fast-5", "fast-9", "hc-1", "hc-4", "hc-9", "hc-12",
+    point_groups: &[
+        PointGroup {
+            name: "fast",
+            points: &["fast-1", "fast-3", "fast-5", "fast-9"],
+        },
+        PointGroup {
+            name: "hc",
+            points: &["hc-1", "hc-4", "hc-9", "hc-12"],
+        },
     ],
     default_point: "fast-1",
     format_note: None,
@@ -69,8 +93,19 @@ const ZSTD: Codec = Codec {
         "-DZSTD_BUILD_TESTS=OFF",
     ],
     libraries: &["lib/libzstd.a"],
-    operating_points: &[
-        "level-1", "level-3", "level-6", "level-9", "level-12", "level-15", "level-19", "level-22",
+    point_groups: &[
+        PointGroup {
+            name: "low",
+            points: &["level-1", "level-3", "level-6", "level-9"],
+        },
+        PointGroup {
+            name: "high",
+            points: &["level-12", "level-15", "level-19"],
+        },
+        PointGroup {
+            name: "max",
+            points: &["level-22"],
+        },
     ],
     default_point: "level-3",
     format_note: None,
@@ -93,7 +128,20 @@ const BROTLI: Codec = Codec {
         "lib/libbrotlidec.a",
         "lib/libbrotlienc.a",
     ],
-    operating_points: &["q0", "q2", "q5", "q9", "q11"],
+    point_groups: &[
+        PointGroup {
+            name: "low",
+            points: &["q0", "q2", "q5"],
+        },
+        PointGroup {
+            name: "high",
+            points: &["q9"],
+        },
+        PointGroup {
+            name: "max",
+            points: &["q11"],
+        },
+    ],
     default_point: "q11",
     format_note: None,
 };
@@ -111,7 +159,10 @@ const SNAPPY: Codec = Codec {
         "-DSNAPPY_BUILD_BENCHMARKS=OFF",
     ],
     libraries: &["lib/libsnappy.a"],
-    operating_points: &["default"],
+    point_groups: &[PointGroup {
+        name: "default",
+        points: &["default"],
+    }],
     default_point: "default",
     format_note: Some(
         "Snappy defines a block format and a framing format, and the two are not \
@@ -135,13 +186,46 @@ const ZLIB: Codec = Codec {
         "-DZLIB_BUILD_TESTING=OFF",
     ],
     libraries: &["lib/libz.a"],
-    operating_points: &["level-1", "level-6", "level-9"],
+    point_groups: &[
+        PointGroup {
+            name: "low",
+            points: &["level-1", "level-6"],
+        },
+        PointGroup {
+            name: "high",
+            points: &["level-9"],
+        },
+    ],
     default_point: "level-6",
     format_note: None,
 };
 
 /// Every competitor the laboratory holds.
 pub const CODECS: &[Codec] = &[LZ4, ZSTD, BROTLI, SNAPPY, ZLIB];
+
+impl Codec {
+    /// Every operating point this competitor is measured at, in group order.
+    pub fn operating_points(&self) -> Vec<&'static str> {
+        self.point_groups
+            .iter()
+            .flat_map(|group| group.points.iter().copied())
+            .collect()
+    }
+
+    /// The group a `--points` argument names.
+    pub fn group(&self, name: &str) -> Option<&'static PointGroup> {
+        self.point_groups.iter().find(|group| group.name == name)
+    }
+
+    /// Every group name, in catalog order, for a usage message.
+    pub fn group_names(&self) -> String {
+        self.point_groups
+            .iter()
+            .map(|group| group.name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
 
 /// Finds a competitor by the name a segment or a result uses.
 pub fn find(name: &str) -> Option<&'static Codec> {
@@ -199,7 +283,7 @@ mod tests {
     fn every_codec_names_the_point_its_own_project_defaults_to() {
         for codec in CODECS {
             assert!(
-                codec.operating_points.contains(&codec.default_point),
+                codec.operating_points().contains(&codec.default_point),
                 "{} defaults to {}, which is not one of its points",
                 codec.name,
                 codec.default_point
@@ -212,7 +296,7 @@ mod tests {
         for codec in CODECS {
             assert!(!codec.libraries.is_empty(), "{} builds nothing", codec.name);
             assert!(
-                !codec.operating_points.is_empty(),
+                !codec.operating_points().is_empty(),
                 "{} measures nothing",
                 codec.name
             );
@@ -234,6 +318,51 @@ mod tests {
                 .any(|option| option.contains("SHARED") && option.ends_with("=OFF"));
             assert!(shared, "{} does not disable its shared library", codec.name);
         }
+    }
+
+    #[test]
+    fn every_point_belongs_to_exactly_one_group() {
+        for codec in CODECS {
+            let mut points = codec.operating_points();
+            let covered = points.len();
+            points.sort_unstable();
+            points.dedup();
+            assert_eq!(
+                points.len(),
+                covered,
+                "{} measures a point in two groups",
+                codec.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_group_is_named_once_and_measures_something() {
+        for codec in CODECS {
+            let mut names: Vec<&str> = codec.point_groups.iter().map(|g| g.name).collect();
+            let count = names.len();
+            names.sort_unstable();
+            names.dedup();
+            assert_eq!(names.len(), count, "{} names a group twice", codec.name);
+            for group in codec.point_groups {
+                assert!(
+                    !group.points.is_empty(),
+                    "{} group {} measures nothing",
+                    codec.name,
+                    group.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_group_nobody_pinned_is_not_found() {
+        let Some(zstd) = find("zstd") else {
+            unreachable!("zstd is pinned in the catalog")
+        };
+        assert!(zstd.group("low").is_some());
+        assert!(zstd.group("fast").is_none());
+        assert!(zstd.group_names().contains("max"));
     }
 
     #[test]

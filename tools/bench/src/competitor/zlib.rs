@@ -133,6 +133,9 @@ impl Session {
         Notes {
             format: "raw deflate, with no container. The zlib and gzip containers each add \
                      a header and a checksum this format does not carry.",
+            integrity: "None. Raw deflate defines no checksum. The Adler-32 of the zlib \
+                        container and the CRC-32 of the gzip container are outside what this \
+                        measurement produced.",
             state_bytes: Method::By(
                 "the harness allocator, which the stream's zalloc hook is set to. The \
                  project publishes no state-size call.",

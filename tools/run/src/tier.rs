@@ -358,29 +358,103 @@ const BENCH_DEV_SEGMENTS: &[Segment] = &[
     bench_segment!("dev", "zlib"),
 ];
 
-/// A segmented tier splits by size class as well, because the cost of a class grows
-/// with the input it covers and a segment holds one budget.
+/// One baseline segment: one competitor, at one group of its operating points, over one size
+/// class.
+///
+/// The gate tier measures every point the catalog pins, and the cost of one point spans three
+/// orders of magnitude inside one project. Zstandard 22 and Brotli q11 each cost more over
+/// the large class than every cheaper point of the same competitor put together, so a segment
+/// covers one group rather than one competitor. The group is what keeps a segment inside its
+/// budget; the class is what keeps it inside the input the tier reaches.
+///
+/// The segment identifier is passed to the harness, so the result document names the segment
+/// the runner recorded it under rather than a name it derived for itself.
+macro_rules! baseline_segment {
+    ($codec:literal, $group:literal, $class:literal) => {
+        Segment {
+            id: concat!("baseline-", $codec, "-", $group, "-", $class),
+            description: concat!(
+                "Every metric the gate tier covers, for ",
+                $codec,
+                " at its ",
+                $group,
+                " operating points, over the ",
+                $class,
+                " size class."
+            ),
+            steps: &[Step {
+                program: "cargo",
+                args: &[
+                    "run",
+                    "--quiet",
+                    "--release",
+                    "--package",
+                    "entroq-bench",
+                    "--",
+                    "measure",
+                    "--tier",
+                    "gate",
+                    "--codec",
+                    $codec,
+                    "--points",
+                    $group,
+                    "--class",
+                    $class,
+                    "--segment",
+                    concat!("baseline-", $codec, "-", $group, "-", $class),
+                ],
+            }],
+        }
+    };
+}
+
+/// The competitor baseline. One segment per competitor, operating point group, and size
+/// class, which is the unit that holds one budget and that a resumed campaign re-runs alone.
 const BENCH_GATE_SEGMENTS: &[Segment] = &[
-    bench_segment!("gate", "lz4", "tiny"),
-    bench_segment!("gate", "lz4", "small"),
-    bench_segment!("gate", "lz4", "medium"),
-    bench_segment!("gate", "lz4", "large"),
-    bench_segment!("gate", "zstd", "tiny"),
-    bench_segment!("gate", "zstd", "small"),
-    bench_segment!("gate", "zstd", "medium"),
-    bench_segment!("gate", "zstd", "large"),
-    bench_segment!("gate", "brotli", "tiny"),
-    bench_segment!("gate", "brotli", "small"),
-    bench_segment!("gate", "brotli", "medium"),
-    bench_segment!("gate", "brotli", "large"),
-    bench_segment!("gate", "snappy", "tiny"),
-    bench_segment!("gate", "snappy", "small"),
-    bench_segment!("gate", "snappy", "medium"),
-    bench_segment!("gate", "snappy", "large"),
-    bench_segment!("gate", "zlib", "tiny"),
-    bench_segment!("gate", "zlib", "small"),
-    bench_segment!("gate", "zlib", "medium"),
-    bench_segment!("gate", "zlib", "large"),
+    baseline_segment!("lz4", "fast", "tiny"),
+    baseline_segment!("lz4", "fast", "small"),
+    baseline_segment!("lz4", "fast", "medium"),
+    baseline_segment!("lz4", "fast", "large"),
+    baseline_segment!("lz4", "hc", "tiny"),
+    baseline_segment!("lz4", "hc", "small"),
+    baseline_segment!("lz4", "hc", "medium"),
+    baseline_segment!("lz4", "hc", "large"),
+    baseline_segment!("zstd", "low", "tiny"),
+    baseline_segment!("zstd", "low", "small"),
+    baseline_segment!("zstd", "low", "medium"),
+    baseline_segment!("zstd", "low", "large"),
+    baseline_segment!("zstd", "high", "tiny"),
+    baseline_segment!("zstd", "high", "small"),
+    baseline_segment!("zstd", "high", "medium"),
+    baseline_segment!("zstd", "high", "large"),
+    baseline_segment!("zstd", "max", "tiny"),
+    baseline_segment!("zstd", "max", "small"),
+    baseline_segment!("zstd", "max", "medium"),
+    baseline_segment!("zstd", "max", "large"),
+    baseline_segment!("brotli", "low", "tiny"),
+    baseline_segment!("brotli", "low", "small"),
+    baseline_segment!("brotli", "low", "medium"),
+    baseline_segment!("brotli", "low", "large"),
+    baseline_segment!("brotli", "high", "tiny"),
+    baseline_segment!("brotli", "high", "small"),
+    baseline_segment!("brotli", "high", "medium"),
+    baseline_segment!("brotli", "high", "large"),
+    baseline_segment!("brotli", "max", "tiny"),
+    baseline_segment!("brotli", "max", "small"),
+    baseline_segment!("brotli", "max", "medium"),
+    baseline_segment!("brotli", "max", "large"),
+    baseline_segment!("snappy", "default", "tiny"),
+    baseline_segment!("snappy", "default", "small"),
+    baseline_segment!("snappy", "default", "medium"),
+    baseline_segment!("snappy", "default", "large"),
+    baseline_segment!("zlib", "low", "tiny"),
+    baseline_segment!("zlib", "low", "small"),
+    baseline_segment!("zlib", "low", "medium"),
+    baseline_segment!("zlib", "low", "large"),
+    baseline_segment!("zlib", "high", "tiny"),
+    baseline_segment!("zlib", "high", "small"),
+    baseline_segment!("zlib", "high", "medium"),
+    baseline_segment!("zlib", "high", "large"),
 ];
 
 const BENCH_PUBLICATION_SEGMENTS: &[Segment] = &[
@@ -422,7 +496,9 @@ pub enum Suite {
     Lab,
     /// The corpus registry: the project corpus, and every registered public corpus.
     Corpus,
-    /// The benchmark: every competitor measured in-process, one segment per competitor.
+    /// The benchmark: every competitor measured in-process. A cheap tier runs one segment
+    /// per competitor. The gate tier runs one per competitor, operating point group, and
+    /// size class, because a segment holds one budget.
     Bench,
 }
 
@@ -513,8 +589,10 @@ impl Suite {
                 "Competitor measurement only. Each segment drives one competitor \
                  in-process, through the library the laboratory built, over the registered \
                  corpus entries its tier's budget reaches, and emits one machine-readable \
-                 result. Entroq has no codec path at this revision, so every result carries \
-                 an empty Entroq column and states why."
+                 result. A segmented tier covers one operating point group and one size \
+                 class per segment, and the groups of a competitor cover every point the \
+                 catalog pins for it. Entroq has no codec path at this revision, so every \
+                 result carries an empty Entroq column and states why."
             }
         }
     }
@@ -551,7 +629,12 @@ impl Suite {
                  monitor unit this host does not grant, so all three counter metrics report \
                  unavailable with the reason and no number is derived from elapsed time. A \
                  tier's input budget bounds the entries a segment reads, and every entry a \
-                 budget did not reach is named in the result rather than dropped in silence."
+                 budget did not reach is named in the result rather than dropped in silence. \
+                 Every competitor was measured with no integrity check: each one is driven \
+                 through the format of its own project that carries no checksum, and each \
+                 result names that setting and the container checksum it was not produced \
+                 under. Every number is single threaded except the parallel scaling metric, \
+                 which states its own worker count."
             }
         }
     }
@@ -768,16 +851,35 @@ mod tests {
     }
 
     #[test]
-    fn a_segmented_bench_tier_splits_by_size_class_as_well() {
-        assert_eq!(Suite::Bench.segments(Tier::Gate).len(), 20);
+    fn the_baseline_splits_by_operating_point_group_and_by_size_class() {
+        assert_eq!(Suite::Bench.segments(Tier::Gate).len(), 44);
         assert_eq!(Suite::Bench.segments(Tier::Publication).len(), 25);
         let ids: Vec<&str> = Suite::Bench
             .segments(Tier::Gate)
             .iter()
             .map(|segment| segment.id)
             .collect();
-        for expected in ["bench-lz4-tiny", "bench-brotli-large", "bench-zlib-medium"] {
+        for expected in [
+            "baseline-lz4-fast-tiny",
+            "baseline-brotli-max-large",
+            "baseline-zstd-max-large",
+            "baseline-snappy-default-medium",
+            "baseline-zlib-high-small",
+        ] {
             assert!(ids.contains(&expected), "{expected} is not a segment");
+        }
+    }
+
+    #[test]
+    fn a_baseline_segment_measures_under_the_identifier_the_runner_records_it_under() {
+        for segment in Suite::Bench.segments(Tier::Gate) {
+            let args: Vec<&str> = segment
+                .steps
+                .iter()
+                .flat_map(|step| step.args.iter().copied())
+                .collect();
+            assert!(args.contains(&"--points"), "{}", segment.id);
+            assert!(args.contains(&segment.id), "{}", segment.id);
         }
     }
 

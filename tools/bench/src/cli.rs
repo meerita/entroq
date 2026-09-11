@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use crate::catalog::{self, Codec};
 use crate::error::{Error, Result};
-use crate::plan::{Request, Tier};
+use crate::plan::{Points, Request, Tier};
 use crate::registry::{self, Group, Selection, SizeClass};
 
 pub const HELP: &str = "\
@@ -25,7 +25,8 @@ Usage:
   entroq-bench corpus verify    <what> [--corpus <dir>]
   entroq-bench corpus list      <what>
   entroq-bench measure        --tier <tier> --codec <name> [--class <name>]
-                              [--segment <id>] [--lab <dir>] [--corpus <dir>]
+                              [--points <group>] [--segment <id>] [--lab <dir>]
+                              [--corpus <dir>]
   entroq-bench report parse   --results <path> [--results <path>]...
   entroq-bench report pareto  --results <path> [--results <path>]...
   entroq-bench help
@@ -71,8 +72,11 @@ Tiers:
   gate         every pinned operating point, adds the large class, spread reported
   publication  full corpora, the only tier a number may leave the repository from
 
-A measurement covers every size class its tier names, unless --class names one. A segmented
-campaign names one class per segment so each segment fits its budget.
+A measurement covers every size class its tier names, unless --class names one, and every
+operating point its tier names, unless --points names one group. A segmented campaign names
+one class and one group per segment so each segment fits its budget. The cost of one point
+spans three orders of magnitude inside one project, so a slow point is grouped with points of
+its own cost rather than with the cheap ones it would push over the budget.
 
 Entroq has no codec path at this revision, so every result states an empty Entroq column and
 why it is empty.
@@ -112,6 +116,13 @@ Competitors:
 
 Size classes:
   tiny, small, medium, large, huge
+
+Operating point groups:
+  lz4      fast, hc
+  zstd     low, high, max
+  brotli   low, high, max
+  snappy   default
+  zlib     low, high
 
 Corpus groups:
   project, enwik, sourcecode, gutenberg
@@ -364,6 +375,7 @@ fn measure(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
     let mut tier_name: Option<String> = None;
     let mut codec_name: Option<String> = None;
     let mut class_name: Option<String> = None;
+    let mut points_name: Option<String> = None;
     let mut segment: Option<String> = None;
     let mut lab: Option<PathBuf> = None;
     let mut corpus: Option<PathBuf> = None;
@@ -373,6 +385,7 @@ fn measure(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
             "--tier" => tier_name = Some(text(&next(&mut args, "--tier")?, "--tier")?),
             "--codec" => codec_name = Some(text(&next(&mut args, "--codec")?, "--codec")?),
             "--class" => class_name = Some(text(&next(&mut args, "--class")?, "--class")?),
+            "--points" => points_name = Some(text(&next(&mut args, "--points")?, "--points")?),
             "--segment" => segment = Some(text(&next(&mut args, "--segment")?, "--segment")?),
             "--lab" => lab = Some(PathBuf::from(next(&mut args, "--lab")?)),
             "--corpus" => corpus = Some(PathBuf::from(next(&mut args, "--corpus")?)),
@@ -418,16 +431,44 @@ fn measure(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
         )));
     }
 
+    let points = match points_name {
+        Some(name) => {
+            if tier.points() == Points::Default {
+                return Err(Error::Usage(format!(
+                    "the {} tier measures the point {} defaults to, so it covers no \
+                     operating point group",
+                    tier.name(),
+                    codec.display
+                )));
+            }
+            Some(codec.group(&name).ok_or_else(|| {
+                Error::Usage(format!(
+                    "`{name}` is not an operating point group of {}. It groups its points as {}.",
+                    codec.display,
+                    codec.group_names()
+                ))
+            })?)
+        }
+        None => None,
+    };
+
     let segment = segment.unwrap_or_else(|| {
-        class.map_or_else(
-            || format!("bench-{}", codec.name),
-            |class| format!("bench-{}-{}", codec.name, class.name()),
-        )
+        let mut id = format!("bench-{}", codec.name);
+        if let Some(group) = points {
+            id.push('-');
+            id.push_str(group.name);
+        }
+        if let Some(class) = class {
+            id.push('-');
+            id.push_str(class.name());
+        }
+        id
     });
     Ok(Invocation::Measure(Box::new(Request {
         tier,
         codec,
         class,
+        points,
         segment,
         lab,
         corpus,
@@ -651,6 +692,38 @@ mod tests {
             request.map(|r| r.segment),
             Some(String::from("bench-brotli-large"))
         );
+    }
+
+    #[test]
+    fn a_measurement_of_one_point_group_names_it_in_its_segment() {
+        let request = measured(&[
+            "measure", "--tier", "gate", "--codec", "brotli", "--points", "max", "--class", "large",
+        ]);
+        assert_eq!(
+            request.map(|r| (r.segment, r.points.map(|g| g.points))),
+            Some((String::from("bench-brotli-max-large"), Some(&["q11"][..])))
+        );
+    }
+
+    #[test]
+    fn a_point_group_the_competitor_does_not_have_is_rejected_with_the_ones_it_does() {
+        let failure = invoke(&[
+            "measure", "--tier", "gate", "--codec", "zstd", "--points", "hc",
+        ]);
+        assert!(failure.is_err());
+        let message = failure.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("low"), "{message}");
+        assert!(message.contains("max"), "{message}");
+    }
+
+    #[test]
+    fn a_tier_that_measures_one_default_point_covers_no_group() {
+        for tier in ["smoke", "dev"] {
+            let failure = invoke(&[
+                "measure", "--tier", tier, "--codec", "zstd", "--points", "low",
+            ]);
+            assert!(failure.is_err(), "the {tier} tier accepted a point group");
+        }
     }
 
     #[test]

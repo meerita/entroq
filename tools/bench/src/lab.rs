@@ -379,7 +379,7 @@ fn describe(
     }
     manifest.set("library_root", PREFIX_DIR)?;
 
-    for point in codec.operating_points {
+    for point in codec.operating_points() {
         manifest.set("operating_point", point)?;
     }
     if let Some(note) = codec.format_note {

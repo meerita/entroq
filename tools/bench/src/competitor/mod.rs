@@ -55,6 +55,12 @@ pub struct Notes {
     /// A project that defines more than one format, or that is commonly measured inside a
     /// container it does not define, states which one a number came from.
     pub format: &'static str,
+    /// What the measured bytes are protected by, and what the project offers that they are
+    /// not protected by.
+    ///
+    /// A fairness axis, not a footnote. A codec that checksums less is not faster for free,
+    /// so every result states the integrity setting its number was produced under.
+    pub integrity: &'static str,
     /// How the bytes the codec owns are obtained.
     pub state_bytes: Method,
     /// How the allocations one operation makes are obtained.
@@ -89,13 +95,13 @@ impl Session {
     /// Fails when the codec is not one the laboratory holds, the operating point is not one
     /// the catalog names for it, or the library refuses to produce a context.
     pub fn open(codec: &Codec, point: &str) -> Result<Self> {
-        if !codec.operating_points.contains(&point) {
+        if !codec.operating_points().contains(&point) {
             return Err(Error::measure(
                 format!("the operating point `{point}`"),
                 format!(
                     "is not one of the points the catalog pins for {}: {}",
                     codec.display,
-                    codec.operating_points.join(", ")
+                    codec.operating_points().join(", ")
                 ),
             ));
         }
@@ -294,7 +300,7 @@ mod tests {
     #[test]
     fn every_pinned_competitor_opens_at_every_point_the_catalog_names() {
         for codec in crate::catalog::CODECS {
-            for point in codec.operating_points {
+            for point in codec.operating_points() {
                 assert!(
                     Session::open(codec, point).is_ok(),
                     "{} does not open at {point}",
@@ -307,7 +313,7 @@ mod tests {
     #[test]
     fn every_linked_library_reports_the_version_the_catalog_pins() {
         for codec in crate::catalog::CODECS {
-            let Some(point) = codec.operating_points.first() else {
+            let Some(point) = codec.operating_points().first().copied() else {
                 continue;
             };
             let Ok(session) = Session::open(codec, point) else {

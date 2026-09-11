@@ -24,7 +24,7 @@ use crate::error::{Error, Result};
 ///
 /// A change to the document's shape changes this, so a parser meets a document it does not
 /// understand as a mismatch rather than as a field it silently ignores.
-pub const SCHEMA: &str = "entroq.bench.result/1";
+pub const SCHEMA: &str = "entroq.bench.result/2";
 
 const DOCUMENT: &[&str] = &[
     "schema",
@@ -35,6 +35,7 @@ const DOCUMENT: &[&str] = &[
     "tier_licence",
     "codec",
     "size_class",
+    "operating_point_group",
     "entroq",
     "environment",
     "laboratory",
@@ -108,6 +109,7 @@ const MEASUREMENT: &[&str] = &[
     "version",
     "operating_point",
     "format",
+    "integrity",
     "entry",
     "group",
     "class",
@@ -193,6 +195,9 @@ pub struct Row {
     pub display_name: String,
     pub version: String,
     pub operating_point: String,
+    /// What the measured bytes were protected by, as the result stated it. A fairness axis:
+    /// a codec that checksums less is not faster for free.
+    pub integrity: String,
     pub entry: String,
     pub group: String,
     pub class: String,
@@ -256,6 +261,9 @@ pub struct Document {
     pub tier_licence: String,
     pub codec: String,
     pub size_class: Option<String>,
+    /// The operating point group this segment covered, or none when it covered every point
+    /// its tier names.
+    pub operating_point_group: Option<String>,
     pub entroq_measured: bool,
     pub host: Host,
     pub rows: Vec<Row>,
@@ -460,6 +468,7 @@ impl Reader<'_> {
             tier_licence: self.text(root, AT, "tier_licence")?,
             codec: self.text(root, AT, "codec")?,
             size_class: self.optional_text(root, AT, "size_class")?,
+            operating_point_group: self.optional_text(root, AT, "operating_point_group")?,
             entroq_measured,
             host,
             rows,
@@ -609,6 +618,7 @@ impl Reader<'_> {
             display_name: self.text(measurement, AT, "display_name")?,
             version: self.text(measurement, AT, "version")?,
             operating_point: self.text(measurement, AT, "operating_point")?,
+            integrity: self.text(measurement, AT, "integrity")?,
             entry: self.text(measurement, AT, "entry")?,
             group: self.text(measurement, AT, "group")?,
             class: self.text(measurement, AT, "class")?,
@@ -741,6 +751,7 @@ pub mod fixture {
             "version": "v1",
             "operating_point": point,
             "format": "the fixture format",
+            "integrity": "the fixture protects nothing",
             "entry": entry,
             "group": "project",
             "class": "small",
@@ -765,6 +776,7 @@ pub mod fixture {
             "tier_licence": "a fixture states no licence",
             "codec": "fixture",
             "size_class": Value::Null,
+            "operating_point_group": Value::Null,
             "entroq": { "measured": false, "reason": "no codec path exists" },
             "environment": environment(),
             "laboratory": laboratory(),
@@ -1000,10 +1012,10 @@ mod tests {
     fn another_schema_is_rejected_by_name() {
         let mut value = one();
         if let Some(object) = value.as_object_mut() {
-            let _ = object.insert(String::from("schema"), json!("entroq.bench.result/2"));
+            let _ = object.insert(String::from("schema"), json!("entroq.bench.result/1"));
         }
         let message = rejected(&value);
-        assert!(message.contains("entroq.bench.result/2"), "{message}");
+        assert!(message.contains("entroq.bench.result/1"), "{message}");
         assert!(message.contains(SCHEMA), "{message}");
     }
 

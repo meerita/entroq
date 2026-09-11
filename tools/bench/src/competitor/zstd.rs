@@ -138,6 +138,9 @@ impl Session {
         Notes {
             format: "the Zstandard frame format, which is the only format the library \
                      produces. The one-shot and streaming paths produce the same format.",
+            integrity: "None. ZSTD_c_checksumFlag is left at the library default of 0, so \
+                        the frame carries no content checksum. The frame header is still \
+                        produced, and its bytes are counted in the compressed length.",
             state_bytes: Method::By("ZSTD_sizeof_CCtx and ZSTD_sizeof_DCtx"),
             allocations: Method::By(
                 "ZSTD_createCCtx_advanced and ZSTD_createDCtx_advanced, which take the \
