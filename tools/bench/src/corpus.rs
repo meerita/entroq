@@ -200,6 +200,44 @@ pub fn verify(selection: &Selection, layout: &Layout) -> Result<()> {
     Ok(())
 }
 
+/// Reads one cached entry and confirms it is the one the registry describes.
+///
+/// A measurement reads the bytes it measures through here, so a number can never come from
+/// a file that is not the registered entry.
+///
+/// # Errors
+///
+/// Fails when the entry is not cached, cannot be read, or is not the one the registry
+/// describes.
+pub fn load(entry: &Entry, layout: &Layout) -> Result<Vec<u8>> {
+    let path = layout.entry(entry);
+    if !path.is_file() {
+        return Err(Error::corpus(
+            format!("the entry {}", entry.name),
+            format!(
+                "is not cached at {}. Materialize the corpus before measuring on it.",
+                path.display()
+            ),
+        ));
+    }
+    let data = std::fs::read(&path).map_err(|e| Error::at("read", &path, e))?;
+    let bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
+    if bytes != entry.bytes {
+        return Err(Error::corpus(
+            format!("the entry {}", entry.name),
+            format!("is {bytes} bytes, and the registry records {}", entry.bytes),
+        ));
+    }
+    let found = digest::bytes(&data);
+    if found != entry.digest {
+        return Err(Error::corpus(
+            format!("the entry {}", entry.name),
+            format!("hashes to {found}, and the registry pins {}", entry.digest),
+        ));
+    }
+    Ok(data)
+}
+
 /// Prints what the registry holds, without touching the cache.
 ///
 /// Every field a corpus entry must state appears here, because a number measured on an
@@ -450,6 +488,22 @@ mod tests {
             std::fs::metadata(layout.entry(entry)).map(|d| d.len()).ok(),
             Some(entry.bytes)
         );
+    }
+
+    #[test]
+    fn a_measurement_reads_an_entry_only_after_it_matches_the_registry() {
+        let (Some(layout), Some(entry)) = (scratch("load"), find("project-zeros-tiny")) else {
+            return;
+        };
+        assert!(super::load(entry, &layout).is_err());
+        assert!(build(&Selection::Entry(entry.name), &layout).is_ok());
+        let data = super::load(entry, &layout);
+        assert_eq!(
+            data.ok().map(|bytes| bytes.len()),
+            usize::try_from(entry.bytes).ok()
+        );
+        assert!(std::fs::write(layout.entry(entry), b"not the corpus").is_ok());
+        assert!(super::load(entry, &layout).is_err());
     }
 
     #[test]

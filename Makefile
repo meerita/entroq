@@ -3,8 +3,8 @@
 # Each target delegates to the tool that owns the implementation. Do not
 # duplicate delegated logic here.
 #
-# The fuzz drivers and the benchmark harness do not exist yet, so `fuzz` and
-# `bench` say so and fail. Every other target works.
+# The fuzz drivers do not exist yet, so `fuzz` says so and fails. Every other
+# target works.
 #
 # `lab` builds the competitor laboratory. It needs a network, a C and C++
 # compiler, cmake, and git. No other target needs any of them, so a host
@@ -27,8 +27,13 @@
 #
 #   LAB     The competitor codec workspace. Holds the pinned, built
 #           compression systems that Entroq is compared against. `lab`
-#           produces it. Every comparison target reads it.
-#           Scope:    lab, lab-resume, bench, and any comparison target.
+#           produces it. The benchmark harness links the libraries it names,
+#           so it is a build input of the workspace and not only of a
+#           comparison. It is exported for every target, because two targets
+#           that disagree about it would rebuild the harness in turn.
+#           A workspace whose LAB holds no complete set of competitors builds
+#           a harness that links none and says so when asked to measure.
+#           Scope:    every target that builds or measures.
 #           Required: yes, for a comparison.
 #           Default:  ../lab
 #
@@ -48,7 +53,7 @@
 #           Default:  ../runs
 #
 #   TIER    The validation tier a recorded target runs at.
-#           Scope:    bench.
+#           Scope:    bench, bench-resume.
 #           Required: no.
 #           Default:  dev
 #
@@ -68,6 +73,7 @@
 
 CARGO ?= cargo
 LAB ?= ../lab
+export LAB
 CORPUS ?= ../corpus
 RUNS ?= ../runs
 TIER ?= dev
@@ -76,7 +82,7 @@ PLATFORM ?=
 # Repository tooling, versioned with the code whose gates it runs.
 RUNNER = $(CARGO) run --quiet --release --package entroq-run --
 
-.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume lab lab-resume corpus corpus-resume fuzz bench validate ci ci-validate clean
+.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume lab lab-resume corpus corpus-resume fuzz bench-harness bench bench-resume validate ci ci-validate clean
 
 help:
 	@echo "build      compile the workspace"
@@ -93,7 +99,8 @@ help:
 	@echo "corpus     materialize the corpus into CORPUS, one segment per group"
 	@echo "corpus-resume  continue the current corpus campaign where it stopped"
 	@echo "fuzz       advance one fuzz target by one bounded segment (TARGET=<name>)"
-	@echo "bench      benchmark campaign at TIER"
+	@echo "bench      benchmark campaign at TIER, one segment per competitor"
+	@echo "bench-resume continue the current benchmark campaign where it stopped"
 	@echo "validate   fmt-check, lint, and the dev tier"
 	@echo "ci         fmt-check, lint, build, and the smoke tier, in a clean container"
 	@echo "ci-validate  validate in a clean container, recorded"
@@ -139,10 +146,10 @@ gate-resume:
 # behave the same and not hash the same.
 
 lab:
-	LAB=$(LAB) $(RUNNER) run --suite lab --tier gate --runs $(RUNS)
+	$(RUNNER) run --suite lab --tier gate --runs $(RUNS)
 
 lab-resume:
-	LAB=$(LAB) $(RUNNER) resume --suite lab --tier gate --runs $(RUNS)
+	$(RUNNER) resume --suite lab --tier gate --runs $(RUNS)
 
 # The corpus. One segment per group, so one fetch fits the segment budget and
 # a resumed campaign re-fetches only what did not pass.
@@ -163,8 +170,31 @@ fuzz:
 	@test -n "$(TARGET)" || { echo "make fuzz: set TARGET=<fuzz target>" >&2; exit 1; }
 	$(RUNNER) fuzz --target $(TARGET) --runs $(RUNS)
 
-bench:
-	CORPUS=$(CORPUS) $(RUNNER) bench --tier $(TIER) --lab $(LAB) --runs $(RUNS)
+# The benchmark. One segment per competitor, and one per competitor and size
+# class at a segmented tier, so a segment holds one budget and a resumed campaign
+# re-measures only what did not pass.
+#
+# Each segment measures its competitor in-process, through the library built into
+# $(LAB), and writes one machine-readable result into the segment's evidence
+# directory. Entroq has no codec path yet, so every result carries an empty
+# Entroq column and states why.
+#
+# The smoke tier is not recorded, so it takes no run root.
+#
+# The harness is built before the campaign starts. A campaign measures codec
+# work under a wall-clock budget, and a compile inside the first segment would
+# spend that budget on the compiler.
+
+RECORDED_RUNS = $(if $(filter smoke,$(TIER)),,--runs $(RUNS))
+
+bench-harness:
+	$(CARGO) build --quiet --release --package entroq-bench
+
+bench: bench-harness
+	CORPUS=$(CORPUS) $(RUNNER) run --suite bench --tier $(TIER) $(RECORDED_RUNS)
+
+bench-resume: bench-harness
+	CORPUS=$(CORPUS) $(RUNNER) resume --suite bench --tier $(TIER) --runs $(RUNS)
 
 validate: fmt-check lint test
 

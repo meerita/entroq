@@ -499,12 +499,8 @@ fn reset(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| Error::at("create", dir, e))
 }
 
-/// The instant a manifest or a rebuild record is stamped with, in UTC.
-///
-/// `date` is a required host tool. A build that cannot state when it happened is not a
-/// record, so a host without it fails here rather than stamping something invented.
 fn now() -> Result<String> {
-    exec::capture(&argv(["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"]), Path::new("."))
+    crate::environment::timestamp()
 }
 
 #[cfg(test)]

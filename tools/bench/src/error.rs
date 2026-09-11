@@ -21,6 +21,9 @@ pub enum Error {
     Lab { context: String, message: String },
     /// A corpus entry is not the one the registry describes.
     Corpus { context: String, message: String },
+    /// A competitor library refused the work, or the harness cannot measure what it was
+    /// asked to measure.
+    Measure { context: String, message: String },
 }
 
 impl Error {
@@ -58,6 +61,13 @@ impl Error {
             message: message.into(),
         }
     }
+
+    pub fn measure(context: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Measure {
+            context: context.into(),
+            message: message.into(),
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -66,7 +76,9 @@ impl fmt::Display for Error {
             Self::Usage(message) => write!(f, "{message}"),
             Self::Io { context, source } => write!(f, "could not {context}: {source}"),
             Self::Tool { command, message } => write!(f, "`{command}` {message}"),
-            Self::Lab { context, message } | Self::Corpus { context, message } => {
+            Self::Lab { context, message }
+            | Self::Corpus { context, message }
+            | Self::Measure { context, message } => {
                 write!(f, "{context}: {message}")
             }
         }

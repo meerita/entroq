@@ -265,6 +265,145 @@ const CORPUS_SEGMENTS: &[Segment] = &[
     },
 ];
 
+/// One benchmark segment: one competitor, at one tier, over the size classes the tier names
+/// or over the one class the segment names.
+///
+/// A segment is one harness process, so the resident-set figure it reports is its own and a
+/// failure blocks one competitor rather than the campaign.
+macro_rules! bench_segment {
+    ($tier:literal, $codec:literal) => {
+        Segment {
+            id: concat!("bench-", $codec),
+            description: concat!(
+                "Every metric the ",
+                $tier,
+                " tier covers, for ",
+                $codec,
+                ", measured in-process through the library the laboratory built."
+            ),
+            steps: &[Step {
+                program: "cargo",
+                args: &[
+                    "run",
+                    "--quiet",
+                    "--release",
+                    "--package",
+                    "entroq-bench",
+                    "--",
+                    "measure",
+                    "--tier",
+                    $tier,
+                    "--codec",
+                    $codec,
+                ],
+            }],
+        }
+    };
+    ($tier:literal, $codec:literal, $class:literal) => {
+        Segment {
+            id: concat!("bench-", $codec, "-", $class),
+            description: concat!(
+                "Every metric the ",
+                $tier,
+                " tier covers, for ",
+                $codec,
+                " at the ",
+                $class,
+                " size class."
+            ),
+            steps: &[Step {
+                program: "cargo",
+                args: &[
+                    "run",
+                    "--quiet",
+                    "--release",
+                    "--package",
+                    "entroq-bench",
+                    "--",
+                    "measure",
+                    "--tier",
+                    $tier,
+                    "--codec",
+                    $codec,
+                    "--class",
+                    $class,
+                ],
+            }],
+        }
+    };
+}
+
+/// The cheap tiers measure every class they cover in one segment per competitor, so a
+/// campaign that has to fit one budget stays five processes rather than twenty.
+const BENCH_SMOKE_SEGMENTS: &[Segment] = &[
+    bench_segment!("smoke", "lz4"),
+    bench_segment!("smoke", "zstd"),
+    bench_segment!("smoke", "brotli"),
+    bench_segment!("smoke", "snappy"),
+    bench_segment!("smoke", "zlib"),
+];
+
+const BENCH_DEV_SEGMENTS: &[Segment] = &[
+    bench_segment!("dev", "lz4"),
+    bench_segment!("dev", "zstd"),
+    bench_segment!("dev", "brotli"),
+    bench_segment!("dev", "snappy"),
+    bench_segment!("dev", "zlib"),
+];
+
+/// A segmented tier splits by size class as well, because the cost of a class grows
+/// with the input it covers and a segment holds one budget.
+const BENCH_GATE_SEGMENTS: &[Segment] = &[
+    bench_segment!("gate", "lz4", "tiny"),
+    bench_segment!("gate", "lz4", "small"),
+    bench_segment!("gate", "lz4", "medium"),
+    bench_segment!("gate", "lz4", "large"),
+    bench_segment!("gate", "zstd", "tiny"),
+    bench_segment!("gate", "zstd", "small"),
+    bench_segment!("gate", "zstd", "medium"),
+    bench_segment!("gate", "zstd", "large"),
+    bench_segment!("gate", "brotli", "tiny"),
+    bench_segment!("gate", "brotli", "small"),
+    bench_segment!("gate", "brotli", "medium"),
+    bench_segment!("gate", "brotli", "large"),
+    bench_segment!("gate", "snappy", "tiny"),
+    bench_segment!("gate", "snappy", "small"),
+    bench_segment!("gate", "snappy", "medium"),
+    bench_segment!("gate", "snappy", "large"),
+    bench_segment!("gate", "zlib", "tiny"),
+    bench_segment!("gate", "zlib", "small"),
+    bench_segment!("gate", "zlib", "medium"),
+    bench_segment!("gate", "zlib", "large"),
+];
+
+const BENCH_PUBLICATION_SEGMENTS: &[Segment] = &[
+    bench_segment!("publication", "lz4", "tiny"),
+    bench_segment!("publication", "lz4", "small"),
+    bench_segment!("publication", "lz4", "medium"),
+    bench_segment!("publication", "lz4", "large"),
+    bench_segment!("publication", "lz4", "huge"),
+    bench_segment!("publication", "zstd", "tiny"),
+    bench_segment!("publication", "zstd", "small"),
+    bench_segment!("publication", "zstd", "medium"),
+    bench_segment!("publication", "zstd", "large"),
+    bench_segment!("publication", "zstd", "huge"),
+    bench_segment!("publication", "brotli", "tiny"),
+    bench_segment!("publication", "brotli", "small"),
+    bench_segment!("publication", "brotli", "medium"),
+    bench_segment!("publication", "brotli", "large"),
+    bench_segment!("publication", "brotli", "huge"),
+    bench_segment!("publication", "snappy", "tiny"),
+    bench_segment!("publication", "snappy", "small"),
+    bench_segment!("publication", "snappy", "medium"),
+    bench_segment!("publication", "snappy", "large"),
+    bench_segment!("publication", "snappy", "huge"),
+    bench_segment!("publication", "zlib", "tiny"),
+    bench_segment!("publication", "zlib", "small"),
+    bench_segment!("publication", "zlib", "medium"),
+    bench_segment!("publication", "zlib", "large"),
+    bench_segment!("publication", "zlib", "huge"),
+];
+
 /// A named set of segments, and what a campaign over that set does and does not cover.
 ///
 /// A suite is what is run. A tier is how it is bounded and recorded.
@@ -276,6 +415,8 @@ pub enum Suite {
     Lab,
     /// The corpus registry: the project corpus, and every registered public corpus.
     Corpus,
+    /// The benchmark: every competitor measured in-process, one segment per competitor.
+    Bench,
 }
 
 impl Suite {
@@ -285,6 +426,7 @@ impl Suite {
             "workspace" => Some(Self::Workspace),
             "lab" => Some(Self::Lab),
             "corpus" => Some(Self::Corpus),
+            "bench" => Some(Self::Bench),
             _ => None,
         }
     }
@@ -294,6 +436,7 @@ impl Suite {
             Self::Workspace => "workspace",
             Self::Lab => "lab",
             Self::Corpus => "corpus",
+            Self::Bench => "bench",
         }
     }
 
@@ -303,6 +446,7 @@ impl Suite {
             Self::Workspace => "workspace-gate",
             Self::Lab => "lab-build",
             Self::Corpus => "corpus-registry",
+            Self::Bench => "bench-baseline",
         }
     }
 
@@ -324,6 +468,12 @@ impl Suite {
             Self::Corpus => match tier {
                 Tier::Smoke | Tier::Dev => &[],
                 Tier::Gate | Tier::Publication => CORPUS_SEGMENTS,
+            },
+            Self::Bench => match tier {
+                Tier::Smoke => BENCH_SMOKE_SEGMENTS,
+                Tier::Dev => BENCH_DEV_SEGMENTS,
+                Tier::Gate => BENCH_GATE_SEGMENTS,
+                Tier::Publication => BENCH_PUBLICATION_SEGMENTS,
             },
         }
     }
@@ -352,6 +502,13 @@ impl Suite {
                  registry pins, and whether a generated entry produces the same bytes \
                  twice from its recorded seed."
             }
+            Self::Bench => {
+                "Competitor measurement only. Each segment drives one competitor \
+                 in-process, through the library the laboratory built, over the registered \
+                 corpus entries its tier's budget reaches, and emits one machine-readable \
+                 result. Entroq has no codec path at this revision, so every result carries \
+                 an empty Entroq column and states why."
+            }
         }
     }
 
@@ -379,6 +536,15 @@ impl Suite {
                  whose fetch cannot finish inside one segment budget, is not registered, \
                  so the registry is bounded by what is licensed and obtainable rather \
                  than by what exists."
+            }
+            Self::Bench => {
+                "The campaign ran on one host and one architecture, and it compares no two \
+                 environments. It measured no Entroq number, because no encoder and no \
+                 decoder exist. A cycle count and an instruction count need a performance \
+                 monitor unit this host does not grant, so all three counter metrics report \
+                 unavailable with the reason and no number is derived from elapsed time. A \
+                 tier's input budget bounds the entries a segment reads, and every entry a \
+                 budget did not reach is named in the result rather than dropped in silence."
             }
         }
     }
@@ -443,7 +609,7 @@ mod tests {
     use super::{SEGMENT_BUDGET, Suite, Tier};
 
     const TIERS: [Tier; 4] = [Tier::Smoke, Tier::Dev, Tier::Gate, Tier::Publication];
-    const SUITES: [Suite; 3] = [Suite::Workspace, Suite::Lab, Suite::Corpus];
+    const SUITES: [Suite; 4] = [Suite::Workspace, Suite::Lab, Suite::Corpus, Suite::Bench];
 
     #[test]
     fn every_tier_name_round_trips() {
@@ -585,6 +751,50 @@ mod tests {
     fn the_laboratory_suite_says_it_measured_no_compression() {
         assert!(Suite::Lab.coverage().contains("compresses a byte"));
         assert!(Suite::Lab.limits().contains("no throughput"));
+    }
+
+    #[test]
+    fn the_bench_suite_runs_one_segment_per_competitor_at_a_tier_that_holds_one_budget() {
+        for tier in [Tier::Smoke, Tier::Dev] {
+            assert_eq!(Suite::Bench.segments(tier).len(), 5, "{}", tier.name());
+        }
+    }
+
+    #[test]
+    fn a_segmented_bench_tier_splits_by_size_class_as_well() {
+        assert_eq!(Suite::Bench.segments(Tier::Gate).len(), 20);
+        assert_eq!(Suite::Bench.segments(Tier::Publication).len(), 25);
+        let ids: Vec<&str> = Suite::Bench
+            .segments(Tier::Gate)
+            .iter()
+            .map(|segment| segment.id)
+            .collect();
+        for expected in ["bench-lz4-tiny", "bench-brotli-large", "bench-zlib-medium"] {
+            assert!(ids.contains(&expected), "{expected} is not a segment");
+        }
+    }
+
+    #[test]
+    fn every_bench_segment_names_one_competitor_and_its_tier() {
+        for tier in TIERS {
+            for segment in Suite::Bench.segments(tier) {
+                let args: Vec<&str> = segment
+                    .steps
+                    .iter()
+                    .flat_map(|step| step.args.iter().copied())
+                    .collect();
+                assert!(args.contains(&"measure"), "{}", segment.id);
+                assert!(args.contains(&tier.name()), "{}", segment.id);
+                assert!(args.contains(&"--codec"), "{}", segment.id);
+            }
+        }
+    }
+
+    #[test]
+    fn the_bench_suite_says_the_entroq_column_is_empty_and_the_counter_is_not_granted() {
+        assert!(Suite::Bench.coverage().contains("empty"));
+        assert!(Suite::Bench.limits().contains("counter"));
+        assert!(Suite::Bench.limits().contains("elapsed time"));
     }
 
     #[test]

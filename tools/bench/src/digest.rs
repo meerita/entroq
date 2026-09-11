@@ -39,9 +39,24 @@ pub fn file(path: &Path) -> Result<String> {
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
+/// Hashes bytes already in memory, in the same form `file` reports.
+pub fn bytes(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::file;
+    use super::{bytes, file};
+
+    #[test]
+    fn hashing_bytes_agrees_with_hashing_the_file_that_holds_them() {
+        let path = std::env::temp_dir().join("entroq-bench-digest-agree");
+        let data = vec![3_u8; 100 * 1024];
+        assert!(std::fs::write(&path, &data).is_ok());
+        assert_eq!(file(&path).ok(), Some(bytes(&data)));
+    }
 
     #[test]
     fn an_empty_file_hashes_to_the_known_empty_digest() {

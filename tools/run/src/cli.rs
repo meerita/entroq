@@ -19,7 +19,6 @@ Usage:
   entroq-run run    --tier <tier> [--suite <suite>] [--runs <dir>] [--topic <name>]
   entroq-run resume --tier <tier> [--suite <suite>]  --runs <dir>
   entroq-run fuzz   --target <name> --runs <dir>
-  entroq-run bench  --tier <tier> --lab <dir> --runs <dir>
   entroq-run help
 
 Tiers:
@@ -35,6 +34,8 @@ Suites:
   corpus       the corpus registry: the project corpus, generated from recorded seeds, and
                every registered public corpus, fetched and checksummed. Segmented, so it
                runs at a segmented tier only.
+  bench        the benchmark: one segment per competitor, measured in-process through the
+               library the laboratory built. A segmented tier splits by size class too.
 
 A tier says how a campaign is bounded, recorded, and resumed. A suite says which segments
 it runs.
@@ -49,12 +50,16 @@ and the budget does not move to accommodate it.
 --runs is required for every recorded tier. Its record lands in
 <runs>/<tier>/<date>-<NN>-<topic>/ and never inside the repository.
 
+Every segment of a recorded campaign is given ENTROQ_SEGMENT_DIR, the directory its raw
+output and any artifact it produces belong in. A benchmark segment writes its result document
+there. No segment writes inside the repository.
+
 Environment:
   CARGO    the cargo binary a segment step invokes. Not required. Default: cargo.
-  LAB      the competitor codec workspace a lab segment builds into. Not required.
-           Default: ../lab.
-  CORPUS   the corpus cache a corpus segment materializes into. Not required.
-           Default: ../corpus.
+  LAB      the competitor codec workspace a lab segment builds into, and a benchmark
+           segment measures from. Not required. Default: ../lab.
+  CORPUS   the corpus cache a corpus segment materializes into, and a benchmark segment
+           reads. Not required. Default: ../corpus.
 
 Exit status:
   0  the campaign passed, and a recorded campaign sealed
@@ -102,9 +107,6 @@ pub fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
         "resume" => campaign(args, Mode::Resume),
         "fuzz" => Ok(Invocation::Unavailable(String::from(
             "fuzz: no fuzz target exists at this revision, so there is nothing to advance",
-        ))),
-        "bench" => Ok(Invocation::Unavailable(String::from(
-            "bench: no benchmark harness exists at this revision, so there is nothing to measure",
         ))),
         other => Err(Error::Usage(format!(
             "unknown command `{other}`. Run `entroq-run help`."
@@ -373,6 +375,19 @@ mod tests {
     #[test]
     fn a_capability_this_revision_lacks_is_named_not_guessed() {
         assert!(matches!(invoke(&["fuzz"]), Ok(Invocation::Unavailable(_))));
-        assert!(matches!(invoke(&["bench"]), Ok(Invocation::Unavailable(_))));
+    }
+
+    #[test]
+    fn the_benchmark_runs_as_a_suite_at_every_tier() {
+        assert_eq!(
+            suite(&["run", "--tier", "smoke", "--suite", "bench"]),
+            Some((Suite::Bench, String::from("bench-baseline")))
+        );
+        assert!(
+            invoke(&[
+                "run", "--tier", "gate", "--suite", "bench", "--runs", "../runs"
+            ])
+            .is_ok()
+        );
     }
 }

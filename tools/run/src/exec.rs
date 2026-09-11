@@ -9,6 +9,11 @@
 //! through the `CARGO` environment variable when it is set, so a segment invokes the same
 //! toolchain that invoked the runner.
 //!
+//! A recorded segment is told where its evidence goes, through `ENTROQ_SEGMENT_DIR`. A tool
+//! that produces an artifact of its own, such as a benchmark result, writes it there. The
+//! directory is inside the run record and never inside the repository. An unrecorded tier
+//! sets nothing, and a tool that finds nothing set writes no artifact.
+//!
 //! This module does not own the budget. It enforces the one it is given.
 
 use std::ffi::OsString;
@@ -23,6 +28,9 @@ use crate::tier::{Segment, Step};
 
 /// How often a running step is checked against its budget.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The variable that names the directory a segment's evidence goes to.
+pub const SEGMENT_DIR: &str = "ENTROQ_SEGMENT_DIR";
 
 /// Where a segment's raw output goes.
 ///
@@ -74,10 +82,15 @@ pub fn run_segment(
 ) -> Result<(Outcome, Duration)> {
     let logs = open_output(segment, output)?;
 
+    let evidence = match output {
+        Output::Directory(dir) => Some(dir.as_path()),
+        Output::Inherit => None,
+    };
+
     let started = Instant::now();
     for step in segment.steps {
         let remaining = budget.saturating_sub(started.elapsed());
-        let outcome = run_step(step, working_dir, remaining, logs.as_ref())?;
+        let outcome = run_step(step, working_dir, remaining, logs.as_ref(), evidence)?;
         if !outcome.is_pass() {
             return Ok((outcome, started.elapsed()));
         }
@@ -116,6 +129,7 @@ fn run_step(
     working_dir: &Path,
     budget: Duration,
     logs: Option<&(File, File)>,
+    evidence: Option<&Path>,
 ) -> Result<Outcome> {
     let description = describe(step);
     if budget.is_zero() {
@@ -126,12 +140,24 @@ fn run_step(
         Some((out, err)) => (clone_log(out, &description)?, clone_log(err, &description)?),
         None => (Stdio::inherit(), Stdio::inherit()),
     };
-    let mut child = Command::new(resolve(step.program))
+    let mut command = Command::new(resolve(step.program));
+    let _ = command
         .args(step.args)
         .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(out)
-        .stderr(err)
+        .stderr(err);
+    match evidence {
+        Some(dir) => {
+            let _ = command.env(SEGMENT_DIR, dir);
+        }
+        // An unrecorded tier has no evidence directory, and a variable left over from an
+        // outer invocation would send an artifact somewhere this campaign did not choose.
+        None => {
+            let _ = command.env_remove(SEGMENT_DIR);
+        }
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| Error::io(format!("start `{description}`"), e))?;
 
@@ -250,6 +276,48 @@ mod tests {
         assert!(matches!(run, Ok((Outcome::Pass, _))));
         let stdout = std::fs::read_to_string(dir.join("stdout.txt")).unwrap_or_default();
         assert_eq!(stdout, "second\n");
+    }
+
+    #[test]
+    fn a_recorded_segment_is_told_where_its_evidence_goes() {
+        let dir = std::env::temp_dir().join("entroq-run-exec-evidence");
+        let _ = std::fs::remove_dir_all(&dir);
+        let segment = Segment {
+            id: "evidence",
+            description: "A segment that reports the directory it was given.",
+            steps: &[Step {
+                program: "sh",
+                args: &["-c", "printf %s \"$ENTROQ_SEGMENT_DIR\""],
+            }],
+        };
+        let run = run_segment(
+            &segment,
+            Path::new("."),
+            Duration::from_secs(10),
+            &Output::Directory(dir.clone()),
+        );
+        assert!(matches!(run, Ok((Outcome::Pass, _))));
+        let reported = std::fs::read_to_string(dir.join("stdout.txt")).unwrap_or_default();
+        assert_eq!(reported, dir.display().to_string());
+    }
+
+    #[test]
+    fn an_unrecorded_segment_is_told_nothing_so_it_writes_no_artifact() {
+        let segment = Segment {
+            id: "no-evidence",
+            description: "A segment that fails when it is given an evidence directory.",
+            steps: &[Step {
+                program: "sh",
+                args: &["-c", "test -z \"$ENTROQ_SEGMENT_DIR\""],
+            }],
+        };
+        let run = run_segment(
+            &segment,
+            Path::new("."),
+            Duration::from_secs(10),
+            &Output::Inherit,
+        );
+        assert!(matches!(run, Ok((Outcome::Pass, _))));
     }
 
     #[test]

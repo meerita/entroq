@@ -26,6 +26,11 @@ pub struct Codec {
     pub libraries: &'static [&'static str],
     /// The operating points a comparison covers, not only the default level.
     pub operating_points: &'static [&'static str],
+    /// The point this project's own interface selects when a caller states no level.
+    ///
+    /// A tier that measures direction rather than a frontier measures this one, so a cheap
+    /// run still compares what a caller who states nothing actually gets.
+    pub default_point: &'static str,
     /// A fact about the format a result must state, when the project publishes more than one.
     pub format_note: Option<&'static str>,
 }
@@ -46,6 +51,7 @@ const LZ4: Codec = Codec {
     operating_points: &[
         "fast-1", "fast-3", "fast-5", "fast-9", "hc-1", "hc-4", "hc-9", "hc-12",
     ],
+    default_point: "fast-1",
     format_note: None,
 };
 
@@ -66,6 +72,7 @@ const ZSTD: Codec = Codec {
     operating_points: &[
         "level-1", "level-3", "level-6", "level-9", "level-12", "level-15", "level-19", "level-22",
     ],
+    default_point: "level-3",
     format_note: None,
 };
 
@@ -87,6 +94,7 @@ const BROTLI: Codec = Codec {
         "lib/libbrotlienc.a",
     ],
     operating_points: &["q0", "q2", "q5", "q9", "q11"],
+    default_point: "q11",
     format_note: None,
 };
 
@@ -104,6 +112,7 @@ const SNAPPY: Codec = Codec {
     ],
     libraries: &["lib/libsnappy.a"],
     operating_points: &["default"],
+    default_point: "default",
     format_note: Some(
         "Snappy defines a block format and a framing format, and the two are not \
          interchangeable. This build measures the block format, which is what the C++ library \
@@ -127,6 +136,7 @@ const ZLIB: Codec = Codec {
     ],
     libraries: &["lib/libz.a"],
     operating_points: &["level-1", "level-6", "level-9"],
+    default_point: "level-6",
     format_note: None,
 };
 
@@ -181,6 +191,18 @@ mod tests {
                 codec.commit.chars().all(|c| c.is_ascii_hexdigit()),
                 "{} pins something that is not a commit",
                 codec.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_codec_names_the_point_its_own_project_defaults_to() {
+        for codec in CODECS {
+            assert!(
+                codec.operating_points.contains(&codec.default_point),
+                "{} defaults to {}, which is not one of its points",
+                codec.name,
+                codec.default_point
             );
         }
     }

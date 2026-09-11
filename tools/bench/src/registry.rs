@@ -55,6 +55,20 @@ impl SizeClass {
         }
     }
 
+    /// The class a `--class` argument names.
+    pub fn parse(name: &str) -> Option<Self> {
+        CLASSES.iter().copied().find(|class| class.name() == name)
+    }
+
+    /// Every class name, in increasing order, for a usage message.
+    pub fn names() -> String {
+        CLASSES
+            .iter()
+            .map(|class| class.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::Tiny => "tiny",
@@ -561,6 +575,18 @@ mod tests {
         assert_eq!(SizeClass::of(4 * 1024 * 1024), SizeClass::Large);
         assert_eq!(SizeClass::of(100 * 1024 * 1024 - 1), SizeClass::Large);
         assert_eq!(SizeClass::of(100 * 1024 * 1024), SizeClass::Huge);
+    }
+
+    #[test]
+    fn every_class_name_round_trips() {
+        for class in CLASSES {
+            assert_eq!(
+                SizeClass::parse(class.name()).map(SizeClass::name),
+                Some(class.name())
+            );
+        }
+        assert!(SizeClass::parse("enormous").is_none());
+        assert!(SizeClass::names().contains("medium"));
     }
 
     #[test]

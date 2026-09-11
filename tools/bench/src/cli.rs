@@ -11,7 +11,8 @@ use std::path::PathBuf;
 
 use crate::catalog::{self, Codec};
 use crate::error::{Error, Result};
-use crate::registry::{self, Group, Selection};
+use crate::plan::{Request, Tier};
+use crate::registry::{self, Group, Selection, SizeClass};
 
 pub const HELP: &str = "\
 entroq-bench: the Entroq benchmark tool.
@@ -23,6 +24,8 @@ Usage:
   entroq-bench corpus reproduce <what> [--corpus <dir>]
   entroq-bench corpus verify    <what> [--corpus <dir>]
   entroq-bench corpus list      <what>
+  entroq-bench measure        --tier <tier> --codec <name> [--class <name>]
+                              [--segment <id>] [--lab <dir>] [--corpus <dir>]
   entroq-bench help
 
 `lab build` fetches one competitor at its pinned commit, builds it as a static library with
@@ -54,6 +57,24 @@ cache.
 
 No corpus byte is committed. The registry and the method of obtaining it are.
 
+`measure` measures one competitor in-process, through the library the laboratory built and
+this binary linked. It emits one machine-readable result on standard output, and writes the
+same document into the directory the runner names for the segment's evidence. Every metric is
+reported as measured, with the call that produced it, or as unavailable, with the reason. No
+metric is reported as a zero.
+
+Tiers:
+  smoke        tiny and small classes, the default operating point, numbers ignored
+  dev          adds the medium class, few samples, direction only, never published
+  gate         every pinned operating point, adds the large class, spread reported
+  publication  full corpora, the only tier a number may leave the repository from
+
+A measurement covers every size class its tier names, unless --class names one. A segmented
+campaign names one class per segment so each segment fits its budget.
+
+Entroq has no codec path at this revision, so every result states an empty Entroq column and
+why it is empty.
+
 Selecting entries, for every corpus action:
   --all             every registered entry
   --group <name>    every entry of one group
@@ -61,6 +82,9 @@ Selecting entries, for every corpus action:
 
 Competitors:
   lz4, zstd, brotli, snappy, zlib
+
+Size classes:
+  tiny, small, medium, large, huge
 
 Corpus groups:
   project, enwik, sourcecode, gutenberg
@@ -70,6 +94,10 @@ Environment:
            Not required. Default: ../lab, beside the repository.
   CORPUS   the corpus cache, when --corpus does not name it.
            Not required. Default: ../corpus, beside the repository.
+  ENTROQ_SEGMENT_DIR
+           the directory a measurement writes its result document into, which the
+           validation runner sets to the segment's evidence directory. Not required.
+           Without it the document goes to standard output alone.
 
 Host tools:
   Building the laboratory needs git, cmake, a C and C++ compiler, date, and uname.
@@ -77,7 +105,7 @@ Host tools:
   A host missing one fails with its name.
 
 Exit status:
-  0  the action succeeded, whatever a rebuild measured
+  0  the action succeeded, whatever a rebuild or a measurement found
   1  the tool could not complete the action
 ";
 
@@ -97,6 +125,7 @@ pub enum Invocation {
         selection: Selection,
         corpus: Option<PathBuf>,
     },
+    Measure(Box<Request>),
 }
 
 /// What a corpus invocation does to the entries it selected.
@@ -133,6 +162,7 @@ pub fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
         "help" | "--help" | "-h" => Ok(Invocation::Help),
         "lab" => lab(args),
         "corpus" => corpus(args),
+        "measure" => measure(args),
         other => Err(Error::Usage(format!(
             "unknown command `{other}`. Run `entroq-bench help`."
         ))),
@@ -246,6 +276,80 @@ fn corpus(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
         selection,
         corpus,
     })
+}
+
+fn measure(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
+    let mut tier_name: Option<String> = None;
+    let mut codec_name: Option<String> = None;
+    let mut class_name: Option<String> = None;
+    let mut segment: Option<String> = None;
+    let mut lab: Option<PathBuf> = None;
+    let mut corpus: Option<PathBuf> = None;
+
+    while let Some(arg) = args.next() {
+        match text(&arg, "argument")?.as_str() {
+            "--tier" => tier_name = Some(text(&next(&mut args, "--tier")?, "--tier")?),
+            "--codec" => codec_name = Some(text(&next(&mut args, "--codec")?, "--codec")?),
+            "--class" => class_name = Some(text(&next(&mut args, "--class")?, "--class")?),
+            "--segment" => segment = Some(text(&next(&mut args, "--segment")?, "--segment")?),
+            "--lab" => lab = Some(PathBuf::from(next(&mut args, "--lab")?)),
+            "--corpus" => corpus = Some(PathBuf::from(next(&mut args, "--corpus")?)),
+            other => {
+                return Err(Error::Usage(format!(
+                    "unexpected argument `{other}`. Run `entroq-bench help`."
+                )));
+            }
+        }
+    }
+
+    let tier_name =
+        tier_name.ok_or_else(|| Error::Usage(String::from("measure: --tier is required")))?;
+    let tier = Tier::parse(&tier_name).ok_or_else(|| {
+        Error::Usage(format!(
+            "`{tier_name}` is not a tier. Use smoke, dev, gate, or publication."
+        ))
+    })?;
+    let codec_name =
+        codec_name.ok_or_else(|| Error::Usage(String::from("measure: --codec is required")))?;
+    let codec = catalog::find(&codec_name).ok_or_else(|| {
+        Error::Usage(format!(
+            "`{codec_name}` is not a pinned competitor. The laboratory holds {}.",
+            catalog::names()
+        ))
+    })?;
+    let class = match class_name {
+        Some(name) => Some(SizeClass::parse(&name).ok_or_else(|| {
+            Error::Usage(format!(
+                "`{name}` is not a size class. The registry holds {}.",
+                SizeClass::names()
+            ))
+        })?),
+        None => None,
+    };
+    if let Some(class) = class
+        && !tier.classes().contains(&class)
+    {
+        return Err(Error::Usage(format!(
+            "the {} tier does not cover the {} class",
+            tier.name(),
+            class.name()
+        )));
+    }
+
+    let segment = segment.unwrap_or_else(|| {
+        class.map_or_else(
+            || format!("bench-{}", codec.name),
+            |class| format!("bench-{}-{}", codec.name, class.name()),
+        )
+    });
+    Ok(Invocation::Measure(Box::new(Request {
+        tier,
+        codec,
+        class,
+        segment,
+        lab,
+        corpus,
+    })))
 }
 
 fn next(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<OsString> {
@@ -438,5 +542,113 @@ mod tests {
     #[test]
     fn an_unknown_corpus_action_is_rejected() {
         assert!(invoke(&["corpus", "delete", "--all"]).is_err());
+    }
+
+    fn measured(args: &[&str]) -> Option<super::Request> {
+        match invoke(args) {
+            Ok(Invocation::Measure(request)) => Some(*request),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_measurement_names_its_tier_and_its_competitor() {
+        let request = measured(&["measure", "--tier", "dev", "--codec", "zstd"]);
+        assert_eq!(
+            request.map(|r| (r.tier.name(), r.codec.name, r.segment)),
+            Some(("dev", "zstd", String::from("bench-zstd")))
+        );
+    }
+
+    #[test]
+    fn a_measurement_of_one_class_names_it_in_its_segment() {
+        let request = measured(&[
+            "measure", "--tier", "gate", "--codec", "brotli", "--class", "large",
+        ]);
+        assert_eq!(
+            request.map(|r| r.segment),
+            Some(String::from("bench-brotli-large"))
+        );
+    }
+
+    #[test]
+    fn a_named_segment_wins_over_the_derived_one() {
+        let request = measured(&[
+            "measure",
+            "--tier",
+            "smoke",
+            "--codec",
+            "lz4",
+            "--segment",
+            "bench-probe",
+        ]);
+        assert_eq!(
+            request.map(|r| r.segment),
+            Some(String::from("bench-probe"))
+        );
+    }
+
+    #[test]
+    fn a_measurement_keeps_the_build_inputs_it_was_given() {
+        let request = measured(&[
+            "measure",
+            "--tier",
+            "smoke",
+            "--codec",
+            "lz4",
+            "--lab",
+            "/tmp/lab",
+            "--corpus",
+            "/tmp/corpus",
+        ]);
+        let paths = request.map(|r| {
+            (
+                r.lab.map(|p| p.display().to_string()),
+                r.corpus.map(|p| p.display().to_string()),
+            )
+        });
+        assert_eq!(
+            paths,
+            Some((
+                Some(String::from("/tmp/lab")),
+                Some(String::from("/tmp/corpus"))
+            ))
+        );
+    }
+
+    #[test]
+    fn a_measurement_without_a_tier_or_a_codec_is_rejected() {
+        assert!(invoke(&["measure", "--codec", "zstd"]).is_err());
+        assert!(invoke(&["measure", "--tier", "dev"]).is_err());
+        assert!(invoke(&["measure"]).is_err());
+    }
+
+    #[test]
+    fn a_tier_or_a_class_nobody_defined_is_rejected_with_what_exists() {
+        let failure = invoke(&["measure", "--tier", "quick", "--codec", "zstd"]);
+        let message = failure.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("publication"), "{message}");
+        assert!(
+            invoke(&[
+                "measure", "--tier", "dev", "--codec", "zstd", "--class", "enormous"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_class_the_tier_does_not_cover_is_rejected_rather_than_measured_empty() {
+        let failure = invoke(&[
+            "measure", "--tier", "smoke", "--codec", "zstd", "--class", "large",
+        ]);
+        assert!(failure.is_err());
+        let message = failure.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("does not cover"), "{message}");
+    }
+
+    #[test]
+    fn the_help_states_the_segment_directory_and_the_empty_entroq_column() {
+        assert!(HELP.contains("ENTROQ_SEGMENT_DIR"));
+        assert!(HELP.contains("empty Entroq column"));
     }
 }
