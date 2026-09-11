@@ -51,6 +51,30 @@ A lower tier never substitutes for a higher one. A dev-tier result is not a gate
 A recorded run writes its record outside the repository, under `../runs` by default. Set
 `RUNS` to change that path. The repository carries code, not evidence.
 
+## The competitor laboratory
+
+Entroq is measured against pinned builds of LZ4, Zstandard, Brotli, Snappy, and zlib. They
+live outside the repository, under `../lab` by default. Set `LAB` to change that path.
+
+```sh
+make lab          # build every pinned competitor, one segment per codec
+make lab-resume   # continue the current lab campaign where it stopped
+```
+
+`make lab` needs a network, `git`, `cmake`, and a C and C++ compiler. No other target
+needs any of them, so you can run every gate without them.
+
+Each competitor is pinned to the commit behind its release tag and built as a static
+library with the release configuration its own project recommends. A competitor built with
+weaker optimization than Entroq is not a baseline.
+
+Each build carries a `MANIFEST` that says how it was produced, and a `REBUILD` that records
+what a rebuild from those commands produced. A build with no manifest cannot appear in a
+result.
+
+A pinned build is never rebuilt in place. A new build of the same project takes a new
+version directory, so an old result keeps pointing at the build that produced it.
+
 Prefer many distinct small inputs to one large input. Variety finds more defects per
 second than volume.
 

@@ -51,6 +51,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "entroq-bench"
+version = "0.0.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "entroq-run"
 version = "0.0.0"
 dependencies = [

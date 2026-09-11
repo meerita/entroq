@@ -15,6 +15,7 @@ pub struct Summary<'a> {
     pub environment: &'a Environment,
     pub entries: &'a [Entry],
     pub coverage: &'a str,
+    pub limits: &'a str,
 }
 
 /// The block a campaign prints when it ends.
@@ -35,6 +36,7 @@ pub fn console(outcome: &Outcome) -> String {
     format!(
         "Campaign: {campaign}\n\
          Tier: {tier}\n\
+         Suite: {suite}\n\
          Revision: {revision}\n\
          Segments: {satisfied}/{total}, {reused} reused\n\
          Duration: {duration}\n\
@@ -42,6 +44,7 @@ pub fn console(outcome: &Outcome) -> String {
          Record: {record}\n\
          Blockers: {blockers}\n",
         tier = outcome.tier.name(),
+        suite = outcome.suite.name(),
         revision = outcome.revision,
         satisfied = outcome.satisfied,
         total = outcome.total,
@@ -67,6 +70,7 @@ pub fn summary(summary: &Summary<'_>) -> String {
         format!("# {}", outcome.campaign.as_deref().unwrap_or("unnamed")),
         String::new(),
         format!("Tier: {}", outcome.tier.name()),
+        format!("Suite: {}", outcome.suite.name()),
         format!("Status: {}", outcome.status.as_str()),
         format!("Revision: {}", outcome.revision),
         format!(
@@ -108,16 +112,11 @@ pub fn summary(summary: &Summary<'_>) -> String {
         String::new(),
         String::from(summary.coverage),
         String::new(),
-        String::from(LIMITS),
+        String::from(summary.limits),
         String::new(),
     ]);
     lines.join("\n")
 }
-
-/// What no segment of this campaign measured, stated so no reader infers it.
-const LIMITS: &str = "The campaign ran on one host and one architecture. It measured no \
-compression ratio, no throughput, and no competitor. A segment reports only whether its \
-command succeeded within the segment budget.";
 
 fn seconds(value: f64) -> String {
     format!("{value:.1} s")
@@ -127,13 +126,14 @@ fn seconds(value: f64) -> String {
 mod tests {
     use super::{console, seconds, segment_line};
     use crate::campaign::{Outcome, Status};
-    use crate::tier::Tier;
+    use crate::tier::{Suite, Tier};
     use std::path::PathBuf;
     use std::time::Duration;
 
     fn outcome() -> Outcome {
         Outcome {
             tier: Tier::Gate,
+            suite: Suite::Workspace,
             campaign: Some(String::from("2026-09-11-01-workspace-gate")),
             revision: String::from("1a195e3"),
             total: 5,
@@ -152,6 +152,7 @@ mod tests {
         for field in [
             "Campaign: 2026-09-11-01-workspace-gate",
             "Tier: gate",
+            "Suite: workspace",
             "Revision: 1a195e3",
             "Segments: 5/5, 3 reused",
             "Duration: 12.4 s",

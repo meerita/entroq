@@ -10,16 +10,14 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use crate::error::{Error, Result};
-use crate::tier::Tier;
-
-const DEFAULT_TOPIC: &str = "workspace-gate";
+use crate::tier::{Suite, Tier};
 
 pub const HELP: &str = "\
 entroq-run: the Entroq validation runner.
 
 Usage:
-  entroq-run run    --tier <tier> [--runs <dir>] [--topic <name>]
-  entroq-run resume --tier <tier>  --runs <dir>
+  entroq-run run    --tier <tier> [--suite <suite>] [--runs <dir>] [--topic <name>]
+  entroq-run resume --tier <tier> [--suite <suite>]  --runs <dir>
   entroq-run fuzz   --target <name> --runs <dir>
   entroq-run bench  --tier <tier> --lab <dir> --runs <dir>
   entroq-run help
@@ -30,9 +28,17 @@ Tiers:
   gate         100 MiB inputs, segmented and resumable, recorded
   publication  full corpora, segmented and authorized, recorded
 
-`run` starts a campaign. `resume` continues the most recent campaign of a segmented tier,
-re-running only the segments that did not pass at the current revision against the current
-inputs.
+Suites:
+  workspace    the gates every revision must pass. The default.
+  lab          the competitor laboratory: one pinned build per competitor. Segmented, so
+               it runs at a segmented tier only.
+
+A tier says how a campaign is bounded, recorded, and resumed. A suite says which segments
+it runs.
+
+`run` starts a campaign. `resume` continues the most recent campaign of the same suite at a
+segmented tier, re-running only the segments that did not pass at the current revision
+against the current inputs.
 
 No segment runs longer than 120 seconds. A segment that overruns is reported as a timeout,
 and the budget does not move to accommodate it.
@@ -59,6 +65,7 @@ pub enum Mode {
 /// A campaign the runner was asked to run.
 pub struct Request {
     pub tier: Tier,
+    pub suite: Suite,
     pub runs: Option<PathBuf>,
     pub topic: String,
 }
@@ -100,12 +107,14 @@ pub fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
 
 fn campaign(mut args: impl Iterator<Item = OsString>, mode: Mode) -> Result<Invocation> {
     let mut tier_name: Option<String> = None;
+    let mut suite_name: Option<String> = None;
     let mut runs: Option<PathBuf> = None;
     let mut topic: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match text(&arg, "argument")?.as_str() {
             "--tier" => tier_name = Some(text(&next(&mut args, "--tier")?, "--tier")?),
+            "--suite" => suite_name = Some(text(&next(&mut args, "--suite")?, "--suite")?),
             "--runs" => runs = Some(PathBuf::from(next(&mut args, "--runs")?)),
             "--topic" => topic = Some(text(&next(&mut args, "--topic")?, "--topic")?),
             other => {
@@ -122,7 +131,20 @@ fn campaign(mut args: impl Iterator<Item = OsString>, mode: Mode) -> Result<Invo
             "unknown tier `{tier_name}`. Run `entroq-run help`."
         ))
     })?;
+    let suite = match suite_name {
+        Some(name) => Suite::parse(&name).ok_or_else(|| {
+            Error::Usage(format!("unknown suite `{name}`. Run `entroq-run help`."))
+        })?,
+        None => Suite::Workspace,
+    };
 
+    if suite.segments(tier).is_empty() {
+        return Err(Error::Usage(format!(
+            "the {} suite has no segments at the {} tier, so there is nothing to run",
+            suite.name(),
+            tier.name()
+        )));
+    }
     if tier.is_recorded() && runs.is_none() {
         return Err(Error::Usage(format!(
             "the {} tier is recorded, so --runs is required",
@@ -142,10 +164,15 @@ fn campaign(mut args: impl Iterator<Item = OsString>, mode: Mode) -> Result<Invo
         )));
     }
 
-    let topic = topic.unwrap_or_else(|| String::from(DEFAULT_TOPIC));
+    let topic = topic.unwrap_or_else(|| String::from(suite.default_topic()));
     validate_topic(&topic)?;
     Ok(Invocation::Campaign {
-        request: Request { tier, runs, topic },
+        request: Request {
+            tier,
+            suite,
+            runs,
+            topic,
+        },
         mode,
     })
 }
@@ -182,7 +209,7 @@ fn text(value: &OsString, what: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{Invocation, Mode, parse};
-    use crate::tier::Tier;
+    use crate::tier::{Suite, Tier};
     use std::ffi::OsString;
 
     fn invoke(args: &[&str]) -> super::Result<Invocation> {
@@ -197,6 +224,13 @@ mod tests {
                 request.runs.map(|p| p.display().to_string()),
                 request.topic,
             )),
+            _ => None,
+        }
+    }
+
+    fn suite(args: &[&str]) -> Option<(Suite, String)> {
+        match invoke(args) {
+            Ok(Invocation::Campaign { request, .. }) => Some((request.suite, request.topic)),
             _ => None,
         }
     }
@@ -264,6 +298,52 @@ mod tests {
         );
         assert!(invoke(&["resume", "--tier", "dev", "--runs", "../runs"]).is_err());
         assert!(invoke(&["resume", "--tier", "smoke"]).is_err());
+    }
+
+    #[test]
+    fn a_campaign_runs_the_workspace_suite_when_none_is_named() {
+        assert_eq!(
+            suite(&["run", "--tier", "smoke"]),
+            Some((Suite::Workspace, String::from("workspace-gate")))
+        );
+    }
+
+    #[test]
+    fn a_named_suite_brings_its_own_topic() {
+        assert_eq!(
+            suite(&[
+                "run", "--tier", "gate", "--suite", "lab", "--runs", "../runs"
+            ]),
+            Some((Suite::Lab, String::from("lab-build")))
+        );
+    }
+
+    #[test]
+    fn a_named_topic_still_wins_over_the_suite_default() {
+        let named = suite(&[
+            "run", "--tier", "gate", "--suite", "lab", "--runs", "../runs", "--topic", "relab",
+        ]);
+        assert_eq!(named.map(|(_, topic)| topic).as_deref(), Some("relab"));
+    }
+
+    #[test]
+    fn a_suite_with_no_segments_at_a_tier_is_rejected_rather_than_run_empty() {
+        let failure = invoke(&[
+            "run", "--tier", "dev", "--suite", "lab", "--runs", "../runs",
+        ]);
+        assert!(failure.is_err());
+        let message = failure.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("no segments"), "{message}");
+    }
+
+    #[test]
+    fn an_unknown_suite_is_rejected() {
+        assert!(
+            invoke(&[
+                "run", "--tier", "gate", "--suite", "codecs", "--runs", "../runs"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
