@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members  = ["codec"]
+members  = ["codec", "tools/run"]
 
 # The policy is `deny`, not `warn`, so `cargo clippy --workspace --all-targets` fails
 # on a warning with no `-D warnings` on the command line.

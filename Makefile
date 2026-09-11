@@ -3,8 +3,8 @@
 # Each target delegates to the tool that owns the implementation. Do not
 # duplicate delegated logic here.
 #
-# The validation runner does not exist yet, so every target that invokes it
-# fails. The build, format, and lint targets work.
+# The fuzz drivers and the benchmark harness do not exist yet, so `fuzz` and
+# `bench` say so and fail. Every other target works.
 #
 # No validation segment may exceed 120 seconds.
 #
@@ -44,7 +44,7 @@ RUNS ?= ../runs
 TIER ?= dev
 
 # Repository tooling, versioned with the code whose gates it runs.
-RUNNER = tools/run
+RUNNER = $(CARGO) run --quiet --release --package entroq-run --
 
 .PHONY: help build check fmt fmt-check lint smoke test gate gate-resume fuzz bench validate clean
 
