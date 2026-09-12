@@ -1,9 +1,9 @@
 //! Owns the driver that proves the fuzz mechanism runs.
 //!
-//! This driver tests no Entroq behavior and covers no Entroq code. No encoder and no decoder
-//! exists at this revision, so there is nothing to feed hostile bytes to. It exists so that
-//! the runner, the segment budget, and the persistent corpus can be shown to work before the
-//! drivers that matter arrive.
+//! This driver tests no Entroq behavior and covers no Entroq code. It exists so that the
+//! runner, the segment budget, and the persistent corpus can be exercised on their own,
+//! separately from any driver that reads a parser or a decoder. A runner defect and a codec
+//! defect then cannot be mistaken for each other.
 //!
 //! A passing segment here is not codec coverage. It says that one bounded segment ran, that
 //! it stopped inside its budget, and that its corpus survived the invocation.

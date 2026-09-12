@@ -168,7 +168,7 @@ A number leaves the repository only from a sealed publication-tier record. A dev
 never appears in a document, a release note, or a comparison claim.
 
 Every metric is reported as measured, with the call that produced it, or as unavailable, with
-the reason. No metric is reported as a zero. Entroq itself has no codec path yet, so every
+the reason. No metric is reported as a zero. The harness links no Entroq codec, so every
 result carries an empty Entroq column and says why.
 
 Two reports read what a campaign recorded. Both take a run record directory and read every

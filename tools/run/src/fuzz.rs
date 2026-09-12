@@ -84,24 +84,33 @@ const fn declared(name: &'static str, covers: &'static str) -> Target {
     }
 }
 
+const fn runnable_target(name: &'static str, covers: &'static str) -> Target {
+    Target {
+        name,
+        covers,
+        state: State::Runnable,
+    }
+}
+
 /// Every fuzz target the project carries.
 ///
-/// The eleven declared entries are the parser and decoder entry points. Each one arrives
-/// with the code it covers, so the set is fixed before any driver exists and no driver
-/// appears without a place in it.
+/// The eleven entry-point entries are the parsers and decoders. Each one becomes runnable
+/// when the code it covers exists, so the set is fixed before any driver is written and no
+/// driver appears without a place in it.
 ///
-/// `mechanism` is the odd one. It covers no Entroq code, because no encoder and no decoder
-/// exists. It proves that a bounded segment runs, stops inside its budget, and keeps its
-/// corpus. A passing segment on it is not coverage of anything the project ships.
+/// `mechanism` is the odd one. It covers no Entroq code at all. It proves that a bounded
+/// segment runs, stops inside its budget, and keeps its corpus, which is a property of the
+/// runner rather than of the codec. A passing segment on it is not coverage of anything the
+/// project ships, and it stays in the list so the runner itself keeps being exercised.
 const TARGETS: &[Target] = &[
-    declared("frame-parser", "the frame header parser"),
+    runnable_target("frame-parser", "the frame header parser"),
     declared("region-parser", "the region header parser"),
     declared("block-parser", "the block header parser"),
     declared("entropy-table-parser", "the entropy table parser"),
     declared("entropy-decoder", "the entropy decoder"),
     declared("sequence-decoder", "the sequence decoder"),
     declared("full-decoder", "the full decode path"),
-    declared("streaming-decoder", "the streaming decode path"),
+    runnable_target("streaming-decoder", "the streaming decode path"),
     declared("index-parser", "the index parser"),
     declared("range-decoder", "the range decoder"),
     declared("round-trip", "encode followed by decode"),
@@ -471,20 +480,26 @@ mod tests {
         }
     }
 
+    /// The drivers that exist at this revision, and nothing else.
+    ///
+    /// A target becomes runnable when its driver is written, so this list grows one entry at
+    /// a time. It is asserted exactly, so a driver cannot be marked runnable without the
+    /// list that names it being updated in the same change.
     #[test]
-    fn one_driver_exists_at_this_revision() {
-        let runnable = TARGETS
+    fn the_runnable_set_is_exactly_the_drivers_that_exist() {
+        let found: Vec<&str> = TARGETS
             .iter()
             .filter(|target| target.state == State::Runnable)
-            .count();
-        assert_eq!(runnable, 1);
+            .map(|target| target.name)
+            .collect();
+        assert_eq!(found, ["frame-parser", "streaming-decoder", "mechanism"]);
     }
 
     #[test]
-    fn the_one_driver_says_it_covers_no_entroq_code() {
+    fn the_mechanism_driver_says_it_covers_no_entroq_code() {
         let found = TARGETS
             .iter()
-            .find(|target| target.state == State::Runnable)
+            .find(|target| target.name == "mechanism")
             .map(|target| target.covers);
         assert_eq!(
             found.map(|covers| covers.contains("No Entroq code")),
@@ -494,10 +509,10 @@ mod tests {
 
     #[test]
     fn a_declared_target_names_what_it_waits_for_rather_than_running_empty() {
-        let refused = runnable("frame-parser");
+        let refused = runnable("index-parser");
         let message = refused.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(message.contains("no driver at this revision"), "{message}");
-        assert!(message.contains("frame header parser"), "{message}");
+        assert!(message.contains("the index parser"), "{message}");
     }
 
     #[test]
@@ -507,11 +522,10 @@ mod tests {
     }
 
     #[test]
-    fn the_driver_that_exists_is_runnable() {
-        assert_eq!(
-            runnable("mechanism").map(|t| t.name).ok(),
-            Some("mechanism")
-        );
+    fn every_driver_that_exists_is_runnable() {
+        for name in ["frame-parser", "streaming-decoder", "mechanism"] {
+            assert_eq!(runnable(name).map(|target| target.name).ok(), Some(name));
+        }
     }
 
     #[test]

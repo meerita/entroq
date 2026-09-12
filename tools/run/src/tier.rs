@@ -595,8 +595,8 @@ impl Suite {
                  corpus entries its tier's budget reaches, and emits one machine-readable \
                  result. A segmented tier covers one operating point group and one size \
                  class per segment, and the groups of a competitor cover every point the \
-                 catalog pins for it. Entroq has no codec path at this revision, so every \
-                 result carries an empty Entroq column and states why."
+                 catalog pins for it. The harness links no Entroq codec at this revision, \
+                 so every result carries an empty Entroq column and states why."
             }
         }
     }
@@ -628,8 +628,8 @@ impl Suite {
             }
             Self::Bench => {
                 "The campaign ran on one host and one architecture, and it compares no two \
-                 environments. It measured no Entroq number, because no encoder and no \
-                 decoder exist. A cycle count and an instruction count need a performance \
+                 environments. It measured no Entroq number, because the harness links no \
+                 Entroq codec. A cycle count and an instruction count need a performance \
                  monitor unit this host does not grant, so all three counter metrics report \
                  unavailable with the reason and no number is derived from elapsed time. A \
                  tier's input budget bounds the entries a segment reads, and every entry a \

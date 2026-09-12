@@ -9,12 +9,16 @@ Deflate, and it is not bitstream compatible with any of them.
 
 Early development.
 
-The codec crate exports no API. Every module in it is private, and none holds an encoder or
-a decoder. There is no format specification and no Entroq command line tool.
+The codec crate exports a format module and a streaming module. Between them they hold the
+frame, region and block structure, a streaming encoder, and a streaming decoder. Every other
+module in the crate is private, because the mechanism it owns has not been designed and
+measured. There is no Entroq command line tool.
 
-There is nothing to compress with yet.
+The structure carries no compression. Content travels literally or as a run, so a stream is
+a validated container and not yet a compressed representation. There is nothing to compress
+with yet.
 
-What the repository holds is the measurement foundation the codec will be built against:
+Beyond that, the repository holds the measurement foundation the codec is built against:
 
 * A validation runner. Four tiers, a hard 120 second budget per segment, an append-only
   record per run, resume, and sealing.
@@ -27,8 +31,9 @@ What the repository holds is the measurement foundation the codec will be built 
 * A result parser, a Pareto report, and a comparison that states whether one recorded
   campaign reproduced another.
 * Fuzz infrastructure. Eleven targets are declared against the parsers and decoders Entroq
-  will have, and no driver exists for any of them, because the code they cover does not. A
-  twelfth target exercises the fuzz runner itself and covers no Entroq code.
+  will have. Two carry a driver, for the frame header parser and for the streaming decoder;
+  the other nine wait for the code they cover. A twelfth target exercises the fuzz runner
+  itself and covers no Entroq code.
 * An integration lane that runs the gates on a clean Linux host, in a container.
 
 Every number these produce is a competitor number. No Entroq number exists, and every
@@ -78,8 +83,10 @@ behavior they would state does not exist.
 `docs/benchmarks.md` states what Entroq measures, against what, how, and what a number from
 each tier licenses.
 
-`docs/format.md` will state the format contract. A third party must be able to write a
-conforming decoder from that page alone. It waits for a designed format.
+`docs/format.md` states the format contract: the frame, region and block structure, and
+what a conforming decoder accepts, refuses, and ignores. A third party must be able to write
+a conforming decoder from that page alone. The format is implemented and not frozen, and the
+page marks every field that is still provisional.
 
 ## Contributing
 
