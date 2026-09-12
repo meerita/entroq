@@ -60,6 +60,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "entroq-proof"
+version = "0.0.0"
+dependencies = [
+ "codec",
+ "libc",
+]
+
+[[package]]
 name = "entroq-run"
 version = "0.0.0"
 dependencies = [

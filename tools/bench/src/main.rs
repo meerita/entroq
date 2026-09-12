@@ -18,7 +18,7 @@
 //! The measurement: it drives each competitor in-process, through the library the laboratory
 //! built and the build script linked, and emits one machine-readable result per segment.
 //! Every metric is reported as measured, with the call that produced it, or as unavailable,
-//! with the reason. Entroq itself has no codec path at this revision, so every result states
+//! with the reason. This tool links no Entroq codec at this revision, so every result states
 //! an empty Entroq column and says why.
 //!
 //! A host that has not built the laboratory compiles this tool, builds the laboratory with

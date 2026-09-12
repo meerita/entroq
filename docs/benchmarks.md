@@ -5,7 +5,7 @@ class: reference
 audience: someone reading, reproducing, or citing an Entroq measurement
 order: 2
 version_axes: [encoder_version, harness_version]
-encoder_version: none. No encoder exists at this revision.
+encoder_version: 0.0.0. The harness links no Entroq codec, so no number on this page was produced by it.
 harness_version: 0.0.0
 ---
 
@@ -13,8 +13,10 @@ harness_version: 0.0.0
 
 This page states the measurement laboratory as it exists now.
 
-No Entroq number appears on this page, and none exists anywhere. The codec crate exports no
-API and holds no encoder and no decoder, so every Entroq cell below is N/A with the reason.
+No Entroq number appears on this page, and none exists anywhere. The harness links no Entroq
+codec, so every Entroq cell below is N/A with the reason. The encoder and decoder that exist
+store content without compressing it, so even linked they would produce no compressed size
+and no compression work to time.
 
 The competitor numbers below come from a sealed gate-tier record. The gate tier is not the
 publication tier. Read every number with the scope stated beside it, and read the timing
@@ -120,20 +122,20 @@ No metric is reported as a zero, and no absent metric is omitted.
 
 | Metric | Unit | Entroq | Competitors |
 |---|---|---|---|
-| `compressed_bytes` | bytes | N/A, no encoder | measured |
-| `compression_ratio` | input bytes per compressed byte | N/A, no encoder | measured |
-| `encode_throughput` | bytes per second | N/A, no encoder | measured |
-| `decode_throughput` | bytes per second | N/A, no decoder | measured |
-| `peak_rss` | bytes | N/A, nothing to measure | measured, for the harness process |
-| `codec_owned_bytes` | bytes | N/A, no encoder state | measured for Brotli, LZ4, zlib and Zstandard. Snappy publishes no state-size call and no allocator hook |
-| `decoder_owned_bytes` | bytes | N/A, no decoder state | measured for Zstandard alone. Brotli, LZ4, Snappy and zlib publish no decoder state size |
-| `allocations` | allocations | N/A, nothing to measure | measured through the harness allocator, for Brotli, LZ4, zlib and Zstandard, on one entry per size class |
-| `encode_first_output_latency` | nanoseconds | N/A, no streaming path | measured for Brotli, LZ4, zlib and Zstandard, on one entry per size class. Snappy publishes no streaming interface |
-| `encode_streaming_latency` | nanoseconds | N/A, no streaming path | measured on the same basis |
+| `compressed_bytes` | bytes | N/A, not linked | measured |
+| `compression_ratio` | input bytes per compressed byte | N/A, not linked | measured |
+| `encode_throughput` | bytes per second | N/A, not linked | measured |
+| `decode_throughput` | bytes per second | N/A, not linked | measured |
+| `peak_rss` | bytes | N/A, not linked | measured, for the harness process |
+| `codec_owned_bytes` | bytes | N/A, not linked | measured for Brotli, LZ4, zlib and Zstandard. Snappy publishes no state-size call and no allocator hook |
+| `decoder_owned_bytes` | bytes | N/A, not linked | measured for Zstandard alone. Brotli, LZ4, Snappy and zlib publish no decoder state size |
+| `allocations` | allocations | N/A, not linked | measured through the harness allocator, for Brotli, LZ4, zlib and Zstandard, on one entry per size class |
+| `encode_first_output_latency` | nanoseconds | N/A, not linked | measured for Brotli, LZ4, zlib and Zstandard, on one entry per size class. Snappy publishes no streaming interface |
+| `encode_streaming_latency` | nanoseconds | N/A, not linked | measured on the same basis |
 | `parallel_scaling` | ratio | N/A, no parallel path | measured for Zstandard alone. Brotli, LZ4, Snappy and zlib publish no thread parameter |
-| `encode_cycles_per_byte` | cycles per byte | N/A, no encoder | N/A on every host this project reaches |
-| `decode_cycles_per_byte` | cycles per byte | N/A, no decoder | N/A on every host this project reaches |
-| `instructions_per_byte` | instructions per byte | N/A, no codec path | N/A on every host this project reaches |
+| `encode_cycles_per_byte` | cycles per byte | N/A, not linked | N/A on every host this project reaches |
+| `decode_cycles_per_byte` | cycles per byte | N/A, not linked | N/A on every host this project reaches |
+| `instructions_per_byte` | instructions per byte | N/A, not linked | N/A on every host this project reaches |
 | `random_range_latency` | nanoseconds | N/A, no range read | N/A, no competitor measured here publishes a range read |
 | `range_amplification` | ratio | N/A, no range read | N/A, same reason |
 
@@ -371,7 +373,8 @@ and move by up to about a fifth at the expensive ones, in one direction, between
 machine. Treat a throughput here as the order of magnitude and the shape of the curve, not as
 a value to compare against another published figure.
 
-Nothing here compares Entroq to anything. Entroq has no codec path, so it appears in no table.
+Nothing here compares Entroq to anything. The harness links no Entroq codec, so it appears
+in no table.
 
 ## Fairness
 

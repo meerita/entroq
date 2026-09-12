@@ -80,8 +80,8 @@ one class and one group per segment so each segment fits its budget. The cost of
 spans three orders of magnitude inside one project, so a slow point is grouped with points of
 its own cost rather than with the cheap ones it would push over the budget.
 
-Entroq has no codec path at this revision, so every result states an empty Entroq column and
-why it is empty.
+Every result states an empty Entroq column and why it is empty: this harness links no Entroq
+codec at this revision.
 
 `report parse` reads every recorded result under the paths given and reports what it read.
 A result is read whole or rejected: a document carrying a field the parser does not declare,

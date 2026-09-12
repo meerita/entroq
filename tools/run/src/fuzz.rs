@@ -14,6 +14,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::campaign::Status;
 use crate::clock::Utc;
@@ -21,7 +22,7 @@ use crate::error::{Error, Result};
 use crate::exec::{self, Invocation, Output};
 use crate::record::{Entry, FuzzManifest, Record, Status as AttemptStatus};
 use crate::report;
-use crate::tier::{FUZZ_SEGMENT_SECONDS, SEGMENT_BUDGET, Tier};
+use crate::tier::{FUZZ_SEGMENT_SECONDS, SEGMENT_BUDGET, Tier, fuzz_routine_seconds};
 use crate::workspace;
 
 /// The tier a fuzz segment is recorded at.
@@ -74,6 +75,12 @@ pub struct Target {
     pub name: &'static str,
     pub covers: &'static str,
     pub state: State,
+    /// Whether the driver reaches codec code.
+    ///
+    /// A target that exercises the runner rather than the codec is still worth running, and
+    /// still not codec coverage. A routine that fuzzes on a codec campaign's behalf advances
+    /// only the targets that reach the codec, so none of its budget buys coverage of itself.
+    pub codec: bool,
 }
 
 const fn declared(name: &'static str, covers: &'static str) -> Target {
@@ -81,27 +88,38 @@ const fn declared(name: &'static str, covers: &'static str) -> Target {
         name,
         covers,
         state: State::Declared,
+        codec: true,
+    }
+}
+
+const fn runnable_target(name: &'static str, covers: &'static str) -> Target {
+    Target {
+        name,
+        covers,
+        state: State::Runnable,
+        codec: true,
     }
 }
 
 /// Every fuzz target the project carries.
 ///
-/// The eleven declared entries are the parser and decoder entry points. Each one arrives
-/// with the code it covers, so the set is fixed before any driver exists and no driver
-/// appears without a place in it.
+/// The eleven entry-point entries are the parsers and decoders. Each one becomes runnable
+/// when the code it covers exists, so the set is fixed before any driver is written and no
+/// driver appears without a place in it.
 ///
-/// `mechanism` is the odd one. It covers no Entroq code, because no encoder and no decoder
-/// exists. It proves that a bounded segment runs, stops inside its budget, and keeps its
-/// corpus. A passing segment on it is not coverage of anything the project ships.
+/// `mechanism` is the odd one. It covers no Entroq code at all. It proves that a bounded
+/// segment runs, stops inside its budget, and keeps its corpus, which is a property of the
+/// runner rather than of the codec. A passing segment on it is not coverage of anything the
+/// project ships, and it stays in the list so the runner itself keeps being exercised.
 const TARGETS: &[Target] = &[
-    declared("frame-parser", "the frame header parser"),
+    runnable_target("frame-parser", "the frame header parser"),
     declared("region-parser", "the region header parser"),
     declared("block-parser", "the block header parser"),
     declared("entropy-table-parser", "the entropy table parser"),
     declared("entropy-decoder", "the entropy decoder"),
     declared("sequence-decoder", "the sequence decoder"),
     declared("full-decoder", "the full decode path"),
-    declared("streaming-decoder", "the streaming decode path"),
+    runnable_target("streaming-decoder", "the streaming decode path"),
     declared("index-parser", "the index parser"),
     declared("range-decoder", "the range decoder"),
     declared("round-trip", "encode followed by decode"),
@@ -109,6 +127,7 @@ const TARGETS: &[Target] = &[
         name: "mechanism",
         covers: "the runner, the segment budget, and the persistent corpus. No Entroq code",
         state: State::Runnable,
+        codec: false,
     },
 ];
 
@@ -207,7 +226,7 @@ pub fn advance(name: &str, runs: &Path) -> Result<Outcome> {
     let segment = format!("fuzz-{}", target.name);
     let history = History::read(runs, &segment)?;
 
-    let steps = vec![corpus.invocation(target.name)];
+    let steps = vec![corpus.invocation(target.name, FUZZ_SEGMENT_SECONDS)];
     let created = Utc::now()?;
     let record = Record::create(runs, TIER, &created.date(), &segment)?;
     let description = format!("One bounded segment of the {} fuzz target.", target.name);
@@ -294,6 +313,105 @@ pub fn advance(name: &str, runs: &Path) -> Result<Outcome> {
     Ok(outcome)
 }
 
+/// The run root a routine writes its corpus under.
+///
+/// The argument wins, then the `RUNS` build input, then the default beside the repository. A
+/// segment declared at compile time cannot carry a path the caller chose at run time, so the
+/// campaign that runs one passes the root in the environment.
+pub const RUNS_VARIABLE: &str = "RUNS";
+pub const RUNS_DEFAULT: &str = "../runs";
+
+/// Resolves the run root a routine writes under.
+#[must_use]
+pub fn runs_root(explicit: Option<PathBuf>) -> PathBuf {
+    explicit
+        .or_else(|| std::env::var_os(RUNS_VARIABLE).map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(RUNS_DEFAULT))
+}
+
+/// What one target did inside a routine.
+pub struct Advanced {
+    pub target: &'static str,
+    pub duration_s: f64,
+    pub status: AttemptStatus,
+    pub files_before: usize,
+    pub files_after: usize,
+    pub reproducers: Vec<String>,
+    pub note: Option<String>,
+}
+
+/// What a routine did.
+pub struct Routine {
+    pub revision: String,
+    pub seconds_each: u64,
+    pub advanced: Vec<Advanced>,
+    pub corpus_root: PathBuf,
+}
+
+impl Routine {
+    /// Whether every target advanced without a failure and without a reproducer.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.advanced
+            .iter()
+            .all(|one| one.status.is_satisfied() && one.reproducers.is_empty())
+    }
+}
+
+/// Advances every runnable codec target by one shortened invocation, inside one segment.
+///
+/// A gate campaign that names fuzzing as a segment cannot spend a full invocation on each
+/// target and stay inside the segment budget, so a routine shortens each one and runs them in
+/// turn. The runner's own self-test target is skipped: it reaches no codec code, and a codec
+/// campaign's budget should not buy coverage of the runner. Nothing is recorded here: the
+/// campaign that ran the routine is the record.
+///
+/// # Errors
+///
+/// Fails when cargo-fuzz is absent, the repository cannot be inspected, or a corpus directory
+/// cannot be created. A target that runs and finds a crash is an outcome, not an error.
+pub fn routine(runs: &Path) -> Result<Routine> {
+    let root = workspace::root()?;
+    preflight(&root)?;
+    let revision = workspace::revision(&root)?;
+
+    let targets: Vec<&Target> = TARGETS
+        .iter()
+        .filter(|target| target.state == State::Runnable && target.codec)
+        .collect();
+    let seconds_each = fuzz_routine_seconds(u64::try_from(targets.len()).unwrap_or(u64::MAX));
+
+    let started = Instant::now();
+    let mut advanced = Vec::new();
+    for target in targets {
+        let corpus = Corpus::open(runs, target.name)?;
+        let files_before = corpus.files()?;
+        let steps = vec![corpus.invocation(target.name, seconds_each)];
+        let budget = SEGMENT_BUDGET.saturating_sub(started.elapsed());
+        let (result, took) = exec::run_steps(&steps, &root, budget, &Output::Inherit)?;
+        advanced.push(Advanced {
+            target: target.name,
+            duration_s: took.as_secs_f64(),
+            status: match result {
+                exec::Outcome::Pass => AttemptStatus::Pass,
+                exec::Outcome::Fail { .. } => AttemptStatus::Fail,
+                exec::Outcome::Timeout { .. } => AttemptStatus::Timeout,
+            },
+            files_before,
+            files_after: corpus.files()?,
+            reproducers: corpus.reproducers()?,
+            note: result.note(),
+        });
+    }
+
+    Ok(Routine {
+        revision: revision.label(),
+        seconds_each,
+        advanced,
+        corpus_root: runs.join(CORPUS_ROOT),
+    })
+}
+
 /// The target a `--target` argument names, when a driver exists for it.
 fn runnable(name: &str) -> Result<&'static Target> {
     let Some(target) = TARGETS.iter().find(|target| target.name == name) else {
@@ -346,12 +464,12 @@ impl Corpus {
         })
     }
 
-    /// The corpus invocation.
+    /// The corpus invocation, bounded by the seconds the caller allows it.
     ///
     /// The corpus directory is the one libFuzzer reads and extends. The artifact prefix is
     /// passed last, so it wins over the one the driver tool supplies for itself, which points
     /// inside the repository.
-    fn invocation(&self, target: &str) -> Invocation {
+    fn invocation(&self, target: &str, seconds: u64) -> Invocation {
         Invocation::new(
             "cargo",
             [
@@ -363,7 +481,7 @@ impl Corpus {
                 self.dir.display().to_string(),
                 String::from("--"),
                 format!("-artifact_prefix={}/", self.artifacts.display()),
-                format!("-max_total_time={FUZZ_SEGMENT_SECONDS}"),
+                format!("-max_total_time={seconds}"),
                 String::from("-print_final_stats=1"),
             ],
         )
@@ -428,7 +546,7 @@ impl History {
 
 #[cfg(test)]
 mod tests {
-    use super::{State, TARGETS, list, runnable};
+    use super::{State, TARGETS, list, runnable, runs_root};
 
     /// The parser and decoder entry points that every fuzz target list must carry.
     const REQUIRED: [&str; 11] = [
@@ -444,6 +562,35 @@ mod tests {
         "range-decoder",
         "round-trip",
     ];
+
+    #[test]
+    fn a_routine_advances_every_runnable_codec_target_and_no_other() {
+        let advanced: Vec<&str> = TARGETS
+            .iter()
+            .filter(|target| target.state == State::Runnable && target.codec)
+            .map(|target| target.name)
+            .collect();
+        assert_eq!(advanced, ["frame-parser", "streaming-decoder"]);
+        assert!(!advanced.contains(&"mechanism"), "the runner's own target");
+    }
+
+    #[test]
+    fn every_required_target_reaches_the_codec() {
+        for target in TARGETS.iter().filter(|target| target.codec) {
+            assert!(
+                REQUIRED.contains(&target.name),
+                "{} is a codec target and not a required entry point",
+                target.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_routine_takes_the_run_root_it_is_given_before_the_one_it_can_find() {
+        let named = std::path::PathBuf::from("/somewhere/else");
+        assert_eq!(runs_root(Some(named.clone())), named);
+        assert!(!runs_root(None).as_os_str().is_empty());
+    }
 
     #[test]
     fn every_required_target_is_declared() {
@@ -471,20 +618,26 @@ mod tests {
         }
     }
 
+    /// The drivers that exist at this revision, and nothing else.
+    ///
+    /// A target becomes runnable when its driver is written, so this list grows one entry at
+    /// a time. It is asserted exactly, so a driver cannot be marked runnable without the
+    /// list that names it being updated in the same change.
     #[test]
-    fn one_driver_exists_at_this_revision() {
-        let runnable = TARGETS
+    fn the_runnable_set_is_exactly_the_drivers_that_exist() {
+        let found: Vec<&str> = TARGETS
             .iter()
             .filter(|target| target.state == State::Runnable)
-            .count();
-        assert_eq!(runnable, 1);
+            .map(|target| target.name)
+            .collect();
+        assert_eq!(found, ["frame-parser", "streaming-decoder", "mechanism"]);
     }
 
     #[test]
-    fn the_one_driver_says_it_covers_no_entroq_code() {
+    fn the_mechanism_driver_says_it_covers_no_entroq_code() {
         let found = TARGETS
             .iter()
-            .find(|target| target.state == State::Runnable)
+            .find(|target| target.name == "mechanism")
             .map(|target| target.covers);
         assert_eq!(
             found.map(|covers| covers.contains("No Entroq code")),
@@ -494,10 +647,10 @@ mod tests {
 
     #[test]
     fn a_declared_target_names_what_it_waits_for_rather_than_running_empty() {
-        let refused = runnable("frame-parser");
+        let refused = runnable("index-parser");
         let message = refused.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(message.contains("no driver at this revision"), "{message}");
-        assert!(message.contains("frame header parser"), "{message}");
+        assert!(message.contains("the index parser"), "{message}");
     }
 
     #[test]
@@ -507,11 +660,10 @@ mod tests {
     }
 
     #[test]
-    fn the_driver_that_exists_is_runnable() {
-        assert_eq!(
-            runnable("mechanism").map(|t| t.name).ok(),
-            Some("mechanism")
-        );
+    fn every_driver_that_exists_is_runnable() {
+        for name in ["frame-parser", "streaming-decoder", "mechanism"] {
+            assert_eq!(runnable(name).map(|target| target.name).ok(), Some(name));
+        }
     }
 
     #[test]

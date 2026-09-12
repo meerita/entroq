@@ -20,7 +20,8 @@ Usage:
   entroq-run resume --tier <tier> [--suite <suite>]  --runs <dir>
   entroq-run fuzz list
   entroq-run fuzz build --target <name>
-  entroq-run fuzz run   --target <name> --runs <dir>
+  entroq-run fuzz run     --target <name> --runs <dir>
+  entroq-run fuzz routine [--runs <dir>]
   entroq-run help
 
 Tiers:
@@ -56,9 +57,15 @@ Fuzzing is cumulative, not long. `fuzz run` advances one target by one bounded s
 stops. Its corpus lives at <runs>/fuzz-corpus/<target>/, and a crash reproducer lands at
 <runs>/fuzz-corpus/<target>/artifacts/. Both are outside the repository, and both survive
 the invocation. Never delete a corpus to start clean: it is coverage that many segments
-already paid for. `fuzz build` compiles one driver, so the segment that follows spends its
-budget on fuzzing rather than on a compiler. `fuzz list` states every target and whether a
-driver exists for it.
+already paid for.
+
+`fuzz routine` advances every runnable target that reaches codec code, by one shortened
+invocation each, inside one segment, so a campaign that names fuzzing as a segment fits its
+budget. The runner's own self-test target is not one of them. It writes no record of its own:
+the campaign that ran it is the record, and its corpus is the same one `fuzz run` extends.
+
+`fuzz build` compiles one driver, so the segment that follows spends its budget on fuzzing
+rather than on a compiler. `fuzz list` states every target and whether a driver exists for it.
 
 Every segment of a recorded campaign is given ENTROQ_SEGMENT_DIR, the directory its raw
 output and any artifact it produces belong in. A benchmark segment writes its result document
@@ -92,6 +99,8 @@ pub enum Fuzz {
     Build { target: String },
     /// Advance one target by one bounded segment.
     Advance { target: String, runs: PathBuf },
+    /// Advance every runnable codec target by one shortened invocation, inside one segment.
+    Routine { runs: Option<PathBuf> },
 }
 
 /// A campaign the runner was asked to run.
@@ -129,9 +138,11 @@ pub fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
 }
 
 fn fuzz(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
-    let action = args
-        .next()
-        .ok_or_else(|| Error::Usage(String::from("fuzz needs an action: list, build, or run")))?;
+    let action = args.next().ok_or_else(|| {
+        Error::Usage(String::from(
+            "fuzz needs an action: list, build, run, or routine",
+        ))
+    })?;
     let action = text(&action, "fuzz action")?;
 
     let mut target: Option<String> = None;
@@ -177,8 +188,17 @@ fn fuzz(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
                 ))
             })?,
         })),
+        "routine" => {
+            if target.is_some() {
+                return Err(Error::Usage(String::from(
+                    "fuzz routine advances every runnable codec target, so it takes no \
+                     --target",
+                )));
+            }
+            Ok(Invocation::Fuzz(Fuzz::Routine { runs }))
+        }
         other => Err(Error::Usage(format!(
-            "unknown fuzz action `{other}`. Use list, build, or run."
+            "unknown fuzz action `{other}`. Use list, build, run, or routine."
         ))),
     }
 }

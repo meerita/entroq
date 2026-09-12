@@ -5,7 +5,7 @@
 //! and this module never produces one.
 
 use crate::campaign::Outcome;
-use crate::fuzz::Outcome as FuzzOutcome;
+use crate::fuzz::{Outcome as FuzzOutcome, Routine};
 use crate::record::Entry;
 use crate::workspace::{Environment, InputSet};
 
@@ -90,6 +90,54 @@ pub fn fuzz_console(outcome: &FuzzOutcome) -> String {
         accumulated = seconds(outcome.seconds_total),
         segments = plural(outcome.segments_total, "segment"),
     )
+}
+
+/// The block a fuzz routine prints when it ends.
+///
+/// A routine writes no record of its own, so the block states what each target did rather
+/// than where a record is. The campaign that ran the routine holds the record.
+pub fn routine_console(routine: &Routine) -> String {
+    let mut lines = vec![
+        String::from("Suite: fuzz routine"),
+        format!("Revision: {}", routine.revision),
+        format!("Seconds per target: {}", routine.seconds_each),
+        format!("Corpus root: {}", routine.corpus_root.display()),
+        format!(
+            "Targets: {}/{} clean",
+            routine
+                .advanced
+                .iter()
+                .filter(|one| one.status.is_satisfied() && one.reproducers.is_empty())
+                .count(),
+            routine.advanced.len()
+        ),
+    ];
+    for one in &routine.advanced {
+        lines.push(format!(
+            "  {target}: {status}, {duration}, corpus {after}, {added} added, \
+             reproducers {artifacts}{note}",
+            target = one.target,
+            status = one.status.as_str(),
+            duration = seconds(one.duration_s),
+            after = plural(one.files_after, "file"),
+            added = one.files_after.saturating_sub(one.files_before),
+            artifacts = reproducers(&one.reproducers),
+            note = one
+                .note
+                .as_deref()
+                .map_or_else(String::new, |note| format!(", {note}")),
+        ));
+    }
+    lines.push(format!(
+        "Status: {}",
+        if routine.is_clean() {
+            "clean"
+        } else {
+            "not clean"
+        }
+    ));
+    lines.push(String::new());
+    lines.join("\n")
 }
 
 /// The summary a fuzz segment writes when it seals.

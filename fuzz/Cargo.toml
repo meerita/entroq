@@ -23,12 +23,27 @@ cargo-fuzz = true
 members = ["."]
 
 [dependencies]
+codec         = { path = "../codec" }
 libfuzzer-sys = "0.4"
 
 # A crash reproducer is only useful with a symbolized stack, so a driver keeps
 # line tables.
 [profile.release]
 debug = 1
+
+[[bin]]
+name  = "frame-parser"
+path  = "fuzz_targets/frame-parser.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "streaming-decoder"
+path  = "fuzz_targets/streaming-decoder.rs"
+test  = false
+doc   = false
+bench = false
 
 [[bin]]
 name  = "mechanism"
