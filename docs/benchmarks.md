@@ -16,9 +16,10 @@ This page states the measurement laboratory as it exists now.
 No Entroq number appears on this page, and none exists anywhere. The codec crate exports no
 API and holds no encoder and no decoder, so every Entroq cell below is N/A with the reason.
 
-No competitor number appears either. A number leaves this repository only from a sealed
-publication-tier record, and no publication campaign has run. The tier table below states
-what each tier does license.
+The competitor numbers below come from a sealed gate-tier record. The gate tier is not the
+publication tier. Read every number with the scope stated beside it, and read the timing
+stability section before reading any throughput as a property of a codec rather than of this
+machine.
 
 ## The measurement pipeline
 
@@ -143,6 +144,235 @@ denies the counter. A cycle count is never derived from elapsed time and a nomin
 a host that scales frequency, or that mixes core types, makes that product a number with no
 meaning.
 
+## Measured numbers
+
+Source: `2026-09-12-12-bench-baseline`, a gate-tier record sealed at one revision, 44 of 44
+segments. The record holds 550 measured rows over 22 corpus entries. The six tables below are
+the entries that show the most about codec behavior; the record holds the rest.
+
+Every row of every table shares this scope:
+
+```text
+machine       Apple M1 Pro, 10 cores, 16 GiB, macOS Darwin 25.5.0, aarch64
+build         release profile, rustc 1.98.1
+competitors   LZ4 v1.10.0, Zstandard v1.5.7, Brotli v1.2.0, Snappy 1.2.2, zlib v1.3.2,
+              each built from the commit named above
+threads       1
+integrity     none, for all five
+measurement   the library call alone, in-process, median of the samples the tier bought
+tier          gate. Not a published number, and not a claim about any codec
+```
+
+`Ratio` is input bytes per compressed byte, so higher compresses more. `spread` is the
+slowest sample minus the fastest, over the median, inside one segment. It is a within-run
+figure and it does not bound the movement between runs. A spread above about 0.15 means the
+throughput beside it did not repeat closely even within its own segment.
+
+### project-source-small
+
+Source text at the small class. Small class, 32768 bytes.
+
+| Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
+|---|---|---:|---:|---:|---:|---:|---:|
+| LZ4 | `fast-1` | 5.587 | 5865 | 1995.5 | 0.111 | 7208.1 | 0.178 |
+| LZ4 | `fast-3` | 5.599 | 5852 | 2013.4 | 0.074 | 7391.8 | 0.066 |
+| LZ4 | `fast-5` | 5.496 | 5962 | 2013.8 | 0.056 | 7459.1 | 0.051 |
+| LZ4 | `fast-9` | 5.351 | 6124 | 2024.0 | 0.033 | 7519.0 | 0.221 |
+| LZ4 | `hc-1` | 8.478 | 3865 | 2153.4 | 0.104 | 11774.3 | 0.117 |
+| LZ4 | `hc-4` | 14.397 | 2276 | 545.3 | 0.337 | 20739.2 | 0.143 |
+| LZ4 | `hc-9` | 14.888 | 2201 | 392.7 | 0.318 | 21816.2 | 0.085 |
+| LZ4 | `hc-12` | 15.170 | 2160 | 49.1 | 0.184 | 22505.5 | 0.128 |
+| Snappy | `default` | 6.861 | 4776 | 1802.5 | 0.122 | 6661.5 | 0.020 |
+| zlib | `level-1` | 10.304 | 3180 | 670.1 | 0.146 | 1814.9 | 0.121 |
+| zlib | `level-6` | 19.692 | 1664 | 265.3 | 0.123 | 2545.1 | 0.057 |
+| zlib | `level-9` | 19.859 | 1650 | 177.1 | 0.243 | 2561.8 | 0.054 |
+| Zstandard | `level-1` | 11.130 | 2944 | 1081.1 | 0.011 | 2909.1 | 0.037 |
+| Zstandard | `level-3` | 14.309 | 2290 | 1516.5 | 0.035 | 3954.6 | 0.027 |
+| Zstandard | `level-6` | 16.744 | 1957 | 343.4 | 0.125 | 4643.3 | 0.017 |
+| Zstandard | `level-9` | 19.230 | 1704 | 216.3 | 0.092 | 5309.1 | 0.031 |
+| Zstandard | `level-12` | 19.692 | 1664 | 66.0 | 0.227 | 5166.0 | 0.151 |
+| Zstandard | `level-15` | 20.818 | 1574 | 10.3 | 0.147 | 5488.8 | 0.019 |
+| Zstandard | `level-19` | 21.347 | 1535 | 1.9 | 0.009 | 5548.3 | 0.057 |
+| Zstandard | `level-22` | 21.347 | 1535 | 1.9 | 0.044 | 5537.0 | 0.029 |
+| Brotli | `q0` | 8.219 | 3987 | 842.6 | 0.056 | 1021.9 | 0.067 |
+| Brotli | `q2` | 11.405 | 2873 | 330.9 | 0.106 | 1248.0 | 0.242 |
+| Brotli | `q5` | 19.219 | 1705 | 167.3 | 0.158 | 2219.0 | 0.209 |
+| Brotli | `q9` | 21.154 | 1549 | 41.6 | 0.208 | 2290.2 | 0.111 |
+| Brotli | `q11` | 22.291 | 1470 | 0.8 | 0.011 | 1894.0 | 0.177 |
+
+### project-json-medium
+
+JSON records, generated from a recorded seed. Medium class, 262144 bytes.
+
+| Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
+|---|---|---:|---:|---:|---:|---:|---:|
+| LZ4 | `fast-1` | 3.641 | 71999 | 906.4 | 0.098 | 4824.8 | 0.071 |
+| LZ4 | `fast-3` | 3.455 | 75871 | 945.8 | 0.227 | 4744.7 | 0.060 |
+| LZ4 | `fast-5` | 3.396 | 77203 | 975.1 | 0.095 | 4734.0 | 0.040 |
+| LZ4 | `fast-9` | 3.292 | 79641 | 914.2 | 0.155 | 4595.7 | 0.115 |
+| LZ4 | `hc-1` | 3.886 | 67466 | 557.6 | 0.058 | 4446.3 | 0.255 |
+| LZ4 | `hc-4` | 4.880 | 53723 | 160.5 | 0.154 | 5688.5 | 0.095 |
+| LZ4 | `hc-9` | 5.330 | 49180 | 49.1 | 0.080 | 6951.8 | 0.057 |
+| LZ4 | `hc-12` | 5.412 | 48438 | 18.2 | 0.045 | 6580.9 | 0.135 |
+| Snappy | `default` | 3.397 | 77166 | 1231.9 | 0.154 | 3922.3 | 0.004 |
+| zlib | `level-1` | 4.801 | 54601 | 311.1 | 0.053 | 784.3 | 0.057 |
+| zlib | `level-6` | 6.515 | 40236 | 95.6 | 0.030 | 922.5 | 0.057 |
+| zlib | `level-9` | 6.831 | 38376 | 33.7 | 0.022 | 914.7 | 0.085 |
+| Zstandard | `level-1` | 5.595 | 46852 | 680.5 | 0.058 | 2013.9 | 0.085 |
+| Zstandard | `level-3` | 5.478 | 47853 | 557.6 | 0.035 | 2054.7 | 0.038 |
+| Zstandard | `level-6` | 6.423 | 40816 | 159.6 | 0.042 | 2425.4 | 0.124 |
+| Zstandard | `level-9` | 7.068 | 37089 | 77.0 | 0.025 | 2871.5 | 0.100 |
+| Zstandard | `level-12` | 7.531 | 34809 | 26.2 | 0.360 | 3039.4 | 0.078 |
+| Zstandard | `level-15` | 7.932 | 33049 | 7.6 | 0.081 | 2953.7 | 0.277 |
+| Zstandard | `level-19` | 7.995 | 32787 | 3.3 | 0.119 | 3091.6 | 0.097 |
+| Zstandard | `level-22` | 7.995 | 32787 | 2.3 | 0.090 | 3020.4 | 0.101 |
+| Brotli | `q0` | 4.313 | 60785 | 748.2 | 0.111 | 648.7 | 0.101 |
+| Brotli | `q2` | 5.575 | 47018 | 247.5 | 0.382 | 687.5 | 0.040 |
+| Brotli | `q5` | 6.706 | 39092 | 90.6 | 0.075 | 858.5 | 0.088 |
+| Brotli | `q9` | 7.229 | 36263 | 32.2 | 0.119 | 905.2 | 0.111 |
+| Brotli | `q11` | 8.416 | 31147 | 0.9 | 0.023 | 797.6 | 0.055 |
+
+### project-source-medium
+
+Rust and C source text, generated from a recorded seed. Medium class, 1048576 bytes.
+
+| Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
+|---|---|---:|---:|---:|---:|---:|---:|
+| LZ4 | `fast-1` | 6.026 | 174021 | 1878.2 | 0.025 | 6114.1 | 0.128 |
+| LZ4 | `fast-3` | 6.015 | 174315 | 1858.8 | 0.141 | 6151.5 | 0.262 |
+| LZ4 | `fast-5` | 6.005 | 174622 | 1832.6 | 0.179 | 6187.8 | 0.121 |
+| LZ4 | `fast-9` | 6.000 | 174773 | 1825.5 | 0.074 | 6053.9 | 0.029 |
+| LZ4 | `hc-1` | 9.422 | 111293 | 2303.5 | 0.158 | 8165.4 | 0.128 |
+| LZ4 | `hc-4` | 20.108 | 52146 | 428.0 | 0.032 | 12729.3 | 0.156 |
+| LZ4 | `hc-9` | 24.835 | 42221 | 145.3 | 0.037 | 17073.1 | 0.064 |
+| LZ4 | `hc-12` | 26.209 | 40008 | 39.8 | 0.084 | 15477.1 | 0.092 |
+| Snappy | `default` | 7.196 | 145711 | 2474.0 | 0.084 | 6519.7 | 0.018 |
+| zlib | `level-1` | 11.528 | 90957 | 582.7 | 1.410 | 1373.2 | 1.958 |
+| zlib | `level-6` | 29.997 | 34956 | 242.6 | 0.048 | 2486.3 | 0.049 |
+| zlib | `level-9` | 31.104 | 33712 | 132.1 | 0.007 | 2587.2 | 0.044 |
+| Zstandard | `level-1` | 14.677 | 71445 | 1564.6 | 0.042 | 3680.3 | 0.061 |
+| Zstandard | `level-3` | 17.101 | 61318 | 1727.0 | 0.038 | 4568.1 | 0.097 |
+| Zstandard | `level-6` | 23.171 | 45253 | 326.2 | 0.018 | 6418.2 | 0.066 |
+| Zstandard | `level-9` | 28.063 | 37365 | 248.4 | 0.016 | 8371.9 | 0.063 |
+| Zstandard | `level-12` | 33.152 | 31629 | 142.0 | 0.026 | 9390.2 | 0.045 |
+| Zstandard | `level-15` | 39.779 | 26360 | 51.2 | 0.034 | 12366.6 | 0.063 |
+| Zstandard | `level-19` | 42.782 | 24510 | 2.2 | 0.022 | 12324.0 | 0.097 |
+| Zstandard | `level-22` | 43.070 | 24346 | 2.1 | 0.042 | 12294.1 | 0.092 |
+| Brotli | `q0` | 8.897 | 117852 | 1533.8 | 0.046 | 1087.3 | 0.064 |
+| Brotli | `q2` | 13.068 | 80242 | 503.9 | 0.079 | 1284.8 | 0.049 |
+| Brotli | `q5` | 26.484 | 39593 | 262.0 | 0.126 | 2750.4 | 0.082 |
+| Brotli | `q9` | 36.194 | 28971 | 122.5 | 0.036 | 3921.7 | 0.133 |
+| Brotli | `q11` | 40.558 | 25854 | 0.6 | 0.003 | 4243.8 | 0.123 |
+
+### project-high-entropy-medium
+
+Incompressible bytes, generated from a recorded seed. Medium class, 1048576 bytes.
+
+| Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
+|---|---|---:|---:|---:|---:|---:|---:|
+| LZ4 | `fast-1` | 0.996 | 1052690 | 30247.1 | 0.228 | 59352.2 | 0.106 |
+| LZ4 | `fast-3` | 0.996 | 1052690 | 29194.4 | 0.116 | 59214.8 | 0.120 |
+| LZ4 | `fast-5` | 0.996 | 1052690 | 30652.1 | 0.210 | 55066.5 | 0.123 |
+| LZ4 | `fast-9` | 0.996 | 1052690 | 29060.1 | 0.156 | 55310.5 | 0.149 |
+| LZ4 | `hc-1` | 0.996 | 1052690 | 35696.2 | 0.098 | 58524.1 | 0.109 |
+| LZ4 | `hc-4` | 0.996 | 1052681 | 61.2 | 0.013 | 43165.5 | 0.034 |
+| LZ4 | `hc-9` | 0.996 | 1052681 | 60.8 | 0.328 | 43018.5 | 0.067 |
+| LZ4 | `hc-12` | 0.996 | 1052681 | 50.7 | 0.013 | 42799.0 | 0.148 |
+| Snappy | `default` | 1.000 | 1048627 | 28598.0 | 0.060 | 60349.7 | 0.089 |
+| zlib | `level-1` | 1.000 | 1048896 | 65.7 | 0.015 | 62445.0 | 0.360 |
+| zlib | `level-6` | 1.000 | 1048896 | 62.6 | 0.005 | 63072.2 | 0.143 |
+| zlib | `level-9` | 1.000 | 1048896 | 62.5 | 0.019 | 63871.4 | 0.152 |
+| Zstandard | `level-1` | 1.000 | 1048610 | 10503.2 | 0.248 | 60787.0 | 0.188 |
+| Zstandard | `level-3` | 1.000 | 1048609 | 8683.9 | 0.024 | 61381.3 | 0.044 |
+| Zstandard | `level-6` | 1.000 | 1048609 | 4851.7 | 0.148 | 61680.9 | 0.071 |
+| Zstandard | `level-9` | 1.000 | 1048609 | 4181.1 | 0.438 | 60495.9 | 0.118 |
+| Zstandard | `level-12` | 1.000 | 1048609 | 4090.0 | 0.199 | 61080.9 | 0.167 |
+| Zstandard | `level-15` | 1.000 | 1048609 | 552.4 | 0.203 | 65197.8 | 0.140 |
+| Zstandard | `level-19` | 1.000 | 1048609 | 33.4 | 0.062 | 64859.0 | 0.098 |
+| Zstandard | `level-22` | 1.000 | 1048609 | 33.0 | 0.092 | 70687.3 | 0.185 |
+| Brotli | `q0` | 1.000 | 1048581 | 4767.2 | 0.163 | 8671.9 | 0.181 |
+| Brotli | `q2` | 1.000 | 1048581 | 1538.2 | 0.079 | 8820.8 | 0.233 |
+| Brotli | `q5` | 1.000 | 1048581 | 648.2 | 0.173 | 8639.1 | 0.218 |
+| Brotli | `q9` | 1.000 | 1048581 | 176.7 | 0.168 | 8723.0 | 0.406 |
+| Brotli | `q11` | 1.000 | 1048581 | 4.0 | 0.135 | 10814.6 | 0.474 |
+
+### gutenberg-shakespeare
+
+English literary text, the complete works of Shakespeare. Large class, 5638480 bytes.
+
+| Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
+|---|---|---:|---:|---:|---:|---:|---:|
+| LZ4 | `fast-1` | 1.598 | 3527975 | 465.3 | 0.059 | 3941.0 | 0.034 |
+| LZ4 | `fast-3` | 1.455 | 3874515 | 562.8 | 0.010 | 3949.7 | 0.032 |
+| LZ4 | `fast-5` | 1.345 | 4191284 | 669.6 | 0.015 | 3847.9 | 0.050 |
+| LZ4 | `fast-9` | 1.236 | 4562723 | 843.6 | 0.040 | 3961.0 | 0.069 |
+| LZ4 | `hc-1` | 1.909 | 2953359 | 267.2 | 0.044 | 2952.1 | 0.024 |
+| LZ4 | `hc-4` | 2.207 | 2555370 | 70.6 | 0.009 | 3385.8 | 0.027 |
+| LZ4 | `hc-9` | 2.283 | 2469328 | 28.6 | 0.075 | 3478.6 | 0.069 |
+| LZ4 | `hc-12` | 2.313 | 2438082 | 15.6 | 0.037 | 3411.7 | 0.028 |
+| Snappy | `default` | 1.643 | 3430938 | 504.6 | 0.037 | 1859.0 | 0.047 |
+| zlib | `level-1` | 2.232 | 2526146 | 123.9 | 0.019 | 364.5 | 0.014 |
+| zlib | `level-6` | 2.637 | 2138320 | 24.3 | 0.014 | 382.5 | 0.017 |
+| zlib | `level-9` | 2.650 | 2127930 | 18.7 | 0.024 | 382.3 | 0.017 |
+| Zstandard | `level-1` | 2.337 | 2412580 | 439.3 | 0.010 | 1486.9 | 0.035 |
+| Zstandard | `level-3` | 2.679 | 2104953 | 226.3 | 0.014 | 1263.9 | 0.025 |
+| Zstandard | `level-6` | 2.873 | 1962341 | 85.3 | 0.009 | 1283.1 | 0.032 |
+| Zstandard | `level-9` | 2.965 | 1901851 | 53.0 | 0.051 | 1419.5 | 0.049 |
+| Zstandard | `level-12` | 3.046 | 1850924 | 24.5 | 0.090 | 1511.7 | 0.051 |
+| Zstandard | `level-15` | 3.130 | 1801201 | 3.4 | 0.126 | 1402.8 | 0.205 |
+| Zstandard | `level-19` | 3.334 | 1691406 | 2.7 | 0.107 | 1379.3 | 0.274 |
+| Zstandard | `level-22` | 3.334 | 1691408 | 2.6 | 0.110 | 1385.0 | 0.107 |
+| Brotli | `q0` | 2.274 | 2479566 | 300.0 | 0.021 | 289.7 | 0.034 |
+| Brotli | `q2` | 2.565 | 2198605 | 124.9 | 0.113 | 340.2 | 0.038 |
+| Brotli | `q5` | 2.913 | 1935540 | 42.2 | 0.178 | 410.1 | 0.106 |
+| Brotli | `q9` | 3.108 | 1814427 | 14.4 | 0.072 | 469.1 | 0.071 |
+| Brotli | `q11` | 3.367 | 1674501 | 0.7 | 0.000 | 471.4 | 0.079 |
+
+### project-logs-large
+
+Line-oriented application logs, generated from a recorded seed. Large class, 8388608 bytes.
+
+| Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
+|---|---|---:|---:|---:|---:|---:|---:|
+| LZ4 | `fast-1` | 2.874 | 2918436 | 829.7 | 0.067 | 4940.5 | 0.102 |
+| LZ4 | `fast-3` | 2.667 | 3144767 | 920.4 | 0.056 | 4909.4 | 0.136 |
+| LZ4 | `fast-5` | 2.716 | 3089031 | 942.7 | 0.049 | 4882.7 | 0.154 |
+| LZ4 | `fast-9` | 2.509 | 3343188 | 986.4 | 0.063 | 4825.9 | 0.176 |
+| LZ4 | `hc-1` | 3.130 | 2680172 | 360.7 | 0.033 | 4294.1 | 0.076 |
+| LZ4 | `hc-4` | 3.649 | 2298760 | 126.6 | 0.059 | 4394.5 | 0.109 |
+| LZ4 | `hc-9` | 3.855 | 2176141 | 46.6 | 0.014 | 5030.8 | 0.038 |
+| LZ4 | `hc-12` | 3.916 | 2142253 | 18.7 | 0.030 | 4332.5 | 0.030 |
+| Snappy | `default` | 2.693 | 3114991 | 1028.3 | 0.038 | 3419.4 | 0.026 |
+| zlib | `level-1` | 3.699 | 2267654 | 240.6 | 0.020 | 615.3 | 0.010 |
+| zlib | `level-6` | 4.793 | 1750314 | 72.6 | 0.004 | 671.7 | 0.014 |
+| zlib | `level-9` | 5.018 | 1671738 | 32.9 | 0.013 | 683.7 | 0.011 |
+| Zstandard | `level-1` | 4.478 | 1873220 | 644.7 | 0.469 | 1881.2 | 0.059 |
+| Zstandard | `level-3` | 4.428 | 1894602 | 426.3 | 0.050 | 1986.5 | 0.044 |
+| Zstandard | `level-6` | 5.020 | 1670950 | 127.2 | 0.145 | 2303.7 | 0.200 |
+| Zstandard | `level-9` | 5.348 | 1568556 | 70.4 | 0.165 | 2373.8 | 0.217 |
+| Zstandard | `level-12` | 5.527 | 1517666 | 34.2 | 0.182 | 2302.8 | 0.353 |
+| Zstandard | `level-15` | 5.713 | 1468351 | 8.6 | 0.131 | 2883.1 | 0.200 |
+| Zstandard | `level-19` | 6.164 | 1360813 | 2.6 | 0.045 | 2957.7 | 0.223 |
+| Zstandard | `level-22` | 6.164 | 1360813 | 2.8 | 0.036 | 2969.6 | 0.333 |
+| Brotli | `q0` | 3.664 | 2289283 | 581.6 | 0.066 | 511.5 | 0.019 |
+| Brotli | `q2` | 4.297 | 1952286 | 210.0 | 0.067 | 594.6 | 0.049 |
+| Brotli | `q5` | 5.236 | 1602023 | 69.0 | 0.070 | 683.1 | 0.046 |
+| Brotli | `q9` | 5.556 | 1509696 | 24.1 | 0.062 | 736.5 | 0.086 |
+| Brotli | `q11` | 6.337 | 1323781 | 0.8 | 0.000 | 674.8 | 0.020 |
+
+### Reading these tables
+
+The ratios are stable and reproduce exactly. A rebuild of the laboratory from the pinned
+commits, on a restored corpus, produced the same compressed length and the same ratio for all
+550 rows.
+
+The throughputs are not stable in the same way. They reproduce at the cheap operating points
+and move by up to about a fifth at the expensive ones, in one direction, between runs on this
+machine. Treat a throughput here as the order of magnitude and the shape of the curve, not as
+a value to compare against another published figure.
+
+Nothing here compares Entroq to anything. Entroq has no codec path, so it appears in no table.
+
 ## Fairness
 
 A comparison measures equivalent work, or it is not a comparison. Every result states each
@@ -167,7 +397,7 @@ five was measured with a checksum enabled, so none is credited or charged for on
 |---|---|---|---|---|
 | `smoke` | 1 MiB | 30 s | no | nothing. It proves the harness runs and produces a parseable result. Its numbers are ignored |
 | `dev` | 10 MiB per codec path | 120 s, one segment | yes | direction on one machine, from few samples, at the default operating point of each project. It describes no frontier, and no dev number appears in documentation, in a release note, or in a comparison claim |
-| `gate` | 100 MiB per codec path | segmented | yes | a milestone gate. It measures every pinned operating point across the size classes its budget reaches, with repeated samples and a reported spread. It is not a published number |
+| `gate` | 100 MiB per codec path | segmented | yes | a milestone gate. It measures every pinned operating point across the size classes its budget reaches, with repeated samples and a reported spread. The numbers on this page come from this tier. They are scoped to the machine that produced them, and they are not a comparison claim |
 | `publication` | full corpora | segmented, authorized | yes | the only tier a number may leave the repository from, and only from a sealed record |
 
 No validation step runs longer than 120 seconds. A campaign that needs more time is split
@@ -233,8 +463,9 @@ The spread a result reports is taken from samples seconds apart inside one segme
 machine state. It does not bound the movement between runs on different days, and the gap
 between the two grows with the cost of the operating point.
 
-A number that survives this is a number measured on a controlled machine, at the publication
-tier, with the variance reported. Nothing else is publishable.
+This is why the numbers on this page carry their spread and their machine, and why none of
+them is stated as a comparison claim. A claim that one codec is faster than another needs a
+controlled machine and a publication-tier record. Neither exists yet.
 
 ## What this laboratory does not answer
 
@@ -263,9 +494,12 @@ Known:
 - Every campaign so far is dev tier or gate tier.
 - A publication campaign needs a controlled machine and an authorization, and
   has had neither.
+- The numbers on this page are gate tier, published with their scope and their
+  spread, and stated as measurements of this machine rather than as claims.
 
 Blocks:
-- Every number. None may leave this repository until one seals.
+- Any comparison claim, and any number quoted without the machine that
+  produced it.
 ```
 
 ```text
