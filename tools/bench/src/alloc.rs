@@ -209,6 +209,12 @@ mod tests {
     //! so an interval here also sees what other tests allocate. Every assertion is therefore
     //! a lower bound or a direction, which holds whatever else the process is doing. The
     //! measurement these counters serve runs one operation at a time in one process.
+    //!
+    //! `peak_bytes` is not asserted here. Opening an interval stores the current outstanding
+    //! total into one process-wide high-water mark, so a concurrent open lowers the mark this
+    //! interval reads, and no lower bound on it holds. The allocation count and the bytes
+    //! served are differences between monotonic counters, which another thread can only
+    //! raise.
 
     use super::{Usage, close, open, release, reserve, reserve_bytes, reserve_items};
     use std::ffi::c_void;
@@ -234,8 +240,8 @@ mod tests {
         let usage = measure(|| {
             drop(vec![0_u8; 8192]);
         });
-        assert!(usage.allocations >= 1);
-        assert!(usage.peak_bytes >= 8192, "{}", usage.peak_bytes);
+        assert!(usage.allocations >= 1, "{}", usage.allocations);
+        assert!(usage.bytes >= 8192, "{}", usage.bytes);
     }
 
     #[test]
@@ -243,9 +249,7 @@ mod tests {
         let small = measure(|| vec![0_u8; 4096]);
         let large = measure(|| vec![0_u8; 4 * 1024 * 1024]);
         assert!(large.bytes > small.bytes, "{} {}", large.bytes, small.bytes);
-        // The high-water mark is relative to what was outstanding when the interval opened,
-        // and another thread releasing a block just after that lowers it slightly.
-        assert!(large.peak_bytes >= 3 * 1024 * 1024, "{}", large.peak_bytes);
+        assert!(large.bytes >= 4 * 1024 * 1024, "{}", large.bytes);
     }
 
     #[test]
