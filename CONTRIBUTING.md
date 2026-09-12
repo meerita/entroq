@@ -66,6 +66,19 @@ make lab-resume   # continue the current lab campaign where it stopped
 `make lab` needs a network, `git`, `cmake`, and a C and C++ compiler. No other target
 needs any of them, so you can run every gate without them.
 
+The benchmark harness links the laboratory at build time, and it links every pinned
+competitor or none. A host that has not built the laboratory compiles the harness, builds
+the laboratory with it, and links it on the next build. Until then the harness measures
+nothing and says so; it never reports a partial set of competitors as the set.
+
+```sh
+make lab          # the harness builds the laboratory
+make bench        # the next build links it, and the campaign measures
+```
+
+Every other target works on a host with no laboratory, including the format check, the
+lint, the build, the test suite, and the integration lane.
+
 Each competitor is pinned to the commit behind its release tag and built as a static
 library with the release configuration its own project recommends. A competitor built with
 weaker optimization than Entroq is not a baseline.
