@@ -71,10 +71,15 @@ read them. `CONTRIBUTING.md` states how to produce both.
 
 ## Documentation
 
-`docs/` will hold the documentation. It does not exist yet.
+`docs/` holds the user guide, the technical documentation, and the benchmark documentation.
+`docs/README.md` lists every page, and names the pages that do not exist yet because the
+behavior they would state does not exist.
+
+`docs/benchmarks.md` states what Entroq measures, against what, how, and what a number from
+each tier licenses.
 
 `docs/format.md` will state the format contract. A third party must be able to write a
-conforming decoder from that page alone.
+conforming decoder from that page alone. It waits for a designed format.
 
 ## Contributing
 
