@@ -9,11 +9,30 @@ Deflate, and it is not bitstream compatible with any of them.
 
 Early development.
 
-This repository holds the build entry point, the pinned toolchain, and the repository
-configuration. It holds no codec, no public API, no command line tool, and no format
-specification.
+The codec crate exports no API. Every module in it is private, and none holds an encoder or
+a decoder. There is no format specification and no Entroq command line tool.
 
 There is nothing to compress with yet.
+
+What the repository holds is the measurement foundation the codec will be built against:
+
+* A validation runner. Four tiers, a hard 120 second budget per segment, an append-only
+  record per run, resume, and sealing.
+* A competitor laboratory builder. It builds LZ4, Zstandard, Brotli, Snappy, and zlib from
+  pinned upstream commits, and records how each build was produced.
+* A corpus registry. It generates the project corpus from recorded seeds and fetches every
+  registered public corpus against a pinned checksum. No corpus byte is committed.
+* A benchmark harness. It measures a competitor in-process, through the library the
+  laboratory built, and writes one machine-readable result per segment.
+* A result parser, a Pareto report, and a comparison that states whether one recorded
+  campaign reproduced another.
+* Fuzz infrastructure. Eleven targets are declared against the parsers and decoders Entroq
+  will have, and no driver exists for any of them, because the code they cover does not. A
+  twelfth target exercises the fuzz runner itself and covers no Entroq code.
+* An integration lane that runs the gates on a clean Linux host, in a container.
+
+Every number these produce is a competitor number. No Entroq number exists, and every
+result says so rather than carrying a zero.
 
 The next section states goals. Read no sentence in it as current behavior.
 
@@ -37,23 +56,30 @@ Entroq will expose a small number of intentional modes, not dozens of numeric le
 `rust-toolchain.toml` pins the toolchain. `rustup` reads that file and installs the
 pinned channel on the first build.
 
-Every action enters through the `Makefile`.
+Every action enters through the `Makefile`. `make help` lists every target.
 
 ```sh
-make help       # list every target
 make build      # compile the workspace
 make check      # type check the workspace
 make validate   # format check, lint, and the dev validation tier
+make ci         # run the gates on a clean Linux host, in a container
 ```
 
-`make build` compiles nothing until the workspace exists.
+Building and validating needs the pinned toolchain and nothing else. The laboratory and the
+corpus are build inputs that live outside the repository, and only the benchmark targets
+read them. `CONTRIBUTING.md` states how to produce both.
 
 ## Documentation
 
-`docs/` will hold the documentation. It does not exist yet.
+`docs/` holds the user guide, the technical documentation, and the benchmark documentation.
+`docs/README.md` lists every page, and names the pages that do not exist yet because the
+behavior they would state does not exist.
+
+`docs/benchmarks.md` states what Entroq measures, against what, how, and what a number from
+each tier licenses.
 
 `docs/format.md` will state the format contract. A third party must be able to write a
-conforming decoder from that page alone.
+conforming decoder from that page alone. It waits for a designed format.
 
 ## Contributing
 

@@ -1,13 +1,21 @@
 # Entroq repository entry point.
 #
-# `09-build-and-tooling.md` owns the entry point policy. Each target delegates
-# to the tool that owns the implementation. Do not duplicate delegated logic
-# here.
+# Each target delegates to the tool that owns the implementation. Do not
+# duplicate delegated logic here.
 #
-# The workspace and the validation runner do not exist until M0 creates them.
-# Until then these targets report that there is nothing to build or to run.
+# `fuzz` advances one fuzz target by one bounded segment. It needs cargo-fuzz,
+# which `cargo install cargo-fuzz` provides. No other target needs it.
 #
-# `41-validation-runs.md` owns the tiers. No segment may exceed 120 seconds.
+# `lab` builds the competitor laboratory. It needs a network, a C and C++
+# compiler, cmake, and git. No other target needs any of them, so a host
+# without them still runs every gate.
+#
+# `corpus` materializes the corpus. It generates the project corpus from
+# recorded seeds, which needs nothing, and fetches the registered public
+# corpora, which needs a network, curl, unzip, and gzip. No corpus byte is
+# committed: the registry and the method of obtaining it are.
+#
+# No validation segment may exceed 120 seconds.
 #
 # Build inputs:
 #
@@ -18,10 +26,43 @@
 #                     pins to the declared channel.
 #
 #   LAB     The competitor codec workspace. Holds the pinned, built
-#           compression systems that Entroq is compared against.
-#           Scope:    bench, and any comparison target.
+#           compression systems that Entroq is compared against. `lab`
+#           produces it. The benchmark harness links the libraries it names,
+#           so it is a build input of the workspace and not only of a
+#           comparison. It is exported for every target, because two targets
+#           that disagree about it would rebuild the harness in turn.
+#           A workspace whose LAB holds no complete set of competitors builds
+#           a harness that links none and says so when asked to measure.
+#           Scope:    every target that builds or measures.
 #           Required: yes, for a comparison.
 #           Default:  ../lab
+#
+#   CORPUS  The corpus cache. Holds the generated project corpus and the
+#           fetched public corpora that a measurement reads. `corpus`
+#           produces it. It is outside the repository on purpose: the
+#           registry is code, and the bytes it describes are not.
+#           Scope:    corpus, corpus-resume, bench.
+#           Required: no.
+#           Default:  ../corpus
+#
+#   RESULTS The recorded results a report reads. A path to one result
+#           document, or to a directory searched for every `result.json`
+#           under it, which a run record directory is. Name one campaign: a
+#           frontier cannot hold one operating point twice, so results from
+#           two campaigns of the same tier are read separately.
+#           Scope:    report, compare. For compare it names the second
+#                     campaign, the one being checked.
+#           Required: yes, for report and for compare.
+#           Default:  none.
+#
+#   BASELINE
+#           The recorded results a comparison reads a second campaign
+#           against, in the same form as RESULTS. It is the first campaign,
+#           the one whose numbers and whose stated variance the comparison
+#           judges against.
+#           Scope:    compare.
+#           Required: yes, for compare.
+#           Default:  none.
 #
 #   RUNS    The run record root. Recorded tiers write their manifest,
 #           journal, and raw segment output here. It is outside the
@@ -31,23 +72,37 @@
 #           Default:  ../runs
 #
 #   TIER    The validation tier a recorded target runs at.
-#           Scope:    bench.
+#           Scope:    bench, bench-resume.
 #           Required: no.
 #           Default:  dev
 #
-#   TARGET  The fuzz target to advance by one segment.
-#           Scope:    fuzz.
-#           Required: yes, for fuzz.
+#   TARGET  The fuzz target to advance by one segment. `fuzz-list` states
+#           every target and whether a driver exists for it.
+#           Scope:    fuzz, fuzz-driver.
+#           Required: yes, for fuzz and for fuzz-driver.
+#
+#   PLATFORM
+#           The platform an integration lane runs on: linux/amd64 or
+#           linux/arm64.
+#           Scope:    ci, ci-validate.
+#           Required: no.
+#           Default:  the platform of the host. A platform the host must
+#                     emulate still runs, and the lane reports it as
+#                     emulated. An emulated platform is not an architecture
+#                     result.
 
 CARGO ?= cargo
 LAB ?= ../lab
+export LAB
+CORPUS ?= ../corpus
 RUNS ?= ../runs
 TIER ?= dev
+PLATFORM ?=
 
 # Repository tooling, versioned with the code whose gates it runs.
-RUNNER = tools/run
+RUNNER = $(CARGO) run --quiet --release --package entroq-run --
 
-.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume fuzz bench validate clean
+.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume lab lab-resume corpus corpus-resume fuzz-list fuzz-driver fuzz bench-harness bench bench-resume report compare validate ci ci-validate clean
 
 help:
 	@echo "build      compile the workspace"
@@ -59,9 +114,19 @@ help:
 	@echo "test       dev tier: 120 s, 10 MiB inputs, recorded"
 	@echo "gate       gate tier: 100 MiB inputs, segmented and resumable"
 	@echo "gate-resume  continue the current gate campaign where it stopped"
+	@echo "lab        build the pinned competitors into LAB, one segment per codec"
+	@echo "lab-resume   continue the current lab campaign where it stopped"
+	@echo "corpus     materialize the corpus into CORPUS, one segment per group"
+	@echo "corpus-resume  continue the current corpus campaign where it stopped"
+	@echo "fuzz-list  list every fuzz target and whether a driver exists for it"
 	@echo "fuzz       advance one fuzz target by one bounded segment (TARGET=<name>)"
-	@echo "bench      benchmark campaign at TIER"
+	@echo "bench      benchmark campaign at TIER, one segment per competitor"
+	@echo "bench-resume continue the current benchmark campaign where it stopped"
+	@echo "report     mark the dominated points in RESULTS=<record dir>"
+	@echo "compare    state whether RESULTS reproduced BASELINE, metric by metric"
 	@echo "validate   fmt-check, lint, and the dev tier"
+	@echo "ci         fmt-check, lint, build, and the smoke tier, in a clean container"
+	@echo "ci-validate  validate in a clean container, recorded"
 	@echo "clean      remove build artifacts"
 
 build:
@@ -94,14 +159,139 @@ gate:
 gate-resume:
 	$(RUNNER) resume --tier gate --runs $(RUNS)
 
-fuzz:
-	@test -n "$(TARGET)" || { echo "make fuzz: set TARGET=<fuzz target>" >&2; exit 1; }
-	$(RUNNER) fuzz --target $(TARGET) --runs $(RUNS)
+# The competitor laboratory. One segment per codec, so one build fits the
+# segment budget and a resumed campaign rebuilds only what did not pass.
+#
+# Each segment builds its competitor at its pinned commit and then rebuilds it
+# from its own recorded commands into a clean prefix. A rebuild that does not
+# reproduce the recorded bytes is recorded, not failed: a compiler and an
+# archiver embed a path and a timestamp, so two builds of one source tree can
+# behave the same and not hash the same.
 
-bench:
-	$(RUNNER) bench --tier $(TIER) --lab $(LAB) --runs $(RUNS)
+lab:
+	$(RUNNER) run --suite lab --tier gate --runs $(RUNS)
+
+lab-resume:
+	$(RUNNER) resume --suite lab --tier gate --runs $(RUNS)
+
+# The corpus. One segment per group, so one fetch fits the segment budget and
+# a resumed campaign re-fetches only what did not pass.
+#
+# A generated entry is written from the seed the registry records, and is then
+# generated twice into two directories to prove the seed is a pin. A fetched
+# entry is checked against its recorded checksum as the archive arrives and
+# again on the bytes it unpacks to, so a broken transfer and a drifted upstream
+# do not look alike.
+
+corpus:
+	CORPUS=$(CORPUS) $(RUNNER) run --suite corpus --tier gate --runs $(RUNS)
+
+corpus-resume:
+	CORPUS=$(CORPUS) $(RUNNER) resume --suite corpus --tier gate --runs $(RUNS)
+
+# Fuzzing. One invocation is one bounded segment, never one long run. Coverage
+# comes from many segments across many days, so each segment continues from the
+# corpus the previous ones left and the record states the accumulated time.
+#
+# The corpus lives at $(RUNS)/fuzz-corpus/<target>/ and a crash reproducer at
+# $(RUNS)/fuzz-corpus/<target>/artifacts/. Both are outside the repository, so
+# the working tree stays clean and neither is lost to a `git clean`. Never
+# delete a corpus to start clean. It is coverage that many segments paid for.
+#
+# The driver is built before the segment starts. A compile inside the segment
+# would spend the budget on the compiler rather than on fuzzing.
+#
+# Every driver is built with the sanitizer set to none. The pinned toolchain is
+# stable, and AddressSanitizer needs nightly. The coverage instrumentation
+# libFuzzer needs is stable, so a bounded segment still runs.
+
+fuzz-list:
+	@$(RUNNER) fuzz list
+
+fuzz-driver:
+	@test -n "$(TARGET)" || { echo "make fuzz: set TARGET=<fuzz target>" >&2; exit 1; }
+	$(RUNNER) fuzz build --target $(TARGET)
+
+fuzz: fuzz-driver
+	$(RUNNER) fuzz run --target $(TARGET) --runs $(RUNS)
+
+# The benchmark. One segment per competitor, and one per competitor, operating
+# point group, and size class at a segmented tier, so a segment holds one budget
+# and a resumed campaign re-measures only what did not pass. A segmented tier
+# measures every pinned operating point, and the cost of one point spans three
+# orders of magnitude inside one project, so the points of a competitor are
+# grouped by cost rather than measured together.
+#
+# Each segment measures its competitor in-process, through the library built into
+# $(LAB), and writes one machine-readable result into the segment's evidence
+# directory. Entroq has no codec path yet, so every result carries an empty
+# Entroq column and states why.
+#
+# The smoke tier is not recorded, so it takes no run root.
+#
+# The harness is built before the campaign starts. A campaign measures codec
+# work under a wall-clock budget, and a compile inside the first segment would
+# spend that budget on the compiler.
+
+RECORDED_RUNS = $(if $(filter smoke,$(TIER)),,--runs $(RUNS))
+
+bench-harness:
+	$(CARGO) build --quiet --release --package entroq-bench
+
+bench: bench-harness
+	CORPUS=$(CORPUS) $(RUNNER) run --suite bench --tier $(TIER) $(RECORDED_RUNS)
+
+bench-resume: bench-harness
+	CORPUS=$(CORPUS) $(RUNNER) resume --suite bench --tier $(TIER) --runs $(RUNS)
+
+# The report. It reads the results a campaign recorded, rejects any document it
+# does not understand whole, and marks every operating point another point
+# dominates on each axis that has data.
+#
+# It is one command rather than a campaign segment. A segment may not depend on
+# another segment of the same campaign, and a report over a campaign's results
+# depends on every measurement segment in it. So the campaign measures, and the
+# report runs afterwards against the records it wrote.
+#
+# Standard output is the document and nothing else, so `make report > file`
+# writes a document a parser reads. The lines a person reads go to standard
+# error.
+
+report:
+	@test -n "$(RESULTS)" || { echo "make report: set RESULTS=<result file or directory>" >&2; exit 1; }
+	@$(CARGO) run --quiet --release --package entroq-bench -- report pareto --results $(RESULTS)
+
+# The comparison. It reads two recorded campaigns and states, row by row and
+# metric by metric, whether the second reproduced the first.
+#
+# A tolerance is read from the first record, never chosen here. A number that is
+# a property of the bytes has no variance, so any difference in it is a finding.
+# A number that is a timing is judged against the spread the first record states
+# for the block it came from. A number that moves between runs and that no
+# record states a variance for is reported with its difference and no verdict.
+#
+# Like the report it is one command rather than a campaign segment, because it
+# depends on every measurement segment of both campaigns.
+#
+# Standard output is the document and nothing else. The lines a person reads go
+# to standard error.
+
+compare:
+	@test -n "$(BASELINE)" || { echo "make compare: set BASELINE=<the first record>" >&2; exit 1; }
+	@test -n "$(RESULTS)" || { echo "make compare: set RESULTS=<the second record>" >&2; exit 1; }
+	@$(CARGO) run --quiet --release --package entroq-bench -- report compare --baseline $(BASELINE) --results $(RESULTS)
 
 validate: fmt-check lint test
+
+# Integration. The same gates run on a clean Linux host that carries the
+# pinned toolchain and nothing of the developer's machine. The container
+# mounts the repository read only, so a lane cannot write inside it.
+
+ci:
+	PLATFORM=$(PLATFORM) ci/ci.sh gates
+
+ci-validate:
+	PLATFORM=$(PLATFORM) RUNS=$(RUNS) ci/ci.sh validate
 
 clean:
 	$(CARGO) clean

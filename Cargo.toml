@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members  = ["codec", "tools/bench", "tools/run"]
+
+# The policy is `deny`, not `warn`, so `cargo clippy --workspace --all-targets` fails
+# on a warning with no `-D warnings` on the command line.
+
+[workspace.lints.rust]
+warnings = "deny"
+unused_results = "deny"
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+cast_possible_truncation = "deny"
+multiple_unsafe_ops_per_block = "deny"
+undocumented_unsafe_blocks = "deny"
