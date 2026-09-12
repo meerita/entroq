@@ -77,5 +77,14 @@ fn fuzz_action(action: Fuzz) -> error::Result<ExitCode> {
                 ExitCode::from(EXIT_VALIDATION)
             })
         }
+        Fuzz::Routine { runs } => {
+            let outcome = fuzz::routine(&fuzz::runs_root(runs))?;
+            print!("{}", report::routine_console(&outcome));
+            Ok(if outcome.is_clean() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(EXIT_VALIDATION)
+            })
+        }
     }
 }

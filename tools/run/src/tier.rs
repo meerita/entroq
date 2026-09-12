@@ -25,6 +25,32 @@ pub const SEGMENT_BUDGET: Duration = Duration::from_secs(120);
 /// process exit all happen inside the same segment.
 pub const FUZZ_SEGMENT_SECONDS: u64 = 60;
 
+/// The wall clock a routine has for fuzzing, across every target it advances.
+///
+/// A campaign that names fuzzing as one segment runs every target inside that segment's
+/// budget, and a full invocation each does not fit one. The figure is the segment budget less
+/// the room the corpus load, the driver check, and the process exit of each target need.
+const FUZZ_ROUTINE_BUDGET_SECONDS: u64 = 80;
+
+/// The wall clock one target gets inside a routine that advances `targets` of them.
+///
+/// The share is computed rather than fixed, so a routine that gains a target shortens every
+/// invocation instead of overrunning the segment they share. It never buys more than one full
+/// invocation: a routine is a way to fit several targets into one segment, not a way to fuzz
+/// one of them for longer than `fuzz run` would.
+#[must_use]
+pub const fn fuzz_routine_seconds(targets: u64) -> u64 {
+    if targets == 0 {
+        return 0;
+    }
+    let share = FUZZ_ROUTINE_BUDGET_SECONDS.div_euclid(targets);
+    if share < FUZZ_SEGMENT_SECONDS {
+        share
+    } else {
+        FUZZ_SEGMENT_SECONDS
+    }
+}
+
 const SMOKE_CAMPAIGN_BUDGET: Duration = Duration::from_secs(30);
 const DEV_CAMPAIGN_BUDGET: Duration = Duration::from_secs(120);
 
@@ -485,6 +511,122 @@ const BENCH_PUBLICATION_SEGMENTS: &[Segment] = &[
     bench_segment!("publication", "zlib", "huge"),
 ];
 
+/// One skeleton segment: one test of the gate-scale proof binary.
+///
+/// Each proof is its own test, so a segment names one and a resumed campaign re-runs only the
+/// proof that did not hold. The tests are ignored by default, because the dev tier proves the
+/// same properties on a small input set and these are sized to the gate's.
+macro_rules! skeleton_segment {
+    ($id:literal, $test:literal, $description:literal) => {
+        Segment {
+            id: $id,
+            description: $description,
+            steps: &[Step {
+                program: "cargo",
+                args: &[
+                    "test",
+                    "--release",
+                    "--quiet",
+                    "--package",
+                    "codec",
+                    "--test",
+                    "skeleton",
+                    "--",
+                    "--ignored",
+                    "--nocapture",
+                    "--exact",
+                    $test,
+                ],
+            }],
+        }
+    };
+}
+
+/// The M2 closing gate: every heavy proof of the format skeleton, one per segment.
+const SKELETON_SEGMENTS: &[Segment] = &[
+    skeleton_segment!(
+        "skeleton-roundtrip-tiny",
+        "skeleton_roundtrip_tiny",
+        "Every length below one kibibyte round-trips, through five content shapes, both \
+         integrity modes, four chunkings, and a pseudo-random one."
+    ),
+    skeleton_segment!(
+        "skeleton-roundtrip-small",
+        "skeleton_roundtrip_small",
+        "Every kibibyte boundary to sixty-four, and one byte either side of each, round-trips."
+    ),
+    skeleton_segment!(
+        "skeleton-roundtrip-medium",
+        "skeleton_roundtrip_medium",
+        "The region boundary and the sizes around it round-trip."
+    ),
+    skeleton_segment!(
+        "skeleton-roundtrip-large",
+        "skeleton_roundtrip_large",
+        "Multi-region inputs from four to twelve mebibytes round-trip."
+    ),
+    skeleton_segment!(
+        "skeleton-truncation-matrix",
+        "skeleton_truncation_matrix",
+        "Every stream of the structural fixture set, cut at every byte offset, is refused \
+         rather than read as a whole frame."
+    ),
+    skeleton_segment!(
+        "skeleton-chunk-permutation-encode",
+        "skeleton_chunk_permutation_encode",
+        "One input encodes to the same bytes at every input and output chunk size."
+    ),
+    skeleton_segment!(
+        "skeleton-chunk-permutation-decode",
+        "skeleton_chunk_permutation_decode",
+        "One stream decodes to the same bytes at every input and output chunk size."
+    ),
+    Segment {
+        id: "skeleton-memory-curve-1gib",
+        description: "The memory growth curve from one mebibyte to one gibibyte of logical \
+                      input is flat against the criterion the tool states before it runs.",
+        steps: &[Step {
+            program: "cargo",
+            args: &[
+                "run",
+                "--quiet",
+                "--release",
+                "--package",
+                "entroq-proof",
+                "--",
+                "curve",
+            ],
+        }],
+    },
+    Segment {
+        id: "skeleton-byteorder-cross-arch",
+        description: "Two architectures write the same format vectors and each decodes the \
+                      other's.",
+        steps: &[Step {
+            program: "ci/byteorder.sh",
+            args: &["run"],
+        }],
+    },
+    Segment {
+        id: "skeleton-fuzz-routine",
+        description: "Every runnable fuzz target that reaches codec code advances by one \
+                      bounded invocation, and none leaves a reproducer behind.",
+        steps: &[Step {
+            program: "cargo",
+            args: &[
+                "run",
+                "--quiet",
+                "--release",
+                "--package",
+                "entroq-run",
+                "--",
+                "fuzz",
+                "routine",
+            ],
+        }],
+    },
+];
+
 /// A named set of segments, and what a campaign over that set does and does not cover.
 ///
 /// A suite is what is run. A tier is how it is bounded and recorded.
@@ -500,6 +642,8 @@ pub enum Suite {
     /// per competitor. The gate tier runs one per competitor, operating point group, and
     /// size class, because a segment holds one budget.
     Bench,
+    /// The format skeleton's closing gate: every heavy proof the cheap tiers defer.
+    Skeleton,
 }
 
 impl Suite {
@@ -510,6 +654,7 @@ impl Suite {
             "lab" => Some(Self::Lab),
             "corpus" => Some(Self::Corpus),
             "bench" => Some(Self::Bench),
+            "skeleton" => Some(Self::Skeleton),
             _ => None,
         }
     }
@@ -520,6 +665,7 @@ impl Suite {
             Self::Lab => "lab",
             Self::Corpus => "corpus",
             Self::Bench => "bench",
+            Self::Skeleton => "skeleton",
         }
     }
 
@@ -530,6 +676,7 @@ impl Suite {
             Self::Lab => "lab-build",
             Self::Corpus => "corpus-registry",
             Self::Bench => "bench-baseline",
+            Self::Skeleton => "skeleton-gate",
         }
     }
 
@@ -557,6 +704,10 @@ impl Suite {
                 Tier::Dev => BENCH_DEV_SEGMENTS,
                 Tier::Gate => BENCH_GATE_SEGMENTS,
                 Tier::Publication => BENCH_PUBLICATION_SEGMENTS,
+            },
+            Self::Skeleton => match tier {
+                Tier::Smoke | Tier::Dev => &[],
+                Tier::Gate | Tier::Publication => SKELETON_SEGMENTS,
             },
         }
     }
@@ -597,6 +748,17 @@ impl Suite {
                  class per segment, and the groups of a competitor cover every point the \
                  catalog pins for it. The harness links no Entroq codec at this revision, \
                  so every result carries an empty Entroq column and states why."
+            }
+            Self::Skeleton => {
+                "The format skeleton's closing gate. Seven segments round-trip generated \
+                 content across four size classes, cut every fixture stream at every byte \
+                 offset, and drive both machines at every chunk size, all through the \
+                 public API. One measures what the streaming pair holds as the logical \
+                 input grows from one mebibyte to one gibibyte, reading the process's own \
+                 allocator and resident set. One writes the format vectors on two \
+                 architectures and has each decode the other's. One advances every runnable \
+                 fuzz target that reaches codec code. No segment compresses a byte: every block this revision \
+                 writes is stored."
             }
         }
     }
@@ -639,6 +801,17 @@ impl Suite {
                  result names that setting and the container checksum it was not produced \
                  under. Every number is single threaded except the parallel scaling metric, \
                  which states its own worker count."
+            }
+            Self::Skeleton => {
+                "The campaign measured no compression ratio and no throughput, and it \
+                 compares no competitor. The memory figures are the declared bound, the \
+                 process allocator counters, and the resident-set high-water mark of the \
+                 child that performed each run; none of them attributes memory to one call. \
+                 The cross-architecture segment runs one lane under emulation, which \
+                 settles byte order and nothing about speed: no duration from either lane \
+                 is a result. The fuzz segment shortens each target's invocation to fit one \
+                 segment, so the accumulated figure is the one to read, not this run's. The \
+                 round trips cover generated content, not the registered corpus."
             }
         }
     }
@@ -703,7 +876,13 @@ mod tests {
     use super::{Duration, SEGMENT_BUDGET, Suite, Tier};
 
     const TIERS: [Tier; 4] = [Tier::Smoke, Tier::Dev, Tier::Gate, Tier::Publication];
-    const SUITES: [Suite; 4] = [Suite::Workspace, Suite::Lab, Suite::Corpus, Suite::Bench];
+    const SUITES: [Suite; 5] = [
+        Suite::Workspace,
+        Suite::Lab,
+        Suite::Corpus,
+        Suite::Bench,
+        Suite::Skeleton,
+    ];
 
     #[test]
     fn every_tier_name_round_trips() {
@@ -914,6 +1093,74 @@ mod tests {
     fn the_corpus_suite_says_it_measured_no_compression() {
         assert!(Suite::Corpus.coverage().contains("compresses a byte"));
         assert!(Suite::Corpus.limits().contains("no throughput"));
+    }
+
+    #[test]
+    fn the_skeleton_suite_runs_every_segment_the_closing_gate_names() {
+        let segments = Suite::Skeleton.segments(Tier::Gate);
+        let ids: Vec<&str> = segments.iter().map(|segment| segment.id).collect();
+        for expected in [
+            "skeleton-roundtrip-tiny",
+            "skeleton-roundtrip-small",
+            "skeleton-roundtrip-medium",
+            "skeleton-roundtrip-large",
+            "skeleton-truncation-matrix",
+            "skeleton-chunk-permutation-encode",
+            "skeleton-chunk-permutation-decode",
+            "skeleton-memory-curve-1gib",
+            "skeleton-byteorder-cross-arch",
+            "skeleton-fuzz-routine",
+        ] {
+            assert!(ids.contains(&expected), "{expected} is not a segment");
+        }
+        assert_eq!(segments.len(), 10);
+    }
+
+    #[test]
+    fn the_skeleton_suite_has_no_segments_at_a_tier_that_does_not_segment() {
+        assert!(Suite::Skeleton.segments(Tier::Smoke).is_empty());
+        assert!(Suite::Skeleton.segments(Tier::Dev).is_empty());
+    }
+
+    #[test]
+    fn every_skeleton_round_trip_segment_names_one_ignored_test_exactly() {
+        for segment in Suite::Skeleton.segments(Tier::Gate) {
+            if !segment.id.starts_with("skeleton-roundtrip") {
+                continue;
+            }
+            let args: Vec<&str> = segment
+                .steps
+                .iter()
+                .flat_map(|step| step.args.iter().copied())
+                .collect();
+            assert!(args.contains(&"--ignored"), "{}", segment.id);
+            assert!(args.contains(&"--exact"), "{}", segment.id);
+            assert!(args.contains(&"--release"), "{}", segment.id);
+        }
+    }
+
+    #[test]
+    fn the_skeleton_suite_says_it_compressed_nothing_and_claims_no_speed() {
+        assert!(Suite::Skeleton.coverage().contains("compresses a byte"));
+        assert!(Suite::Skeleton.limits().contains("no throughput"));
+        assert!(Suite::Skeleton.limits().contains("emulation"));
+    }
+
+    #[test]
+    fn a_routine_shares_one_segment_among_however_many_targets_it_advances() {
+        for targets in 1_u64..=8 {
+            let each = super::fuzz_routine_seconds(targets);
+            assert!(
+                Duration::from_secs(each.saturating_mul(targets)) < SEGMENT_BUDGET,
+                "{targets} targets"
+            );
+            assert!(each <= super::FUZZ_SEGMENT_SECONDS, "{targets} targets");
+        }
+    }
+
+    #[test]
+    fn a_routine_with_no_target_asks_for_no_time() {
+        assert_eq!(super::fuzz_routine_seconds(0), 0);
     }
 
     #[test]

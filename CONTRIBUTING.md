@@ -48,6 +48,21 @@ make validate     # format check, lint, and the dev tier
 
 Fuzzing runs in bounded segments too. The Fuzzing section below states how.
 
+The format skeleton has a gate campaign of its own. It holds the proofs a cheap tier cannot
+carry: round trips across four size classes, every fixture stream cut at every byte offset,
+both machines driven at every chunk size, the memory growth curve from one mebibyte to one
+gibibyte, the cross-architecture vectors, and one bounded invocation of every fuzz target.
+
+```sh
+make skeleton          # every heavy proof, one per segment
+make skeleton-resume   # continue the current skeleton campaign where it stopped
+```
+
+Both targets compile what the campaign then measures before the first segment starts, so no
+segment spends its budget on a compiler. The compile step builds a container image and the
+tool inside it, so it needs a container tool and takes a few minutes the first time. Only the
+cross-architecture segment needs the container; every other segment runs on the host alone.
+
 A lower tier never substitutes for a higher one. A dev-tier result is not a gate result.
 
 A recorded run writes its record outside the repository, under `../runs` by default. Set
@@ -211,6 +226,10 @@ arrives with the code it covers.
 make fuzz-list                 # every target, and whether a driver exists for it
 make fuzz TARGET=<name>        # advance one target by one bounded segment
 ```
+
+A campaign that names fuzzing as one of its segments advances every runnable target inside
+that one segment, with each invocation shortened to fit the budget they share. It writes no
+record of its own: the campaign that ran it is the record, and it extends the same corpus.
 
 `make fuzz` needs cargo-fuzz. Install it with `cargo install cargo-fuzz`. No other target
 needs it.

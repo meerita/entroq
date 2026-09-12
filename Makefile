@@ -71,6 +71,13 @@
 #           Required: no.
 #           Default:  ../runs
 #
+#   VECTORS The directory the two cross-architecture lanes write their format
+#           vectors into. `skeleton` reads it. It is outside the repository on
+#           purpose: the repository carries code, not evidence.
+#           Scope:    skeleton, skeleton-prepare, skeleton-resume.
+#           Required: no.
+#           Default:  $(RUNS)/byteorder
+#
 #   TIER    The validation tier a recorded target runs at.
 #           Scope:    bench, bench-resume.
 #           Required: no.
@@ -84,7 +91,9 @@
 #   PLATFORM
 #           The platform an integration lane runs on: linux/amd64 or
 #           linux/arm64.
-#           Scope:    ci, ci-validate.
+#           Scope:    ci, ci-validate, and the cross-architecture lane of
+#                     skeleton, where it names the other architecture and must
+#                     differ from the host's.
 #           Required: no.
 #           Default:  the platform of the host. A platform the host must
 #                     emulate still runs, and the lane reports it as
@@ -96,13 +105,14 @@ LAB ?= ../lab
 export LAB
 CORPUS ?= ../corpus
 RUNS ?= ../runs
+VECTORS ?= $(RUNS)/byteorder
 TIER ?= dev
 PLATFORM ?=
 
 # Repository tooling, versioned with the code whose gates it runs.
 RUNNER = $(CARGO) run --quiet --release --package entroq-run --
 
-.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume lab lab-resume corpus corpus-resume fuzz-list fuzz-driver fuzz bench-harness bench bench-resume report compare validate ci ci-validate clean
+.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume skeleton-prepare skeleton skeleton-resume lab lab-resume corpus corpus-resume fuzz-list fuzz-driver fuzz bench-harness bench bench-resume report compare validate ci ci-validate clean
 
 help:
 	@echo "build      compile the workspace"
@@ -114,6 +124,8 @@ help:
 	@echo "test       dev tier: 120 s, 10 MiB inputs, recorded"
 	@echo "gate       gate tier: 100 MiB inputs, segmented and resumable"
 	@echo "gate-resume  continue the current gate campaign where it stopped"
+	@echo "skeleton   gate tier: every heavy proof of the format skeleton"
+	@echo "skeleton-resume  continue the current skeleton campaign where it stopped"
 	@echo "lab        build the pinned competitors into LAB, one segment per codec"
 	@echo "lab-resume   continue the current lab campaign where it stopped"
 	@echo "corpus     materialize the corpus into CORPUS, one segment per group"
@@ -158,6 +170,34 @@ gate:
 
 gate-resume:
 	$(RUNNER) resume --tier gate --runs $(RUNS)
+
+# The format skeleton's closing gate. Every proof the cheap tiers defer, one
+# per segment, so one proof holds one budget and a resumed campaign re-runs
+# only the proof that did not hold.
+#
+# `skeleton-prepare` compiles what the campaign then measures: the gate-scale
+# test binary, the proof tool, both fuzz drivers, and the tool on both
+# architecture lanes, including the container image one of them runs in. None
+# of that is validation, so no budget covers it. A compile inside a segment
+# would spend the budget on the compiler.
+#
+# The cross-architecture segment needs a container tool and a platform the host
+# can run or emulate. Every other segment needs neither.
+
+skeleton-prepare:
+	$(CARGO) test --release --quiet --package codec --test skeleton --no-run
+	$(CARGO) build --quiet --release --package entroq-proof
+	$(RUNNER) fuzz build --target frame-parser
+	$(RUNNER) fuzz build --target streaming-decoder
+	VECTORS=$(VECTORS) PLATFORM=$(PLATFORM) ci/byteorder.sh prepare
+
+skeleton: skeleton-prepare
+	RUNS=$(RUNS) VECTORS=$(VECTORS) PLATFORM=$(PLATFORM) \
+	    $(RUNNER) run --suite skeleton --tier gate --runs $(RUNS)
+
+skeleton-resume: skeleton-prepare
+	RUNS=$(RUNS) VECTORS=$(VECTORS) PLATFORM=$(PLATFORM) \
+	    $(RUNNER) resume --suite skeleton --tier gate --runs $(RUNS)
 
 # The competitor laboratory. One segment per codec, so one build fits the
 # segment budget and a resumed campaign rebuilds only what did not pass.
