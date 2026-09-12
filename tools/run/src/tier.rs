@@ -568,8 +568,11 @@ impl Suite {
     pub const fn coverage(self) -> &'static str {
         match self {
             Self::Workspace => {
-                "Workspace gates only. No codec exists at this revision, so no segment \
-                 exercises a codec path and no test asserts codec behavior."
+                "Workspace gates only. The format contract is the only codec module that \
+                 exists at this revision, so a segment exercises the frame, region, and \
+                 block structure through its unit tests and asserts the error each \
+                 malformed field produces. No segment compresses a byte, no segment \
+                 streams, and no segment fuzzes."
             }
             Self::Lab => {
                 "Competitor laboratory builds only. No segment compresses a byte, and \
