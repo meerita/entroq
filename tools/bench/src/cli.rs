@@ -29,6 +29,8 @@ Usage:
                               [--corpus <dir>]
   entroq-bench report parse   --results <path> [--results <path>]...
   entroq-bench report pareto  --results <path> [--results <path>]...
+  entroq-bench report compare --baseline <path> [--baseline <path>]...
+                              --results <path> [--results <path>]...
   entroq-bench help
 
 `lab build` fetches one competitor at its pinned commit, builds it as a static library with
@@ -102,6 +104,14 @@ One chart holds one tier, one host, one corpus entry, and one thread count, and 
 point states its tier. An axis no result carries a number for reports no data with the reason
 the results gave, and no other metric stands in its place.
 
+`report compare` reads a first campaign and a second one and states, row by row and metric by
+metric, whether the second reproduced the first. A number that is a property of the bytes has
+no variance, so any difference in it is a finding. A number that is a timing is judged against
+the spread the first record states for the block it came from. A number that moves between
+runs and that no record states a variance for is reported with its difference and no verdict.
+Two rows are compared only when they measured the same bytes, at the same operating point,
+through the same competitor version, under the same integrity setting.
+
 A path that names a directory is searched for every file named `result.json`, so a run record
 directory yields the results of every segment in it. Name one campaign: two measurements of
 one operating point are two measurements, and a frontier cannot hold one of them twice.
@@ -129,6 +139,7 @@ Corpus groups:
 
 Report inputs:
   --results <path>  a result document, or a directory holding them. Repeatable.
+  --baseline <path> the first campaign a comparison reads. Repeatable. compare only.
 
 Environment:
   LAB      the competitor codec workspace, when --lab does not name it.
@@ -170,6 +181,8 @@ pub enum Invocation {
     Report {
         action: ReportAction,
         results: Vec<PathBuf>,
+        /// The first campaign a comparison is read against. Empty for every other action.
+        baseline: Vec<PathBuf>,
     },
 }
 
@@ -180,6 +193,8 @@ pub enum ReportAction {
     Parse,
     /// Report the frontier, and every point another point dominates.
     Pareto,
+    /// Report whether a second campaign reproduced the numbers of a first one.
+    Compare,
 }
 
 impl ReportAction {
@@ -187,6 +202,7 @@ impl ReportAction {
         match name {
             "parse" => Some(Self::Parse),
             "pareto" => Some(Self::Pareto),
+            "compare" => Some(Self::Compare),
             _ => None,
         }
     }
@@ -344,17 +360,23 @@ fn corpus(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
 }
 
 fn report(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
-    let action = args
-        .next()
-        .ok_or_else(|| Error::Usage(String::from("report: name an action: parse or pareto")))?;
+    let action = args.next().ok_or_else(|| {
+        Error::Usage(String::from(
+            "report: name an action: parse, pareto, or compare",
+        ))
+    })?;
     let action = ReportAction::parse(&text(&action, "action")?).ok_or_else(|| {
-        Error::Usage(String::from("report: unknown action. Use parse or pareto."))
+        Error::Usage(String::from(
+            "report: unknown action. Use parse, pareto, or compare.",
+        ))
     })?;
 
     let mut results: Vec<PathBuf> = Vec::new();
+    let mut baseline: Vec<PathBuf> = Vec::new();
     while let Some(arg) = args.next() {
         match text(&arg, "argument")?.as_str() {
             "--results" => results.push(PathBuf::from(next(&mut args, "--results")?)),
+            "--baseline" => baseline.push(PathBuf::from(next(&mut args, "--baseline")?)),
             other => {
                 return Err(Error::Usage(format!(
                     "unexpected argument `{other}`. Run `entroq-bench help`."
@@ -368,7 +390,22 @@ fn report(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
              host happens to hold is a report nobody chose.",
         )));
     }
-    Ok(Invocation::Report { action, results })
+    if action == ReportAction::Compare && baseline.is_empty() {
+        return Err(Error::Usage(String::from(
+            "report compare: name the first campaign with --baseline <path>. A comparison \
+             against nothing is not a reproduction.",
+        )));
+    }
+    if action != ReportAction::Compare && !baseline.is_empty() {
+        return Err(Error::Usage(String::from(
+            "report: --baseline belongs to compare. Every other action reads one campaign.",
+        )));
+    }
+    Ok(Invocation::Report {
+        action,
+        results,
+        baseline,
+    })
 }
 
 fn measure(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
@@ -803,13 +840,27 @@ mod tests {
 
     fn report(args: &[&str]) -> Option<(super::ReportAction, Vec<String>)> {
         match invoke(args) {
-            Ok(Invocation::Report { action, results }) => Some((
+            Ok(Invocation::Report {
+                action, results, ..
+            }) => Some((
                 action,
                 results
                     .iter()
                     .map(|path| path.display().to_string())
                     .collect(),
             )),
+            _ => None,
+        }
+    }
+
+    fn baseline(args: &[&str]) -> Option<Vec<String>> {
+        match invoke(args) {
+            Ok(Invocation::Report { baseline, .. }) => Some(
+                baseline
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+            ),
             _ => None,
         }
     }
@@ -834,6 +885,42 @@ mod tests {
                 vec![String::from("/tmp/a"), String::from("/tmp/b")]
             ))
         );
+    }
+
+    #[test]
+    fn a_comparison_names_the_campaign_it_reads_the_second_one_against() {
+        assert_eq!(
+            baseline(&[
+                "report",
+                "compare",
+                "--baseline",
+                "/tmp/first",
+                "--results",
+                "/tmp/second"
+            ]),
+            Some(vec![String::from("/tmp/first")])
+        );
+    }
+
+    #[test]
+    fn a_comparison_against_nothing_is_rejected() {
+        let failure = invoke(&["report", "compare", "--results", "/tmp/second"]);
+        let message = failure.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("--baseline"), "{message}");
+    }
+
+    #[test]
+    fn a_baseline_given_to_an_action_that_reads_one_campaign_is_rejected() {
+        let failure = invoke(&[
+            "report",
+            "pareto",
+            "--baseline",
+            "/tmp/first",
+            "--results",
+            "/tmp/second",
+        ]);
+        let message = failure.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("belongs to compare"), "{message}");
     }
 
     #[test]

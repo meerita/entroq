@@ -10,10 +10,10 @@
 //! from recorded seeds, fetches the registered public corpora, and checks both against the
 //! checksums the registry pins.
 //!
-//! The report: it reads the results a measurement recorded, whole or not at all, and marks
-//! every operating point another point dominates on each axis that has data. It links no
-//! competitor, so a host that never built the laboratory still reads what one that did
-//! recorded.
+//! The report: it reads the results a measurement recorded, whole or not at all, marks every
+//! operating point another point dominates on each axis that has data, and states whether a
+//! second campaign reproduced the numbers of a first one. It links no competitor, so a host
+//! that never built the laboratory still reads what one that did recorded.
 //!
 //! The measurement: it drives each competitor in-process, through the library the laboratory
 //! built and the build script linked, and emits one machine-readable result per segment.
@@ -26,6 +26,12 @@
 //! reports a partial set of competitors as if it were the set.
 //!
 //! Both build inputs live outside the repository. This tool writes no artifact inside it.
+
+// Without the laboratory the measurement path is not compiled, so the sampling, allocator,
+// counter, and environment code that only it reaches has no caller. That is the normal state
+// of a host that has not built the laboratory, and it is not a reason to refuse to compile
+// the tool that builds it. A host that has linked the laboratory still reports dead code.
+#![cfg_attr(not(lab_linked), allow(dead_code))]
 
 mod alloc;
 mod catalog;
@@ -53,6 +59,7 @@ mod parse;
 mod plan;
 mod registry;
 mod report;
+mod reproduce;
 #[cfg(lab_linked)]
 mod result;
 mod shape;
@@ -113,8 +120,12 @@ fn run() -> error::Result<ExitCode> {
             measure(&request)?;
             Ok(ExitCode::SUCCESS)
         }
-        Invocation::Report { action, results } => {
-            report(action, &results)?;
+        Invocation::Report {
+            action,
+            results,
+            baseline,
+        } => {
+            report(action, &results, &baseline)?;
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -125,8 +136,9 @@ fn run() -> error::Result<ExitCode> {
 /// # Errors
 ///
 /// Fails when a result cannot be read, when one is not a document the parser fully
-/// understands, or when the results put one operating point on one chart twice.
-fn report(action: ReportAction, results: &[PathBuf]) -> error::Result<()> {
+/// understands, when the results put one operating point on one chart twice, or when either
+/// campaign of a comparison holds one measured row twice.
+fn report(action: ReportAction, results: &[PathBuf], baseline: &[PathBuf]) -> error::Result<()> {
     let documents = report::read(results)?;
     let produced_at = environment::timestamp()?;
     match action {
@@ -138,6 +150,12 @@ fn report(action: ReportAction, results: &[PathBuf]) -> error::Result<()> {
             let charts = pareto::charts(&documents)?;
             report::emit(&report::frontier(&documents, &charts, &produced_at))?;
             report::log_frontier(&charts);
+        }
+        ReportAction::Compare => {
+            let first = report::read(baseline)?;
+            let found = reproduce::compare(&first, &documents)?;
+            report::emit(&report::agreement(&first, &documents, &found, &produced_at))?;
+            report::log_agreement(&found);
         }
     }
     Ok(())

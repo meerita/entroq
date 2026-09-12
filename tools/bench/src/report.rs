@@ -14,12 +14,14 @@ use serde_json::{Value, json};
 use crate::error::{Error, Result};
 use crate::pareto::{self, AXES, Absent, Chart, Plot, Plotted, Subject};
 use crate::parse::{self, Document};
+use crate::reproduce::{Comparison, Pair, Reproduction, Verdict};
 
 /// The name a segment writes its result document under.
 const RESULT_FILE: &str = "result.json";
 
 pub const PARSE_SCHEMA: &str = "entroq.bench.parse/1";
 pub const PARETO_SCHEMA: &str = "entroq.bench.pareto/1";
+pub const COMPARE_SCHEMA: &str = "entroq.bench.compare/1";
 
 /// Reads every result under the given roots.
 ///
@@ -77,6 +79,201 @@ pub fn frontier(documents: &[Document], charts: &[Chart], produced_at: &str) -> 
             .collect::<Vec<_>>(),
         "charts": charts.iter().map(chart).collect::<Vec<_>>(),
         "limits": limits(documents, charts),
+    })
+}
+
+/// The comparison report: what a second campaign reproduced of a first one.
+///
+/// Every shared row appears, whatever it found, so the document is the comparison rather than
+/// a selection from it. A row the two campaigns do not share, and a row whose two sides did
+/// not measure equivalent work, are named rather than dropped.
+pub fn agreement(
+    baseline: &[Document],
+    subject: &[Document],
+    found: &Reproduction,
+    produced_at: &str,
+) -> Value {
+    json!({
+        "schema": COMPARE_SCHEMA,
+        "produced_at": produced_at,
+        "reads": parse::SCHEMA,
+        "baseline": campaign(baseline),
+        "subject": campaign(subject),
+        "host_differences": found
+            .host
+            .iter()
+            .map(|divergence| json!({
+                "field": divergence.field,
+                "baseline": divergence.baseline,
+                "subject": divergence.subject,
+            }))
+            .collect::<Vec<_>>(),
+        "tolerance_policy": crate::reproduce::policy()
+            .map(|(metric, source)| json!({ "metric": metric, "tolerance": source }))
+            .collect::<Vec<_>>(),
+        "totals": {
+            "rows_compared": found.pairs.len(),
+            "rows_not_comparable": found.blocked().count(),
+            "rows_only_in_baseline": found.only_in_baseline.len(),
+            "rows_only_in_subject": found.only_in_subject.len(),
+            "agrees": found.count(Verdict::Agrees),
+            "differs": found.count(Verdict::Differs),
+            "unjudged": found.count(Verdict::Unjudged),
+            "absent_in_both": found.count(Verdict::Absent),
+            "changed_state": found.count(Verdict::Changed),
+        },
+        "by_metric": by_metric(found),
+        "rows_only_in_baseline": found
+            .only_in_baseline
+            .iter()
+            .map(|key| Value::from(key.label()))
+            .collect::<Vec<_>>(),
+        "rows_only_in_subject": found
+            .only_in_subject
+            .iter()
+            .map(|key| Value::from(key.label()))
+            .collect::<Vec<_>>(),
+        "not_comparable": found
+            .blocked()
+            .map(|pair| json!({
+                "row": pair.key.label(),
+                "reason": pair.blocked,
+            }))
+            .collect::<Vec<_>>(),
+        "findings": findings(found),
+        "rows": found.pairs.iter().map(pair).collect::<Vec<_>>(),
+        "verdict": {
+            "reproduced": found.reproduced(),
+            "statement": found.statement(),
+        },
+        "limits": [
+            "This document states whether two recorded campaigns agree. It states no \
+             performance claim, and it licenses none.",
+            "A tolerance is read from the first record, never chosen here. A metric the \
+             first record states no variance for reaches no verdict, and its difference is \
+             reported alone.",
+            "Two campaigns measured on different hosts are two results about two machines. \
+             Every field of the host the records disagree about is named above.",
+        ],
+    })
+}
+
+fn campaign(documents: &[Document]) -> Value {
+    json!({
+        "sources": documents.iter().map(source).collect::<Vec<_>>(),
+        "results": documents.len(),
+        "measurements": documents.iter().map(|d| d.rows.len()).sum::<usize>(),
+        "host": documents.first().map_or(Value::Null, |document| {
+            let host = &document.host;
+            json!({
+                "os": host.os,
+                "os_version": host.os_version,
+                "arch": host.arch,
+                "cpu_model": host.cpu_model,
+                "cores": host.cores,
+                "memory": host.memory,
+                "rustc": host.rustc,
+                "build_profile": host.build_profile,
+                "harness_version": host.harness_version,
+                "counter_backend": host.counter_backend,
+                "counter_granted": host.counter_granted,
+            })
+        }),
+    })
+}
+
+/// Every metric, with what the comparison concluded about it across every row.
+fn by_metric(found: &Reproduction) -> Vec<Value> {
+    crate::reproduce::policy()
+        .map(|(metric, tolerance)| {
+            let readings: Vec<&Comparison> = found
+                .pairs
+                .iter()
+                .flat_map(|pair| pair.comparisons.iter())
+                .filter(|comparison| comparison.metric == metric)
+                .collect();
+            let worst = readings
+                .iter()
+                .filter(|comparison| comparison.tolerance.is_some())
+                .filter_map(|comparison| comparison.relative_difference)
+                .fold(None, |worst: Option<f64>, value| {
+                    Some(worst.map_or(value, |held| if value > held { value } else { held }))
+                });
+            json!({
+                "metric": metric,
+                "tolerance": tolerance,
+                "agrees": counted(&readings, Verdict::Agrees),
+                "differs": counted(&readings, Verdict::Differs),
+                "unjudged": counted(&readings, Verdict::Unjudged),
+                "absent_in_both": counted(&readings, Verdict::Absent),
+                "changed_state": counted(&readings, Verdict::Changed),
+                "worst_judged_relative_difference": worst,
+            })
+        })
+        .collect()
+}
+
+fn counted(readings: &[&Comparison], verdict: Verdict) -> usize {
+    readings
+        .iter()
+        .filter(|comparison| comparison.verdict == verdict)
+        .fold(0, |total, _| total.saturating_add(1))
+}
+
+/// Every metric the reproduction has to explain, with the row it was measured on.
+fn findings(found: &Reproduction) -> Vec<Value> {
+    found
+        .pairs
+        .iter()
+        .flat_map(|held| held.findings().map(move |comparison| (held, comparison)))
+        .map(|(held, comparison)| {
+            json!({
+                "row": held.key.label(),
+                "baseline_segment": held.baseline_segment,
+                "subject_segment": held.subject_segment,
+                "metric": comparison.metric,
+                "verdict": comparison.verdict.name(),
+                "baseline": comparison.baseline,
+                "subject": comparison.subject,
+                "relative_difference": comparison.relative_difference,
+                "tolerance": comparison.tolerance,
+                "tolerance_source": comparison.tolerance_source,
+                "baseline_encode_spread": held.baseline_encode_spread,
+                "subject_encode_spread": held.subject_encode_spread,
+                "baseline_decode_spread": held.baseline_decode_spread,
+                "subject_decode_spread": held.subject_decode_spread,
+            })
+        })
+        .collect()
+}
+
+fn pair(held: &Pair) -> Value {
+    json!({
+        "row": held.key.label(),
+        "codec": held.key.codec,
+        "operating_point": held.key.operating_point,
+        "entry": held.key.entry,
+        "class": held.key.class,
+        "threads": held.key.threads,
+        "baseline_segment": held.baseline_segment,
+        "subject_segment": held.subject_segment,
+        "baseline_encode_spread": held.baseline_encode_spread,
+        "subject_encode_spread": held.subject_encode_spread,
+        "baseline_decode_spread": held.baseline_decode_spread,
+        "subject_decode_spread": held.subject_decode_spread,
+        "not_comparable": held.blocked,
+        "metrics": held
+            .comparisons
+            .iter()
+            .map(|comparison| json!({
+                "metric": comparison.metric,
+                "verdict": comparison.verdict.name(),
+                "baseline": comparison.baseline,
+                "subject": comparison.subject,
+                "relative_difference": comparison.relative_difference,
+                "tolerance": comparison.tolerance,
+            }))
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -334,6 +531,56 @@ pub fn log_frontier(charts: &[Chart]) {
             for absent in &plot.absent {
                 eprintln!("    {:<24} not plotted: {}", absent.label, absent.reason);
             }
+        }
+    }
+}
+
+/// What a person reading a comparison sees: the per-metric roll-up, then every finding.
+pub fn log_agreement(found: &Reproduction) {
+    eprintln!("{}", found.statement());
+    for difference in &found.host {
+        eprintln!(
+            "  host {}: {} against {}",
+            difference.field, difference.baseline, difference.subject
+        );
+    }
+    for (metric, _) in crate::reproduce::policy() {
+        let readings: Vec<&Comparison> = found
+            .pairs
+            .iter()
+            .flat_map(|pair| pair.comparisons.iter())
+            .filter(|comparison| comparison.metric == metric)
+            .collect();
+        eprintln!(
+            "  {metric:<28} {} agree, {} differ, {} unjudged, {} absent, {} changed",
+            counted(&readings, Verdict::Agrees),
+            counted(&readings, Verdict::Differs),
+            counted(&readings, Verdict::Unjudged),
+            counted(&readings, Verdict::Absent),
+            counted(&readings, Verdict::Changed),
+        );
+    }
+    for pair in found.blocked() {
+        eprintln!(
+            "  not comparable: {} because {}",
+            pair.key.label(),
+            pair.blocked.clone().unwrap_or_default()
+        );
+    }
+    for pair in &found.pairs {
+        for comparison in pair.findings() {
+            eprintln!(
+                "  {} {}: {} against {}, {} the tolerance {}",
+                pair.key.label(),
+                comparison.metric,
+                comparison.baseline.unwrap_or(f64::NAN),
+                comparison.subject.unwrap_or(f64::NAN),
+                comparison.relative_difference.map_or_else(
+                    || String::from("no relative difference against"),
+                    |value| { format!("{value:.4} against") }
+                ),
+                comparison.tolerance.unwrap_or(f64::NAN),
+            );
         }
     }
 }

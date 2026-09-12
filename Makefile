@@ -50,8 +50,18 @@
 #           under it, which a run record directory is. Name one campaign: a
 #           frontier cannot hold one operating point twice, so results from
 #           two campaigns of the same tier are read separately.
-#           Scope:    report.
-#           Required: yes, for report.
+#           Scope:    report, compare. For compare it names the second
+#                     campaign, the one being checked.
+#           Required: yes, for report and for compare.
+#           Default:  none.
+#
+#   BASELINE
+#           The recorded results a comparison reads a second campaign
+#           against, in the same form as RESULTS. It is the first campaign,
+#           the one whose numbers and whose stated variance the comparison
+#           judges against.
+#           Scope:    compare.
+#           Required: yes, for compare.
 #           Default:  none.
 #
 #   RUNS    The run record root. Recorded tiers write their manifest,
@@ -92,7 +102,7 @@ PLATFORM ?=
 # Repository tooling, versioned with the code whose gates it runs.
 RUNNER = $(CARGO) run --quiet --release --package entroq-run --
 
-.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume lab lab-resume corpus corpus-resume fuzz-list fuzz-driver fuzz bench-harness bench bench-resume report validate ci ci-validate clean
+.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume lab lab-resume corpus corpus-resume fuzz-list fuzz-driver fuzz bench-harness bench bench-resume report compare validate ci ci-validate clean
 
 help:
 	@echo "build      compile the workspace"
@@ -113,6 +123,7 @@ help:
 	@echo "bench      benchmark campaign at TIER, one segment per competitor"
 	@echo "bench-resume continue the current benchmark campaign where it stopped"
 	@echo "report     mark the dominated points in RESULTS=<record dir>"
+	@echo "compare    state whether RESULTS reproduced BASELINE, metric by metric"
 	@echo "validate   fmt-check, lint, and the dev tier"
 	@echo "ci         fmt-check, lint, build, and the smoke tier, in a clean container"
 	@echo "ci-validate  validate in a clean container, recorded"
@@ -249,6 +260,26 @@ bench-resume: bench-harness
 report:
 	@test -n "$(RESULTS)" || { echo "make report: set RESULTS=<result file or directory>" >&2; exit 1; }
 	@$(CARGO) run --quiet --release --package entroq-bench -- report pareto --results $(RESULTS)
+
+# The comparison. It reads two recorded campaigns and states, row by row and
+# metric by metric, whether the second reproduced the first.
+#
+# A tolerance is read from the first record, never chosen here. A number that is
+# a property of the bytes has no variance, so any difference in it is a finding.
+# A number that is a timing is judged against the spread the first record states
+# for the block it came from. A number that moves between runs and that no
+# record states a variance for is reported with its difference and no verdict.
+#
+# Like the report it is one command rather than a campaign segment, because it
+# depends on every measurement segment of both campaigns.
+#
+# Standard output is the document and nothing else. The lines a person reads go
+# to standard error.
+
+compare:
+	@test -n "$(BASELINE)" || { echo "make compare: set BASELINE=<the first record>" >&2; exit 1; }
+	@test -n "$(RESULTS)" || { echo "make compare: set RESULTS=<the second record>" >&2; exit 1; }
+	@$(CARGO) run --quiet --release --package entroq-bench -- report compare --baseline $(BASELINE) --results $(RESULTS)
 
 validate: fmt-check lint test
 

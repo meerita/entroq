@@ -59,14 +59,21 @@ fn main() {
 
     let Some(root) = laboratory() else { return };
 
-    let mut linked: Vec<Linked> = Vec::new();
+    // Every manifest is declared before any of them is read, so a manifest that does not
+    // exist yet is still a declared input. A host builds the laboratory with this tool and
+    // links it on the next build, and cargo cannot notice a file appearing that it was never
+    // told to watch. Declaring only the manifests that already exist left a clean host with a
+    // tool that had linked nothing and no reason to build again.
     for codec in CODECS {
-        let version_dir = root.join(codec.name).join(codec.version);
         println!(
             "cargo::rerun-if-changed={}",
-            version_dir.join(MANIFEST).display()
+            manifest_path(&root, codec).display()
         );
-        match resolve(codec, &version_dir) {
+    }
+
+    let mut linked: Vec<Linked> = Vec::new();
+    for codec in CODECS {
+        match resolve(codec, &root.join(codec.name).join(codec.version)) {
             Some(libraries) => linked.extend(libraries),
             None => return,
         }
@@ -75,12 +82,20 @@ fn main() {
     emit(&linked);
 }
 
-/// Where the laboratory sits, as an absolute path.
+/// Where one competitor's manifest sits, whether or not the laboratory holds it yet.
+fn manifest_path(root: &Path, codec: &Codec) -> PathBuf {
+    root.join(codec.name).join(codec.version).join(MANIFEST)
+}
+
+/// Where the laboratory sits, as an absolute path, whether or not it exists yet.
 ///
 /// `LAB` names it, and the default sits beside the repository. Either may be relative, and a
 /// build script runs in its own package directory rather than the repository root, so a
 /// relative path is resolved against the repository root and not against the current
 /// directory. That is the same root the tool itself is invoked from.
+///
+/// A laboratory nobody has built yet still has a path, and that path is what the build
+/// watches for the manifests to appear at.
 fn laboratory() -> Option<PathBuf> {
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
     // tools/bench -> tools -> the repository root.
@@ -91,7 +106,8 @@ fn laboratory() -> Option<PathBuf> {
     } else {
         repository.join(named)
     };
-    resolved.canonicalize().ok()
+    let canonical = resolved.canonicalize().ok();
+    Some(canonical.unwrap_or(resolved))
 }
 
 /// The libraries one competitor's manifest names, when every one of them is present and is

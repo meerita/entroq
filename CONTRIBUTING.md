@@ -123,6 +123,71 @@ To see the registry, including the source, checksum, and license of every entry:
 cargo run --release --package entroq-bench -- corpus list --all
 ```
 
+## The benchmark
+
+The benchmark harness measures every competitor in-process, through the library the
+laboratory built, and writes one machine-readable result per segment. It never runs a
+competitor's command line tool: a process invocation costs milliseconds, the codec work at
+every size class up to the large one costs less, and two of the five competitors publish no
+tool at all.
+
+```sh
+make bench TIER=<tier>    # a benchmark campaign at one tier
+make bench-resume         # continue the current benchmark campaign where it stopped
+```
+
+A campaign at a segmented tier runs one segment per competitor, operating point group, and
+size class. The cost of one operating point spans three orders of magnitude inside one
+project, so the points of a competitor are grouped by cost rather than measured together.
+Zstandard at level 22 and Brotli at q11 each cost more over the large class than every
+cheaper point of the same competitor put together, and each holds a segment of its own.
+
+Each tier means something different, and a lower tier never stands in for a higher one:
+
+| Tier | What it buys |
+|---|---|
+| `smoke` | the harness runs and produces a parseable result; the numbers are ignored |
+| `dev` | one machine, few samples, direction only, never published |
+| `gate` | the full tier corpus, repeated samples, variance reported, gates a milestone |
+| `publication` | a controlled machine, pinned versions, full variance, competitor parity checked |
+
+A number leaves the repository only from a sealed publication-tier record. A dev-tier number
+never appears in a document, a release note, or a comparison claim.
+
+Every metric is reported as measured, with the call that produced it, or as unavailable, with
+the reason. No metric is reported as a zero. Entroq itself has no codec path yet, so every
+result carries an empty Entroq column and says why.
+
+Two reports read what a campaign recorded. Both take a run record directory and read every
+result under it.
+
+```sh
+make report RESULTS=<record dir>                        # mark the dominated points
+make compare BASELINE=<first record> RESULTS=<second>   # did the second reproduce the first
+```
+
+`make report` plots each operating point on every axis that has data and marks every point
+another point dominates. An axis no result carries a number for reports no data with the
+reason, and no other metric stands in its place.
+
+`make compare` states, row by row and metric by metric, whether a second campaign reproduced
+a first one. It reads its tolerance from the first record and chooses none of its own. A
+number that is a property of the bytes has no variance, so any difference in it is a finding.
+A number that is a timing is judged against the spread the first record states for the block
+it came from. A number that moves between runs and that no record states a variance for is
+reported with its difference and no verdict. Two rows are compared only when they measured
+the same bytes, at the same operating point, through the same competitor version, under the
+same integrity setting.
+
+Both reports write the document to standard output and the lines a person reads to standard
+error, so redirecting standard output gives a file a parser reads.
+
+For the tiers, the size classes, the operating point groups, and what each tier licenses:
+
+```sh
+cargo run --release --package entroq-bench -- help
+```
+
 ## Fuzzing
 
 Every parser and every decoder entry point has a fuzz target. A target is declared before
