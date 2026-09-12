@@ -170,6 +170,10 @@ pub enum Corruption {
     RegionPhysicalSize,
     /// The bytes a region holds do not match the sizes its header declared.
     RegionMismatch,
+    /// The frame decoded to a length other than the one it declared.
+    ContentLength,
+    /// A header needs more bytes than the widest form the format defines.
+    HeaderWidth,
 }
 
 impl fmt::Display for Error {
@@ -217,6 +221,8 @@ impl fmt::Display for Corruption {
             Self::RegionLogicalSize => "the region logical size is out of range",
             Self::RegionPhysicalSize => "the region physical size is out of range",
             Self::RegionMismatch => "the region contents contradict its header",
+            Self::ContentLength => "the frame length contradicts its header",
+            Self::HeaderWidth => "a header is wider than the format defines",
         })
     }
 }
@@ -662,7 +668,9 @@ impl Record {
     /// # Errors
     ///
     /// Returns `CorruptData` when the tag is undefined or a region header is out of range,
-    /// and `TruncatedInput` when the input is shorter than the record.
+    /// and `TruncatedInput` when the input is shorter than the record. The truncation count
+    /// is the whole record, tag included, so a caller that waits for it reads a record and
+    /// not a header.
     pub fn decode(input: &[u8], integrity: IntegrityMode) -> Result<(Self, usize), Error> {
         let mut reader = Reader::new(input);
         let short = reader.truncated(RECORD_TAG_BYTES);
@@ -673,7 +681,7 @@ impl Record {
                 let rest = input.get(RECORD_TAG_BYTES..).ok_or(Error::TruncatedInput {
                     needed: RECORD_TAG_BYTES,
                 })?;
-                let (header, used) = RegionHeader::decode(rest, integrity)?;
+                let (header, used) = RegionHeader::decode(rest, integrity).map_err(after_tag)?;
                 let consumed = used
                     .checked_add(RECORD_TAG_BYTES)
                     .ok_or(Error::CorruptData(Corruption::RegionPhysicalSize))?;
@@ -1133,6 +1141,16 @@ const fn shift_left(value: u32, by: u32) -> u32 {
 #[allow(clippy::arithmetic_side_effects)]
 const fn shift_right(value: u32, by: u32) -> u32 {
     value >> by
+}
+
+/// Restates a region-header truncation as the bytes the whole record needs.
+const fn after_tag(error: Error) -> Error {
+    match error {
+        Error::TruncatedInput { needed } => Error::TruncatedInput {
+            needed: needed.saturating_add(RECORD_TAG_BYTES),
+        },
+        other => other,
+    }
 }
 
 fn as_usize(value: u32) -> Result<usize, Error> {
@@ -1935,6 +1953,34 @@ mod tests {
         );
         let block = BlockHeader::raw(true, 1)?;
         assert_eq!(block.encode().len(), BLOCK_HEADER_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn a_short_record_asks_for_the_whole_record_including_its_tag() -> Result<(), Error> {
+        for integrity in INTEGRITY {
+            let region = RegionHeader::new(64, 64, integrity)?;
+            let record = Record::Region(region);
+            let encoded = record.encode();
+            for length in 0..encoded.len() {
+                let short = encoded.as_bytes().get(..length).unwrap_or(&[]);
+                let result = Record::decode(short, integrity);
+                assert!(
+                    matches!(result, Err(Error::TruncatedInput { needed }) if needed > length),
+                    "length {length} gave {result:?}"
+                );
+            }
+            let one_short = encoded
+                .as_bytes()
+                .get(..record.encoded_len().saturating_sub(1))
+                .unwrap_or(&[]);
+            assert_eq!(
+                Record::decode(one_short, integrity),
+                Err(Error::TruncatedInput {
+                    needed: record.encoded_len()
+                })
+            );
+        }
         Ok(())
     }
 

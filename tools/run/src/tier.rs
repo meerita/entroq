@@ -568,11 +568,12 @@ impl Suite {
     pub const fn coverage(self) -> &'static str {
         match self {
             Self::Workspace => {
-                "Workspace gates only. The format contract is the only codec module that \
-                 exists at this revision, so a segment exercises the frame, region, and \
-                 block structure through its unit tests and asserts the error each \
-                 malformed field produces. No segment compresses a byte, no segment \
-                 streams, and no segment fuzzes."
+                "Workspace gates only. The codec carries the format contract and the \
+                 streaming pair that drives it, and no compression, so a segment \
+                 round-trips stored content at every chunk size through its unit tests, \
+                 asserts the error each malformed structure produces, and asserts the \
+                 memory bound each direction declares. No segment compresses a byte and \
+                 no segment fuzzes."
             }
             Self::Lab => {
                 "Competitor laboratory builds only. No segment compresses a byte, and \
