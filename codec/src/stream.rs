@@ -633,14 +633,19 @@ impl Decoder {
                     return Err(self.poisoned(Error::CorruptData(Corruption::RegionMismatch)));
                 };
                 self.region_physical = physical;
-                if u64::from(block.stored_len()) > self.region_physical
+                let payload = match Payload::new(block) {
+                    Ok(payload) => payload,
+                    Err(error) => return Err(self.poisoned(error)),
+                };
+                let stored = u64::try_from(payload.stored_remaining()).unwrap_or(u64::MAX);
+                if stored > self.region_physical
                     || u64::from(block.decoded_len()) > self.region_logical
                 {
                     return Err(self.poisoned(Error::CorruptData(Corruption::RegionMismatch)));
                 }
                 self.reading = Reading::Payload {
                     last: block.last,
-                    payload: Payload::new(block),
+                    payload,
                 };
                 Ok(())
             }

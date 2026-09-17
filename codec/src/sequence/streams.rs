@@ -91,14 +91,15 @@ impl Streams {
 
     /// The four streams one sequence vector codes to.
     ///
-    /// The offset cache starts unset, which is the state a region boundary restores, and a
-    /// match whose distance the slot already names codes the repeat code instead.
+    /// The cache is the caller's, because the slot carries across the blocks of a region and
+    /// is discarded at a region boundary. A match whose distance the slot already names codes
+    /// the repeat code instead, and the slot is updated on every match either way.
     ///
     /// # Errors
     ///
     /// Returns `InvalidParameter` when a value the sequences carry is outside the domain its
     /// alphabet declares, which `Sequences` refuses at construction.
-    pub fn of(sequences: &Sequences) -> Result<Self, Error> {
+    pub fn of(sequences: &Sequences, cache: &mut OffsetCache) -> Result<Self, Error> {
         let mut literal_symbols = Vec::with_capacity(sequences.literals().len());
         for &byte in sequences.literals() {
             literal_symbols.push(u16::from(byte));
@@ -108,7 +109,6 @@ impl Streams {
         let mut runs = Emitter::with_capacity(steps.len());
         let mut lengths = Emitter::with_capacity(steps.len());
         let mut distances = Emitter::with_capacity(steps.len());
-        let mut cache = OffsetCache::reset();
 
         for step in steps {
             runs.emit(Alphabet::LiteralRun, u64::from(step.run))?;
@@ -139,7 +139,9 @@ impl Streams {
     /// The sequence vector the four streams code.
     ///
     /// Every symbol and every suffix here is chosen by whoever wrote the block, so each is
-    /// checked against the alphabet that owns it before anything relies on it.
+    /// checked against the alphabet that owns it before anything relies on it. The cache is
+    /// the caller's, for the reason `of` states, and it is left holding what the last match of
+    /// these streams used.
     ///
     /// # Errors
     ///
@@ -148,7 +150,7 @@ impl Streams {
     /// terminal symbol occurs anywhere but last, or when a repeat code names a slot that names
     /// no distance. Returns `TruncatedInput` when a suffix stream is shorter than the widths
     /// its symbols declare.
-    pub fn sequences(&self) -> Result<Sequences, Error> {
+    pub fn sequences(&self, cache: &mut OffsetCache) -> Result<Sequences, Error> {
         let count = self.literal_run.symbols.len();
         if self.match_length.symbols.len() != count || self.match_distance.symbols.len() > count {
             return Err(Error::CorruptData(Corruption::SequenceCount));
@@ -162,7 +164,6 @@ impl Streams {
         let mut run_bits = BitReader::over(&self.literal_run.suffix);
         let mut length_bits = BitReader::over(&self.match_length.suffix);
         let mut distance_bits = BitReader::over(&self.match_distance.suffix);
-        let mut cache = OffsetCache::reset();
         let mut steps = Vec::with_capacity(count);
         let mut taken = 0usize;
 
@@ -279,6 +280,7 @@ mod tests {
     use super::{Streams, SymbolStream};
     use crate::entropy::bits::{BitBuf, BitWriter, mask};
     use crate::format::{Corruption, Error};
+    use crate::sequence::cache::OffsetCache;
     use crate::sequence::{
         Alphabet, MAX_LITERAL_RUN, MAX_MATCH_LENGTH, MIN_MATCH, Match, Sequences, Step, WINDOW,
     };
@@ -319,9 +321,9 @@ mod tests {
 
     fn round_trip(steps: Vec<Step>, seed: u64) -> Result<Streams, Error> {
         let sequences = Sequences::new(literals_for(&steps, seed), steps)?;
-        let streams = Streams::of(&sequences)?;
+        let streams = Streams::of(&sequences, &mut OffsetCache::reset())?;
         assert_eq!(
-            streams.sequences()?,
+            streams.sequences(&mut OffsetCache::reset())?,
             sequences,
             "the four streams did not decode to the sequences they coded"
         );
@@ -520,7 +522,7 @@ mod tests {
             SymbolStream::new(vec![repeat], empty()),
         );
         assert_eq!(
-            streams.sequences(),
+            streams.sequences(&mut OffsetCache::reset()),
             Err(Error::CorruptData(Corruption::RepeatUnset))
         );
         Ok(())
@@ -543,7 +545,7 @@ mod tests {
             SymbolStream::new(vec![distance], empty()),
         );
         assert_eq!(
-            streams.sequences(),
+            streams.sequences(&mut OffsetCache::reset()),
             Err(Error::CorruptData(Corruption::TerminalSymbol))
         );
 
@@ -554,7 +556,7 @@ mod tests {
             SymbolStream::new(vec![length, terminal], empty()),
             SymbolStream::new(vec![distance], empty()),
         );
-        assert!(streams.sequences().is_ok());
+        assert!(streams.sequences(&mut OffsetCache::reset()).is_ok());
 
         // The terminal carries no suffix and names no length, wherever it is read from.
         assert_eq!(
@@ -582,7 +584,7 @@ mod tests {
                 SymbolStream::new(distances, empty()),
             );
             assert_eq!(
-                streams.sequences(),
+                streams.sequences(&mut OffsetCache::reset()),
                 Err(Error::CorruptData(Corruption::SequenceCount))
             );
         }
@@ -595,7 +597,7 @@ mod tests {
             SymbolStream::new(vec![distance], empty()),
         );
         assert_eq!(
-            streams.sequences(),
+            streams.sequences(&mut OffsetCache::reset()),
             Err(Error::CorruptData(Corruption::SequenceCount))
         );
         Ok(())
@@ -641,7 +643,7 @@ mod tests {
                 SymbolStream::new(distances, empty()),
             );
             assert_eq!(
-                streams.sequences(),
+                streams.sequences(&mut OffsetCache::reset()),
                 Err(Error::CorruptData(Corruption::SequenceSymbol))
             );
         }
@@ -670,7 +672,7 @@ mod tests {
             SymbolStream::default(),
         );
         assert_eq!(
-            streams.sequences(),
+            streams.sequences(&mut OffsetCache::reset()),
             Err(Error::CorruptData(Corruption::SequenceSuffix))
         );
 
@@ -690,7 +692,7 @@ mod tests {
             SymbolStream::default(),
         );
         assert!(matches!(
-            streams.sequences(),
+            streams.sequences(&mut OffsetCache::reset()),
             Err(Error::TruncatedInput { .. })
         ));
 
@@ -712,7 +714,7 @@ mod tests {
             SymbolStream::default(),
         );
         assert_eq!(
-            streams.sequences(),
+            streams.sequences(&mut OffsetCache::reset()),
             Err(Error::CorruptData(Corruption::SequenceExtent))
         );
         Ok(())
@@ -730,7 +732,7 @@ mod tests {
             })
             .collect();
         let sequences = Sequences::new(literals_for(&steps, 41), steps)?;
-        let streams = Streams::of(&sequences)?;
+        let streams = Streams::of(&sequences, &mut OffsetCache::reset())?;
 
         let rebuilt = |alphabet: Alphabet| -> Result<SymbolStream, Error> {
             let stream = streams.stream(alphabet);
@@ -746,7 +748,7 @@ mod tests {
             rebuilt(Alphabet::MatchDistance)?,
         );
         assert_eq!(read, streams);
-        assert_eq!(read.sequences()?, sequences);
+        assert_eq!(read.sequences(&mut OffsetCache::reset())?, sequences);
         Ok(())
     }
 
