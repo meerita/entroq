@@ -383,6 +383,58 @@ impl Sequences {
         Ok(Self { literals, steps })
     }
 
+    /// Empty sequences whose storage is sized once and never grows.
+    ///
+    /// A producer that emits one block after another builds its storage here and reuses it,
+    /// so the steady state costs no allocation per block. The two figures are the block's
+    /// worst cases: every byte a literal, and one step per shortest match.
+    #[must_use]
+    pub fn with_capacity(literal_bytes: usize, steps: usize) -> Self {
+        Self {
+            literals: Vec::with_capacity(literal_bytes),
+            steps: Vec::with_capacity(steps),
+        }
+    }
+
+    /// Empties the sequences and keeps the storage they hold.
+    pub fn clear(&mut self) {
+        self.literals.clear();
+        self.steps.clear();
+    }
+
+    /// Appends one step: the literal bytes its run places, and the match that follows them.
+    ///
+    /// Each step is checked as it arrives, so the invariants `new` checks over a finished
+    /// vector hold over a growing one too: the runs sum to the literal bytes by construction,
+    /// every value is inside its domain, and a step that carries no match is the last step.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParameter` when the run, the length or the distance is outside its
+    /// domain, or when a step follows one that carried no match.
+    pub fn push(&mut self, literals: &[u8], matched: Option<Match>) -> Result<(), Error> {
+        if self.steps.last().is_some_and(|last| last.matched.is_none()) {
+            return Err(Error::InvalidParameter);
+        }
+        let run = u32::try_from(literals.len()).map_err(|_| Error::InvalidParameter)?;
+        if Alphabet::LiteralRun.coded_value(u64::from(run)).is_none() {
+            return Err(Error::InvalidParameter);
+        }
+        if let Some(matched) = matched
+            && (Alphabet::MatchLength
+                .coded_value(u64::from(matched.length))
+                .is_none()
+                || Alphabet::MatchDistance
+                    .coded_value(u64::from(matched.distance))
+                    .is_none())
+        {
+            return Err(Error::InvalidParameter);
+        }
+        self.literals.extend_from_slice(literals);
+        self.steps.push(Step { run, matched });
+        Ok(())
+    }
+
     /// The literal bytes the steps place, in the order the block emits them.
     #[must_use]
     pub fn literals(&self) -> &[u8] {
@@ -494,11 +546,94 @@ const fn narrow_index(value: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Alphabet, MAX_LITERAL_RUN, MAX_MATCH_LENGTH, MIN_MATCH, Sequences, Step, WINDOW,
+        Alphabet, MAX_LITERAL_RUN, MAX_MATCH_LENGTH, MIN_MATCH, Match, Sequences, Step, WINDOW,
         bucket_low, bucket_width,
     };
     use crate::entropy::{MAX_ALPHABET_SIZE, bits::mask};
     use crate::format::{Corruption, Error};
+
+    /// Reused storage holds every invariant a finished vector holds.
+    #[test]
+    fn storage_built_once_refuses_what_the_finished_vector_refuses() -> Result<(), Error> {
+        let mut sequences = Sequences::with_capacity(64, 8);
+        sequences.push(
+            b"abcd",
+            Some(Match {
+                length: MIN_MATCH,
+                distance: 1,
+            }),
+        )?;
+        assert_eq!(sequences.decoded_len(), 8);
+        assert_eq!(sequences.literals(), b"abcd");
+
+        // A step with no match is the last step, and nothing may follow it.
+        sequences.push(b"ef", None)?;
+        assert_eq!(sequences.push(b"gh", None), Err(Error::InvalidParameter));
+        assert_eq!(sequences.decoded_len(), 10);
+
+        // Every value is checked against the domain its alphabet declares.
+        let mut fresh = Sequences::with_capacity(64, 8);
+        for outside in [
+            Match {
+                length: MIN_MATCH.saturating_sub(1),
+                distance: 1,
+            },
+            Match {
+                length: MAX_MATCH_LENGTH.saturating_add(1),
+                distance: 1,
+            },
+            Match {
+                length: MIN_MATCH,
+                distance: 0,
+            },
+            Match {
+                length: MIN_MATCH,
+                distance: WINDOW.saturating_add(1),
+            },
+        ] {
+            assert_eq!(
+                fresh.push(b"", Some(outside)),
+                Err(Error::InvalidParameter),
+                "{outside:?}"
+            );
+        }
+        let long = vec![0u8; MAX_LITERAL_RUN as usize + 1];
+        assert_eq!(fresh.push(&long, None), Err(Error::InvalidParameter));
+
+        // What a refused push left behind is nothing at all.
+        assert!(fresh.steps().is_empty());
+        assert!(fresh.literals().is_empty());
+        Ok(())
+    }
+
+    /// Clearing keeps the storage, which is what makes a producer allocation-free per block.
+    #[test]
+    fn clearing_empties_the_sequences_and_keeps_their_storage() -> Result<(), Error> {
+        let mut sequences = Sequences::with_capacity(4_096, 64);
+        let literals = sequences.literals().as_ptr();
+        for _ in 0..4 {
+            sequences.clear();
+            assert_eq!(sequences.decoded_len(), 0);
+            assert!(sequences.steps().is_empty());
+            sequences.push(
+                b"ab",
+                Some(Match {
+                    length: MIN_MATCH,
+                    distance: 2,
+                }),
+            )?;
+            assert_eq!(sequences.decoded_len(), 6);
+        }
+        assert!(
+            std::ptr::eq(sequences.literals().as_ptr(), literals),
+            "clearing reallocated the literal storage"
+        );
+
+        // A refilled vector is the vector the validating constructor would have accepted.
+        let rebuilt = Sequences::new(sequences.literals().to_vec(), sequences.steps().to_vec())?;
+        assert_eq!(rebuilt, sequences);
+        Ok(())
+    }
 
     /// The sizes the decomposition gives the four alphabets, and the terminal's index.
     ///

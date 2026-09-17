@@ -1,8 +1,13 @@
-//! What the encoder's parse path holds, measured from the allocator rather than stated.
+//! What the encoder's parse path allocates and holds, measured from the allocator rather than
+//! stated.
 //!
 //! An allocator is process wide, so this file is its own test binary and its one test runs the
 //! whole measurement in order. The counters it keeps are per thread, so the figure is what the
 //! encoder held and not what the process held around it.
+//!
+//! The figure is parser-owned allocated bytes. The input fragment is the caller's and is
+//! allocated before the interval begins, so it is not in the figure. Nothing here reads a
+//! resident set, and no claim about resident pages is made from these numbers.
 //!
 //! This file owns no codec behavior. It drives the public API and the allocator and nothing
 //! else.
@@ -171,12 +176,20 @@ fn parse_class(class: &str, total: u64) -> Result<(u64, u64), Error> {
 
 const MIB: u64 = 1_048_576;
 
+/// The allocations one parser makes, whatever the input is.
+///
+/// The head table, the link array, the window buffer, the literal storage and the step
+/// storage: five, all at setup, and none per block.
+const SETUP_ALLOCATIONS: u64 = 5;
+
 #[test]
 fn the_parse_holds_no_more_than_it_declared_and_does_not_grow_with_the_input() -> Result<(), Error>
 {
     let declared = u64::try_from(Parser::declared_bytes(MAX_PARSE_BYTES)).unwrap_or(u64::MAX);
 
-    // The declared bound, on every input class, at one mebibyte each.
+    // The declared bound, on every input class, at one mebibyte each. The parser allocates
+    // once and reuses its storage, so the allocation count is the same on every class and the
+    // same as it is at every length below.
     for class in CLASSES {
         let (held, made) = parse_class(class, MIB)?;
         assert!(
@@ -187,6 +200,10 @@ fn the_parse_holds_no_more_than_it_declared_and_does_not_grow_with_the_input() -
             held >= u64::try_from(Parser::state_bytes()).unwrap_or(0),
             "{class} held {held} bytes, which is less than the state the parser keeps"
         );
+        assert_eq!(
+            made, SETUP_ALLOCATIONS,
+            "{class} allocated {made} times rather than once per buffer at setup"
+        );
         println!("class {class:<16} held {held} of {declared} declared, in {made} allocations");
     }
 
@@ -196,15 +213,19 @@ fn the_parse_holds_no_more_than_it_declared_and_does_not_grow_with_the_input() -
     for length in [MIB, MIB.saturating_mul(4), MIB.saturating_mul(16)] {
         let (held, made) = parse_class("random", length)?;
         println!("length {length:>9} held {held} of {declared} declared, in {made} allocations");
-        curve.push((length, held));
+        curve.push((length, held, made));
     }
     let first = curve.first().map(|point| point.1).unwrap_or_default();
-    for (length, held) in &curve {
+    for (length, held, made) in &curve {
         assert_eq!(
             *held, first,
             "the peak moved with the input length at {length} bytes"
         );
         assert!(*held <= declared, "the peak passed the declared bound");
+        assert_eq!(
+            *made, SETUP_ALLOCATIONS,
+            "the allocation count moved with the input length at {length} bytes"
+        );
     }
     Ok(())
 }

@@ -13,19 +13,25 @@
 //!
 //! # What the parser holds
 //!
-//! The parser owns the window a match reaches into. It is twice the window wide, so one block
-//! of input can be appended without displacing the window the block searches against, and the
-//! slide that makes room moves the buffer and the finder by exactly one window.
+//! The parser owns the window a match reaches into. The buffer is three windows wide, which is
+//! what lets the slide that makes room move by exactly one window and still leave a whole
+//! window of history behind it, whatever block length the caller feeds.
 //!
 //! ```text
-//! head table and link array    327 680 bytes    the finder's, and flat in the input
-//! window buffer                131 072 bytes    two windows
-//! literal bytes                the block        one allocation, sized before the parse
-//! steps                        the block / 4    one allocation, sized before the parse
+//! head table and link array    327 680 bytes    the finder's
+//! window buffer                196 608 bytes    three windows
+//! literal bytes                the block        the block's worst case, every byte a literal
+//! steps                        the block / 4    the block's worst case, one step per match
 //! ```
 //!
-//! Nothing here grows with the length of the input. A caller feeds one block at a time and the
-//! parser's own state is the same size at the first block and at the millionth.
+//! Every one of them is allocated once, when the parser is built. The sequence storage is
+//! emptied and refilled per block rather than allocated per block, so the steady state costs
+//! no allocation at all and the figure above is the same at the first block and at the
+//! millionth.
+//!
+//! The figure is what the parser allocates and holds. It does not count the input fragment,
+//! which the caller owns and passes in, and it is not a resident-set figure: nothing here
+//! measures resident pages.
 //!
 //! # The horizon
 //!
@@ -42,7 +48,7 @@
 
 use crate::format::Error;
 use crate::matchfinder::BoundedHashChain;
-use crate::sequence::{MAX_LITERAL_RUN, MIN_MATCH, Sequences, Step, WINDOW};
+use crate::sequence::{MIN_MATCH, Sequences, Step, WINDOW};
 use crate::simd::Kernel;
 
 /// The input bytes one call may parse.
@@ -51,9 +57,13 @@ use crate::simd::Kernel;
 /// of this length that holds no match at all is still one sequence.
 pub const MAX_PARSE_BYTES: usize = WINDOW as usize;
 
-/// The bytes the parser's buffer holds: the window a match reaches into, and the block that
-/// searches against it.
-const CAPACITY: usize = MAX_PARSE_BYTES.saturating_mul(2);
+/// The bytes the parser's buffer holds.
+///
+/// Three windows. Two would hold a window and a block, but a slide moves by one window exactly
+/// so that every stored position keeps its link slot, and from a buffer of two windows that
+/// leaves only `filled - window` bytes of history behind. At three windows a slide is reached
+/// only above two windows filled, so a whole window always survives it.
+const CAPACITY: usize = MAX_PARSE_BYTES.saturating_mul(3);
 
 /// The bytes the strategy reads ahead of the position it decides at.
 pub const LOOKAHEAD_BYTES: usize = crate::sequence::MAX_MATCH_LENGTH as usize;
@@ -66,6 +76,8 @@ pub struct Parser {
     filled: usize,
     /// The first position of `window` the finder has not been given.
     inserted: usize,
+    /// The sequences of the block last parsed. Emptied and refilled, never reallocated.
+    sequences: Sequences,
 }
 
 impl Default for Parser {
@@ -99,12 +111,16 @@ impl Parser {
         BoundedHashChain::state_bytes().saturating_add(CAPACITY)
     }
 
-    /// The bytes the parser holds while it parses a block of `block_bytes`.
+    /// The bytes the parser allocates and holds, for a block of `block_bytes`.
     ///
-    /// The two vectors a parse returns are sized before it starts and never grow, so this is a
-    /// bound the run meets rather than an estimate it approaches. A block that holds no match
-    /// fills the literal vector exactly; a block of nothing but minimum-length matches fills
-    /// the step vector exactly; no block fills both.
+    /// This is parser-owned allocated memory: every allocation the parser makes, held from the
+    /// moment it is built until it is dropped. It does not count the input fragment, which the
+    /// caller owns and passes in, and it is not a resident-set figure.
+    ///
+    /// Every term is allocated once and none of them grows, so this is a bound the run meets
+    /// rather than an estimate it approaches. A block that holds no match fills the literal
+    /// storage exactly; a block of nothing but minimum-length matches fills the step storage
+    /// exactly; no block fills both.
     #[must_use]
     pub const fn declared_bytes(block_bytes: usize) -> usize {
         Self::state_bytes()
@@ -113,9 +129,16 @@ impl Parser {
     }
 
     /// The bytes a match in the next call may reach back into.
+    ///
+    /// At most one window, because that is the farthest a distance can name. Every byte
+    /// returned survives the slide the next call may perform, so this is what the next block
+    /// can reach and not what the buffer happens to hold.
     #[must_use]
     pub fn history(&self) -> &[u8] {
-        self.window.get(..self.filled).unwrap_or_default()
+        let reach = self.filled.min(MAX_PARSE_BYTES);
+        self.window
+            .get(self.filled.saturating_sub(reach)..self.filled)
+            .unwrap_or_default()
     }
 
     /// Discards the history.
@@ -134,11 +157,14 @@ impl Parser {
     /// The bytes are appended to the history first, so a match may reach back into the blocks
     /// before this one, as far as the window. The sequences decode to exactly `input`.
     ///
+    /// The result borrows the storage the parser reuses, so the next call overwrites it. A
+    /// caller that needs two blocks at once clones the first.
+    ///
     /// # Errors
     ///
     /// Returns `InvalidParameter` when `input` is longer than one call may parse, or when the
     /// sequences the parse produced fall outside the domains the alphabets declare.
-    pub fn parse(&mut self, input: &[u8]) -> Result<Sequences, Error> {
+    pub fn parse(&mut self, input: &[u8]) -> Result<&Sequences, Error> {
         if input.len() > MAX_PARSE_BYTES {
             return Err(Error::InvalidParameter);
         }
@@ -155,14 +181,14 @@ impl Parser {
             finder,
             window,
             inserted,
+            sequences,
             ..
         } = self;
         let Some(data) = window.get(..end) else {
             return Err(Error::InvalidParameter);
         };
 
-        let mut literals = Vec::with_capacity(input.len());
-        let mut steps = Vec::with_capacity(step_capacity(input.len()));
+        sequences.clear();
         let mut run_start = start;
         let mut at = start;
         while at < end {
@@ -178,27 +204,20 @@ impl Parser {
                 at = at.saturating_add(1);
                 continue;
             };
-            let Some(run) = take_run(data, run_start, at, &mut literals) else {
-                return Err(Error::InvalidParameter);
-            };
-            steps.push(Step {
-                run,
-                matched: Some(matched),
-            });
+            let run = data.get(run_start..at).ok_or(Error::InvalidParameter)?;
+            sequences.push(run, Some(matched))?;
             at = at.saturating_add(matched.length as usize);
             run_start = at;
         }
         if run_start < end {
-            let Some(run) = take_run(data, run_start, end, &mut literals) else {
-                return Err(Error::InvalidParameter);
-            };
-            steps.push(Step { run, matched: None });
+            let run = data.get(run_start..end).ok_or(Error::InvalidParameter)?;
+            sequences.push(run, None)?;
         }
         // The last positions of the block were offered to a chain that could not hash them,
         // because the bytes its hash reads were not there yet. The next call holds them, so
         // they are offered again rather than left out of the chain for good.
         *inserted = (*inserted).min(BoundedHashChain::insertable_end(end));
-        Sequences::new(literals, steps)
+        Ok(sequences)
     }
 
     fn of(finder: BoundedHashChain) -> Self {
@@ -207,6 +226,7 @@ impl Parser {
             window: vec![0u8; CAPACITY].into_boxed_slice(),
             filled: 0,
             inserted: 0,
+            sequences: Sequences::with_capacity(MAX_PARSE_BYTES, step_capacity(MAX_PARSE_BYTES)),
         }
     }
 
@@ -225,20 +245,6 @@ impl Parser {
         self.inserted = self.inserted.saturating_sub(window);
         self.finder.slide();
     }
-}
-
-/// Moves the literal bytes of one run into the literal vector and reports its length.
-///
-/// `None` when the run is outside the buffer or is longer than the representation expresses,
-/// neither of which a parse over a block of the declared length can produce.
-fn take_run(data: &[u8], from: usize, to: usize, literals: &mut Vec<u8>) -> Option<u32> {
-    let bytes = data.get(from..to)?;
-    let run = u32::try_from(bytes.len()).ok()?;
-    if run > MAX_LITERAL_RUN {
-        return None;
-    }
-    literals.extend_from_slice(bytes);
-    Some(run)
 }
 
 /// The steps a block of `block_bytes` can hold.
@@ -372,6 +378,7 @@ mod tests {
                 chunk.len() as u64,
                 "a block's sequences decode to the block"
             );
+            let sequences = sequences.clone();
             let (history, room) = out.split_at_mut(done);
             let target = room.get_mut(..chunk.len()).ok_or(Error::InvalidParameter)?;
             expand(&sequences, history, target)?;
@@ -433,7 +440,7 @@ mod tests {
             let mut produced = 0u64;
             for chunk in data.chunks(MAX_PARSE_BYTES) {
                 let sequences = parser.parse(chunk)?;
-                check_domains(&sequences, produced, shape.name());
+                check_domains(sequences, produced, shape.name());
                 produced = produced.saturating_add(sequences.decoded_len());
             }
         }
@@ -480,7 +487,7 @@ mod tests {
         assert!(parser.history().is_empty());
         let mut after = Vec::new();
         for chunk in data.chunks(MAX_PARSE_BYTES) {
-            after.push(parser.parse(chunk)?);
+            after.push(parser.parse(chunk)?.clone());
         }
         assert_eq!(fresh, after, "a reset parser is a fresh parser");
         Ok(())
@@ -496,7 +503,7 @@ mod tests {
                 assert_eq!(parser.kernel(), kernel);
                 let mut produced = Vec::new();
                 for chunk in data.chunks(MAX_PARSE_BYTES) {
-                    produced.push(parser.parse(chunk)?);
+                    produced.push(parser.parse(chunk)?.clone());
                 }
                 match expected {
                     None => expected = Some(produced),
@@ -511,8 +518,8 @@ mod tests {
 
     #[test]
     fn the_declared_bound_states_what_the_parse_holds() {
-        assert_eq!(CAPACITY, 131_072);
-        assert_eq!(Parser::state_bytes(), 458_752);
+        assert_eq!(CAPACITY, 196_608);
+        assert_eq!(Parser::state_bytes(), 524_288);
         assert_eq!(
             Parser::state_bytes(),
             BoundedHashChain::state_bytes().saturating_add(CAPACITY)
@@ -521,7 +528,7 @@ mod tests {
             Parser::declared_bytes(0),
             Parser::state_bytes().saturating_add(16)
         );
-        assert_eq!(Parser::declared_bytes(MAX_PARSE_BYTES), 786_448);
+        assert_eq!(Parser::declared_bytes(MAX_PARSE_BYTES), 851_984);
         assert_eq!(LOOKAHEAD_BYTES, MAX_MATCH_LENGTH as usize);
     }
 
@@ -539,19 +546,55 @@ mod tests {
     }
 
     #[test]
-    fn the_slide_keeps_the_history_a_match_reaches_into() -> Result<(), Error> {
+    fn the_history_is_one_window_of_bytes_the_next_block_can_reach() -> Result<(), Error> {
         let window = WINDOW as usize;
-        let mut parser = Parser::new();
-        for _ in 0..4 {
-            let _ = parser.parse(&noise(window, SEED ^ 0x41))?;
+        // Block lengths that divide the buffer evenly and ones that do not, because a slide
+        // reached from a part-filled buffer is the case that loses history and a slide reached
+        // from a full one is not.
+        for block in [window, 40_000, 1_019] {
+            let mut parser = Parser::new();
+            let mut fed = 0usize;
+            let mut slides = 0usize;
+            // Fed until the slide has been reached twice, and no further: the input the check
+            // needs is what it takes to slide, not a fixed volume.
+            while slides < 2 && fed < CAPACITY.saturating_mul(4) {
+                let promised = parser.history().to_vec();
+                let before = parser.filled;
+                let _ = parser.parse(&noise(block, SEED ^ 0x41))?;
+                fed = fed.saturating_add(block);
+                if parser.filled < before.saturating_add(block) {
+                    slides = slides.saturating_add(1);
+                }
+
+                let history = parser.history();
+                assert!(
+                    history.len() <= window,
+                    "a history of {} bytes at block {block}",
+                    history.len()
+                );
+                assert_eq!(
+                    history.len(),
+                    fed.min(window),
+                    "the history is short of the window at block {block}"
+                );
+
+                // Every byte the history named before this call is still in the buffer
+                // directly before the block just parsed, which is where a match at that
+                // block's first position reaches for it. A slide that dropped a promised byte
+                // shortens or moves this run.
+                let start = parser.filled.saturating_sub(block);
+                let kept = parser
+                    .window
+                    .get(start.saturating_sub(promised.len())..start);
+                assert_eq!(
+                    kept,
+                    Some(promised.as_slice()),
+                    "a slide dropped history the next block was told it could reach, at block \
+                     {block}"
+                );
+            }
+            assert_eq!(slides, 2, "block {block} did not reach the slide twice");
         }
-        assert_eq!(parser.history().len(), CAPACITY);
-        let _ = parser.parse(&noise(window, SEED ^ 0x42))?;
-        assert_eq!(
-            parser.history().len(),
-            CAPACITY,
-            "a slide leaves the window and the block that searches it"
-        );
         Ok(())
     }
 
@@ -559,7 +602,7 @@ mod tests {
         let mut parser = Parser::new();
         let mut out = Vec::new();
         for chunk in data.chunks(MAX_PARSE_BYTES) {
-            out.push(parser.parse(chunk)?);
+            out.push(parser.parse(chunk)?.clone());
         }
         Ok(out)
     }

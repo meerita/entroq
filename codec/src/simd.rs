@@ -18,6 +18,11 @@
 //! The selection is made once, from the target the build was compiled for, and a caller may
 //! force any kernel the build holds. Dispatch changes speed and never bytes, and the
 //! differential test against the oracle is what says so.
+//!
+//! Only one architecture has ranked its kernels. On aarch64 the three were measured against
+//! each other on an Apple M1 Pro and the vector kernel won, so it is the default there. No
+//! other architecture has been measured at all, so the default there is the oracle: it makes
+//! no claim, and the word kernel waits for the measurement that would admit it.
 
 /// Which common-prefix kernel a caller runs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,8 +42,14 @@ pub enum Kernel {
 pub const SELECTED: Kernel = Kernel::Neon;
 
 /// The kernel this build runs unless a caller names another.
+///
+/// The oracle, on a target whose kernels no measurement has ranked. The word kernel is present
+/// and a caller may name it, but nothing has yet compared the two on this architecture, and a
+/// kernel is selected from a measurement rather than from the expectation that what won
+/// elsewhere wins here. Until that measurement exists this target runs the implementation that
+/// claims nothing.
 #[cfg(not(target_arch = "aarch64"))]
-pub const SELECTED: Kernel = Kernel::Word;
+pub const SELECTED: Kernel = Kernel::Scalar;
 
 /// Every kernel this build holds, the oracle first.
 #[cfg(target_arch = "aarch64")]
@@ -138,6 +149,11 @@ pub fn word(data: &[u8], earlier: usize, later: usize, cap: usize) -> usize {
 /// safe formulation this kernel costs 0.63 at a mean matched length near zero and 0.47 at the
 /// length cap, and it beats the word kernel at both ends of the range. Its one loss region is
 /// matches of roughly four to eleven bytes, which is narrow and real.
+///
+/// Those ratios were measured on an Apple M1 Pro, on darwin, at 8 performance cores and a
+/// 128-byte cache line, with no cycle counter available: the figures are wall-clock
+/// nanoseconds per call over 36 workloads at 5 samples each. A ratio between two kernels is
+/// not portable across microarchitectures, and no other part has been measured.
 ///
 /// `vceqq_u8` gives `0xFF` per equal byte and `0x00` per differing one. `vshrn_n_u16` at shift
 /// 4 narrows each 16-bit lane to its low byte after a 4-bit right shift, which leaves one
