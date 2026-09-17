@@ -174,6 +174,22 @@ pub enum Corruption {
     ContentLength,
     /// A header needs more bytes than the widest form the format defines.
     HeaderWidth,
+    /// A table description declares a code longer than the format permits.
+    CodeLength,
+    /// The declared code lengths are not a complete prefix code.
+    KraftSum,
+    /// A table description carries a length count its alphabet does not admit.
+    LengthCount,
+    /// A table description token repeats a value nothing declared, or runs past its alphabet.
+    DescriptionToken,
+    /// A table description declares a table log outside the range the format permits.
+    TableLog,
+    /// The declared frequencies do not sum to the table total they declare.
+    FrequencySum,
+    /// A table description names a symbol outside the alphabet it declares.
+    SymbolAlphabet,
+    /// A coded payload does not decode under the table its block declared.
+    CodedStream,
 }
 
 impl fmt::Display for Error {
@@ -223,6 +239,14 @@ impl fmt::Display for Corruption {
             Self::RegionMismatch => "the region contents contradict its header",
             Self::ContentLength => "the frame length contradicts its header",
             Self::HeaderWidth => "a header is wider than the format defines",
+            Self::CodeLength => "a declared code is longer than the format permits",
+            Self::KraftSum => "the declared code lengths are not a complete prefix code",
+            Self::LengthCount => "the declared length count contradicts the alphabet",
+            Self::DescriptionToken => "a table description token is undefined at its position",
+            Self::TableLog => "the table log is out of range",
+            Self::FrequencySum => "the declared frequencies contradict the table total",
+            Self::SymbolAlphabet => "a declared symbol is outside its alphabet",
+            Self::CodedStream => "a coded payload does not decode under its declared table",
         })
     }
 }

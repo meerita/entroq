@@ -1,12 +1,13 @@
 //! Owns the Entroq codec.
 //!
-//! The crate exports the format contract and the streaming pair that drives it. Every other
-//! module is private until the mechanism it owns is designed and measured.
+//! The crate exports the format contract, the entropy coding the format's tables are declared
+//! and validated through, and the streaming pair that drives them. Every other module is
+//! private until the mechanism it owns is designed and measured.
 
 mod checksum;
 mod decode;
 mod encode;
-mod entropy;
+pub mod entropy;
 pub mod format;
 mod index;
 mod matchfinder;
