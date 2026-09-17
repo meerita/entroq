@@ -35,10 +35,8 @@ pub const SEGMENT_DIR: &str = "ENTROQ_SEGMENT_DIR";
 ///
 /// It is empty because this harness links no Entroq codec. It is stated rather than left
 /// blank, and no zero, no placeholder, and no absent row stands in for it.
-const ENTROQ_ABSENT: &str = "This harness links no Entroq codec at this revision. The \
-encoder and decoder that exist store content without compressing it, so there is no \
-compressed size and no compression work to time, and this result carries no Entroq row. No \
-zero, no placeholder, and no default stands in for one.";
+const ENTROQ_ABSENT: &str = "This harness links no Entroq codec at this revision, so this \
+result carries no Entroq row. No zero, no placeholder, and no default stands in for one.";
 
 /// Builds the document for one segment.
 pub fn document(request: &Request, outcome: &Outcome, produced_at: &str) -> Value {

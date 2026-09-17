@@ -14,9 +14,7 @@ harness_version: 0.0.0
 This page states the measurement laboratory as it exists now.
 
 No Entroq number appears on this page, and none exists anywhere. The harness links no Entroq
-codec, so every Entroq cell below is N/A with the reason. The encoder and decoder that exist
-store content without compressing it, so even linked they would produce no compressed size
-and no compression work to time.
+codec, so every Entroq cell below is N/A with the reason.
 
 The competitor numbers below come from a sealed gate-tier record. The gate tier is not the
 publication tier. Read every number with the scope stated beside it, and read the timing
