@@ -186,6 +186,7 @@ pub struct Emitter {
     tables: block::Encoder,
     payload: Vec<u8>,
     policy: DecoderPolicy,
+    block_bytes: usize,
     statistics: Statistics,
 }
 
@@ -209,6 +210,7 @@ impl Emitter {
             // whole of what this buffer ever holds.
             payload: Vec::with_capacity(block_bytes),
             policy,
+            block_bytes,
             statistics: Statistics::default(),
         })
     }
@@ -219,13 +221,19 @@ impl Emitter {
         self.statistics
     }
 
-    /// The bytes this emitter holds between calls, for blocks of `block_bytes`.
+    /// The bytes this emitter holds between calls.
     ///
-    /// Assembling one block allocates in proportion to that block and frees it before the call
-    /// returns, so it is not in this figure and nothing here grows with the input.
+    /// The parse state and the payload scratch are allocated once and never grow. The tables
+    /// in force are replaced per block and are counted at the ceiling the policy admits, which
+    /// is what bounds them, rather than at whatever the last block left.
+    ///
+    /// This is not the peak. Assembling one block allocates in proportion to that block and
+    /// frees it before the call returns, and those bytes are outside this figure.
     #[must_use]
-    pub const fn state_bytes(block_bytes: usize) -> usize {
-        Parser::declared_bytes(block_bytes).saturating_add(block_bytes)
+    pub fn steady_state_bytes(&self) -> usize {
+        Parser::declared_bytes(self.block_bytes)
+            .saturating_add(self.block_bytes)
+            .saturating_add(usize::try_from(self.policy.max_table_bytes()).unwrap_or(0))
     }
 
     /// Discards everything a region boundary discards: the parse history, the tables in force,
@@ -277,13 +285,14 @@ impl Emitter {
             payload,
             policy,
             statistics,
+            ..
         } = self;
         let sequences = parser.parse(input)?;
         let assembled = tables.assemble_into(
             sequences,
             block::Terms {
                 first_in_region,
-                reuse: block::Reuse::SelfFinancing,
+                repeat: None,
                 ceiling: stored,
             },
             policy,
@@ -617,7 +626,7 @@ mod tests {
                     sequences,
                     block::Terms {
                         first_in_region,
-                        reuse: block::Reuse::SelfFinancing,
+                        repeat: None,
                         ceiling: usize::MAX,
                     },
                     &policy,
@@ -634,7 +643,7 @@ mod tests {
                         sequences,
                         block::Terms {
                             first_in_region,
-                            reuse: block::Reuse::Named(mask),
+                            repeat: Some(mask),
                             ceiling: usize::MAX,
                         },
                         &policy,

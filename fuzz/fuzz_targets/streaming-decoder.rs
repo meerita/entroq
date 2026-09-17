@@ -50,7 +50,7 @@ fuzz_target!(|data: &[u8]| {
     let mut out = vec![0_u8; usize::from(output_byte).saturating_add(1)];
 
     let mut decoder = Decoder::new(DecoderPolicy::CONSERVATIVE);
-    let held = decoder.memory_bytes();
+    let held = decoder.steady_state_bytes();
     let mut at = 0_usize;
     let mut produced = 0_usize;
 
@@ -79,7 +79,7 @@ fuzz_target!(|data: &[u8]| {
 
     let _ = std::hint::black_box(decoder.finish());
     assert_eq!(
-        decoder.memory_bytes(),
+        decoder.steady_state_bytes(),
         held,
         "the decoder grew with the stream"
     );

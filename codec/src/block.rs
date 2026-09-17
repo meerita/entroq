@@ -204,6 +204,8 @@ pub struct Decoder {
     tables: [Option<InForce>; BLOCK_STREAMS],
     cache: OffsetCache,
     tables_built: u64,
+    peak_table_bytes: u64,
+    poison: Option<Error>,
 }
 
 impl Decoder {
@@ -214,13 +216,17 @@ impl Decoder {
             tables: [None, None, None, None],
             cache: OffsetCache::reset(),
             tables_built: 0,
+            peak_table_bytes: 0,
+            poison: None,
         }
     }
 
     /// Discards both histories, which is what a region boundary does to them.
     ///
-    /// The tables this decoder has built are a count of its own work and not a history, so a
-    /// region boundary leaves the count where it is.
+    /// The tables this decoder has built and the widest set it has held are counts of its own
+    /// work and not histories, so a region boundary leaves both where they are. A decoder that
+    /// has failed stays failed: a region boundary is a position in a stream this decoder has
+    /// already refused to read.
     pub fn reset(&mut self) {
         self.tables = [None, None, None, None];
         self.cache = OffsetCache::reset();
@@ -233,6 +239,16 @@ impl Decoder {
     #[must_use]
     pub const fn tables_built(&self) -> u64 {
         self.tables_built
+    }
+
+    /// The widest set of tables this decoder has ever held, over every block it has read.
+    ///
+    /// The figure covers the transition from one block's tables to the next one's and not only
+    /// the state each block settles at, so it is the peak the memory bound is taken over and
+    /// not a figure the decoder passes above on its way to it.
+    #[must_use]
+    pub const fn peak_table_bytes(&self) -> u64 {
+        self.peak_table_bytes
     }
 
     /// The bytes the tables in force occupy together.
@@ -250,6 +266,10 @@ impl Decoder {
     }
 
     /// The distance the offset slot holds, if a match of this region has set it.
+    ///
+    /// The slot is internal state with no caller, and this reads it so that the tests which
+    /// prove it crosses a block and is discarded at a region boundary can see it at all.
+    #[cfg(test)]
     #[must_use]
     pub const fn offset_slot(&self) -> Option<u32> {
         self.cache.slot()
@@ -262,6 +282,12 @@ impl Decoder {
     /// is sized from it, and the tables are built only once the block's whole requirement has
     /// been checked against what this decoder will hold.
     ///
+    /// A decoder that has refused a block is poisoned and answers every later call with the
+    /// same error. The read order commits the tables before it decodes the payloads and moves
+    /// the offset cache only after, so a failure between the two leaves a state no stream
+    /// establishes, and reading on from it would decode against tables and a cache that no
+    /// block put together.
+    ///
     /// # Errors
     ///
     /// Returns `UnsupportedFeature` for a symbol model this build does not implement,
@@ -270,6 +296,32 @@ impl Decoder {
     /// stores at least the bytes it decodes to, and `TruncatedInput` when the stored bytes the
     /// block declares have not arrived.
     pub fn read(
+        &mut self,
+        block: &Block<'_>,
+        policy: &DecoderPolicy,
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
+        if let Some(error) = self.poison {
+            return Err(error);
+        }
+        match self.expand_block(block, policy, out) {
+            Ok(spent) => Ok(spent),
+            Err(error) => {
+                self.poison = Some(error);
+                Err(error)
+            }
+        }
+    }
+
+    /// Reads one block, leaving this decoder in whatever state the failure reached.
+    ///
+    /// A block is read in an order that commits before it decodes: the tables are built once
+    /// the block's whole requirement is admitted, and the offset cache moves only once the
+    /// block has produced every byte it declared. So a failure between the two leaves the
+    /// tables of this block beside the cache of the block before it, which is a state no
+    /// stream establishes. `read` is what makes that state unreachable, by refusing to read
+    /// again from it.
+    fn expand_block(
         &mut self,
         block: &Block<'_>,
         policy: &DecoderPolicy,
@@ -398,9 +450,14 @@ impl Decoder {
     /// Checks the block's requirement and the state this decoder will hold, then builds.
     ///
     /// Both figures come from the descriptions and from the tables already in force, so the
-    /// refusal precedes every allocation the block would size. A superseded table is freed
-    /// before its replacement is built, which is what makes the validated figure the peak and
-    /// not a figure the decoder passes through on its way to it.
+    /// refusal precedes every allocation the block would size.
+    ///
+    /// The build is two passes, and the order is the bound. Every table this block replaces is
+    /// freed before any replacement is built, so the state grows from the tables the block
+    /// keeps to the figure policy admitted and passes above neither. Freeing and building one
+    /// stream at a time would hold a new table beside the old tables of the streams not
+    /// reached yet, and that sum is above the admitted figure whenever a block replaces a small
+    /// table with a large one.
     fn commit(
         &mut self,
         prologue: &BlockPrologue,
@@ -435,15 +492,33 @@ impl Decoder {
         let _admitted = policy.admit_table_bytes(held)?;
 
         for (index, slot) in fresh.iter().enumerate() {
+            if slot.is_none() {
+                continue;
+            }
+            let table = self.tables.get_mut(index).ok_or(Error::InvalidParameter)?;
+            *table = None;
+        }
+        self.observe_peak();
+        for (index, slot) in fresh.iter().enumerate() {
             let Some(admitted) = slot.as_ref() else {
                 continue;
             };
             let table = self.tables.get_mut(index).ok_or(Error::InvalidParameter)?;
-            *table = None;
             *table = Some(admitted.build()?);
             self.tables_built = self.tables_built.saturating_add(1);
+            self.observe_peak();
         }
         Ok(())
+    }
+
+    /// Records the tables in force against the widest set this decoder has ever held.
+    ///
+    /// Called after the tables a block replaces are freed and after each replacement is built,
+    /// so the figure covers the transition and not only the state a block settles at. It is
+    /// four additions and a comparison per table built, which is once per description and not
+    /// once per symbol.
+    fn observe_peak(&mut self) {
+        self.peak_table_bytes = self.peak_table_bytes.max(self.table_bytes());
     }
 }
 
@@ -521,12 +596,12 @@ impl Encoder {
         }
     }
 
-    /// Discards both histories, which is what a region boundary does to them.
-    pub fn reset(&mut self) {
-        *self = Self::at_region_start();
-    }
-
-    /// The bytes the tables in force occupy together.
+    /// The bytes a decoder allocates for the tables this encoder holds in force.
+    ///
+    /// The encoder itself never allocates them; the figure is what the blocks it writes ask a
+    /// decoder for. It reads internal state with no caller, and exists so that the tests which
+    /// hold the encoder to the same ceiling as the decoder can see it.
+    #[cfg(test)]
     #[must_use]
     pub fn table_bytes(&self) -> u64 {
         let mut total = 0u64;
@@ -538,6 +613,11 @@ impl Encoder {
         total
     }
 
+    /// Discards both histories, which is what a region boundary does to them.
+    pub fn reset(&mut self) {
+        *self = Self::at_region_start();
+    }
+
     /// Assembles the payload of one COMPRESSED block into `out`, leaving this encoder unmoved.
     ///
     /// `out` is cleared and filled with the block's stored payload. Nothing here changes the
@@ -545,9 +625,9 @@ impl Encoder {
     /// it discards must leave no trace, because a decoder never sees a candidate. `adopt`
     /// takes the returned assembly when the caller emits it.
     ///
-    /// `reuse` states how a stream may name the table already in force for its class. Which
-    /// streams do is the encoder's choice and not the format's; what the format decides is
-    /// that a block may carry no description for such a stream.
+    /// `terms.repeat` states how a stream may name the table already in force for its class.
+    /// Which streams do is the encoder's choice and not the format's; what the format decides
+    /// is that a block may carry no description for such a stream.
     ///
     /// `ceiling` is the stored length this block must stay below, which is the decoded size a
     /// decoder refuses a COMPRESSED block at. An assembly that does not is answered with
@@ -574,8 +654,8 @@ impl Encoder {
     ) -> Result<Option<Assembly>, Error> {
         let Terms {
             first_in_region,
-            reuse,
             ceiling,
+            ..
         } = terms;
         let mut cache = self.cache;
         let streams = Streams::of(sequences, &mut cache)?;
@@ -583,7 +663,7 @@ impl Encoder {
             .max_table_bytes()
             .checked_div(TABLE_SHARES)
             .ok_or(Error::InvalidParameter)?;
-        let assembled = self.code(&streams, first_in_region, reuse, share)?;
+        let assembled = self.code(&streams, first_in_region, terms, share)?;
 
         let mut held = 0u64;
         for (index, built) in assembled.fresh.iter().enumerate() {
@@ -651,7 +731,7 @@ impl Encoder {
         &self,
         streams: &Streams,
         first_in_region: bool,
-        reuse: Reuse,
+        terms: Terms,
         share: u64,
     ) -> Result<Assembled, Error> {
         let mut assembled = Assembled::default();
@@ -668,7 +748,7 @@ impl Encoder {
             let (coder, alphabet) = class_of(index)?;
             let stream = streams.stream(alphabet);
             let symbols = stream.symbols();
-            let named = reuse.names(index);
+            let named = terms.names(index);
             prologue.counts = spend(
                 prologue.counts,
                 index,
@@ -691,21 +771,19 @@ impl Encoder {
             } else {
                 self.tables.get(index).and_then(Option::as_ref)
             };
-            let written = match reuse {
-                Reuse::Named(_) if named => {
-                    let held = in_force.ok_or(Error::InvalidParameter)?;
-                    Coded {
-                        description: BitWriter::new().finish(),
-                        payload: held.write(symbols)?,
-                        built: held.clone(),
-                        repeats: true,
-                    }
+            let written = if named {
+                let held = in_force.ok_or(Error::InvalidParameter)?;
+                Coded {
+                    description: BitWriter::new().finish(),
+                    payload: held.write(symbols)?,
+                    built: held.clone(),
+                    repeats: true,
                 }
-                Reuse::Named(_) => Self::fresh(coder, alphabet, symbols, share)?,
-                Reuse::SelfFinancing => {
-                    let fresh = Self::fresh(coder, alphabet, symbols, share)?;
-                    Self::cheaper(fresh, in_force, symbols)?
-                }
+            } else if terms.repeat.is_some() {
+                Self::fresh(coder, alphabet, symbols, share)?
+            } else {
+                let fresh = Self::fresh(coder, alphabet, symbols, share)?;
+                Self::cheaper(fresh, in_force, symbols)?
             };
 
             if written.repeats {
@@ -785,29 +863,22 @@ impl Encoder {
 pub struct Terms {
     /// Whether this is the first block of its region, where the mode field is absent.
     pub first_in_region: bool,
-    /// How this block's streams may name the table already in force for their class.
-    pub reuse: Reuse,
+    /// The streams that name the table already in force for their class, whatever it costs
+    /// them, or `None` for the trigger that names one only when it spends fewer bits.
+    ///
+    /// No shipped path names a stream. The field exists so that the gate which holds the
+    /// trigger against every mask a block admits can assemble those masks.
+    pub repeat: Option<[bool; BLOCK_STREAMS]>,
     /// The stored length this block must stay below, which is the decoded size a decoder
     /// refuses a COMPRESSED block at.
     pub ceiling: usize,
 }
 
-/// How a block's streams may name the table already in force for their class.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Reuse {
-    /// A stream names the table in force when doing so spends fewer bits than a fresh one.
-    SelfFinancing,
-    /// The named streams name the table in force, whatever it costs them.
-    Named([bool; BLOCK_STREAMS]),
-}
-
-impl Reuse {
-    /// Whether this rule names one stream outright.
-    fn names(self, stream: usize) -> bool {
-        match self {
-            Self::SelfFinancing => false,
-            Self::Named(mask) => mask.get(stream).copied().unwrap_or(false),
-        }
+impl Terms {
+    /// Whether the caller named one stream outright.
+    fn names(&self, stream: usize) -> bool {
+        self.repeat
+            .is_some_and(|mask| mask.get(stream).copied().unwrap_or(false))
     }
 }
 
@@ -913,7 +984,7 @@ fn frequencies(symbols: &[u16], alphabet: Alphabet) -> Result<Vec<u64>, Error> {
 /// produced before this block, and `out` is what this block has produced so far. Every step is
 /// checked against the block's remaining decoded bytes and against the bytes the region holds,
 /// so nothing here reaches past either.
-pub(crate) fn expand(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(), Error> {
+pub fn expand(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(), Error> {
     let literals = sequences.literals();
     let mut taken = 0usize;
     let mut written = 0usize;
@@ -981,7 +1052,8 @@ pub(crate) fn expand(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{Block, Decoder, Encoder, Reuse, Terms};
+    use super::{Block, Decoder, Encoder, Terms, huffman};
+    use crate::entropy::bits::{BitBuf, BitReader, BitWriter};
     use crate::format::{
         BLOCK_MODEL_V1, BLOCK_STREAMS, BlockPrologue, Corruption, DecoderPolicy, Error, Feature,
         LITERAL_BYTE_STREAM, LITERAL_RUN_STREAM, MATCH_DISTANCE_STREAM, MATCH_LENGTH_STREAM,
@@ -1190,7 +1262,7 @@ mod tests {
                 sequences,
                 Terms {
                     first_in_region,
-                    reuse: Reuse::Named(repeat),
+                    repeat: Some(repeat),
                     ceiling: usize::MAX,
                 },
                 &DecoderPolicy::CONSERVATIVE,
@@ -1217,7 +1289,7 @@ mod tests {
                 &plan.sequences,
                 Terms {
                     first_in_region,
-                    reuse: Reuse::Named(repeat),
+                    repeat: Some(repeat),
                     ceiling: usize::MAX,
                 },
                 &policy,
@@ -1237,6 +1309,12 @@ mod tests {
             spent,
             payload.len(),
             "the block spent other than its payload"
+        );
+        assert!(
+            decoder.peak_table_bytes() <= policy.max_table_bytes(),
+            "the decoder held {} table bytes against a ceiling of {}",
+            decoder.peak_table_bytes(),
+            policy.max_table_bytes()
         );
         assert_eq!(out, plan.content, "the block did not decode to its content");
         Ok(payload)
@@ -1317,7 +1395,7 @@ mod tests {
                         &plan.sequences,
                         Terms {
                             first_in_region: true,
-                            reuse: Reuse::Named(FRESH),
+                            repeat: Some(FRESH),
                             ceiling: usize::MAX,
                         },
                         &DecoderPolicy::CONSERVATIVE,
@@ -1380,6 +1458,178 @@ mod tests {
         Ok(())
     }
 
+    /// A literal code whose decode table is wider than a quarter of the version 1 ceiling.
+    ///
+    /// The encoder never builds one, because it gives each class a quarter share. A decoder
+    /// admits one, because what it holds a block to is the sum over the four classes. So this
+    /// is a table only a stream a caller did not write can ask for.
+    fn wide_literal_code() -> Result<huffman::Code, Error> {
+        let mut counts = vec![0_u64; 256];
+        let (mut a, mut b) = (1_u64, 1_u64);
+        for symbol in 0..15_usize {
+            let slot = counts.get_mut(symbol).ok_or(Error::InvalidParameter)?;
+            *slot = a;
+            let next = a.saturating_add(b);
+            a = b;
+            b = next;
+        }
+        huffman::Code::build(&counts, 256, 15)
+    }
+
+    /// Rebuilds a block's stored body with one description replaced, restating the prologue.
+    fn with_description(
+        payload: &[u8],
+        first_in_region: bool,
+        index: usize,
+        description: &BitBuf,
+        table_bytes: u64,
+    ) -> Result<Vec<u8>, Error> {
+        let policy = DecoderPolicy::CONSERVATIVE;
+        let (mut prologue, used) =
+            BlockPrologue::decode(payload, u32::MAX, first_in_region, &policy)?;
+        let body = payload.get(used..).ok_or(Error::InvalidParameter)?;
+        let mut at = 0_usize;
+        let descriptions = super::locate(&prologue.description_bits, &mut at)?;
+        let payloads = super::locate(&prologue.payload_bits, &mut at)?;
+        let suffixes = super::locate(&prologue.suffix_bits, &mut at)?;
+
+        let slot = prologue
+            .description_bits
+            .get_mut(index)
+            .ok_or(Error::InvalidParameter)?;
+        *slot = description.bits();
+        prologue.table_bytes = table_bytes;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(prologue.encode(first_in_region).as_bytes());
+        for (lane, span) in descriptions.iter().enumerate() {
+            if lane == index {
+                out.extend_from_slice(description.bytes());
+            } else {
+                out.extend_from_slice(span.of(body)?);
+            }
+        }
+        for span in &payloads {
+            out.extend_from_slice(span.of(body)?);
+        }
+        for span in &suffixes {
+            out.extend_from_slice(span.of(body)?);
+        }
+        Ok(out)
+    }
+
+    /// The table bound is taken over the transition and not only over the state a block
+    /// settles at.
+    ///
+    /// The first block leaves three tables of a quarter share each and no literal table. The
+    /// second replaces all four, and its literal table alone is half the ceiling. Both states
+    /// are inside the ceiling; a decoder that freed and built one stream at a time would hold
+    /// the new literal table beside the three tables it had not reached yet, which is above it.
+    #[test]
+    fn the_table_bound_covers_the_transition_between_two_blocks() -> Result<(), Error> {
+        let policy = DecoderPolicy::CONSERVATIVE;
+        let history: Vec<u8> = (0..4_096_u32)
+            .map(|at| u8::try_from(at & 0xFF).unwrap_or(0))
+            .collect();
+        let matches = Shape {
+            run: 0,
+            length: MIN_MATCH,
+            distance: 64,
+            alphabet: 256,
+        };
+        let mut encoder = Encoder::at_region_start();
+        let mut decoder = Decoder::at_region_start();
+        let first = plan(matches, 65_536, &history, 71).ok_or(Error::InvalidParameter)?;
+        let _first = round_trip(&first, &history, true, FRESH, &mut encoder, &mut decoder)?;
+        assert_eq!(
+            decoder.table_bytes(),
+            49_152,
+            "the first block was meant to leave three tables of a quarter share and no literal one"
+        );
+
+        let mut region = history.clone();
+        region.extend_from_slice(&first.content);
+        let mixed = Shape {
+            run: 4,
+            length: 8,
+            distance: 64,
+            alphabet: 64,
+        };
+        let next = plan(mixed, 2_048, &region, 72).ok_or(Error::InvalidParameter)?;
+        let mut payload = Vec::new();
+        let assembly = encoder
+            .assemble_into(
+                &next.sequences,
+                Terms {
+                    first_in_region: false,
+                    repeat: Some(FRESH),
+                    ceiling: usize::MAX,
+                },
+                &policy,
+                &mut payload,
+            )?
+            .ok_or(Error::InvalidParameter)?;
+        encoder.adopt(assembly);
+
+        let (prologue, used) = BlockPrologue::decode(
+            &payload,
+            u32::try_from(next.content.len()).map_err(|_| Error::InvalidParameter)?,
+            false,
+            &policy,
+        )?;
+        let body = payload.get(used..).ok_or(Error::InvalidParameter)?;
+        let mut at = 0_usize;
+        let descriptions = super::locate(&prologue.description_bits, &mut at)?;
+        let span = descriptions
+            .get(LITERAL_BYTE_STREAM)
+            .ok_or(Error::InvalidParameter)?;
+        let mut reader = BitReader::new(span.of(body)?, span.bits);
+        let narrow = huffman::Declared::parse(&mut reader, 256)?
+            .validate()?
+            .table_bytes();
+
+        let wide = wide_literal_code()?;
+        assert_eq!(wide.table_bytes(), 32_768);
+        let mut writer = BitWriter::new();
+        wide.describe(&mut writer);
+        let declared = prologue
+            .table_bytes
+            .saturating_sub(narrow)
+            .saturating_add(wide.table_bytes());
+        assert!(
+            declared <= policy.max_table_bytes(),
+            "the edited block was meant to declare a figure policy admits, and declares {declared}"
+        );
+
+        let edited = with_description(
+            &payload,
+            false,
+            LITERAL_BYTE_STREAM,
+            &writer.finish(),
+            declared,
+        )?;
+        let mut out = vec![0_u8; next.content.len()];
+        let block = Block {
+            arrived: &edited,
+            declared: u64::try_from(edited.len()).unwrap_or(u64::MAX),
+            first_in_region: false,
+            history: &region,
+        };
+        let _read = decoder.read(&block, &policy, &mut out);
+
+        assert!(
+            decoder.peak_table_bytes() > decoder.table_bytes(),
+            "the peak did not cover a transition the final state does not show"
+        );
+        assert!(
+            decoder.peak_table_bytes() <= policy.max_table_bytes(),
+            "the decoder held {} table bytes against a ceiling of {}",
+            decoder.peak_table_bytes(),
+            policy.max_table_bytes()
+        );
+        Ok(())
+    }
+
     /// The expansion bound: a block that stores at least what it decodes to is refused, and
     /// the refusal precedes every allocation the block would size.
     #[test]
@@ -1399,7 +1649,7 @@ mod tests {
                 &plan.sequences,
                 Terms {
                     first_in_region: true,
-                    reuse: Reuse::Named(FRESH),
+                    repeat: Some(FRESH),
                     ceiling: usize::MAX,
                 },
                 &DecoderPolicy::CONSERVATIVE,
@@ -1419,7 +1669,7 @@ mod tests {
                     &plan.sequences,
                     Terms {
                         first_in_region: true,
-                        reuse: Reuse::Named(FRESH),
+                        repeat: Some(FRESH),
                         ceiling: plan.content.len(),
                     },
                     &DecoderPolicy::CONSERVATIVE,
@@ -1475,7 +1725,7 @@ mod tests {
             &next.sequences,
             Terms {
                 first_in_region: false,
-                reuse: Reuse::Named(FRESH),
+                repeat: Some(FRESH),
                 ceiling: usize::MAX,
             },
             &policy,
@@ -1487,7 +1737,7 @@ mod tests {
                 &next.sequences,
                 Terms {
                     first_in_region: false,
-                    reuse: Reuse::SelfFinancing,
+                    repeat: None,
                     ceiling: usize::MAX,
                 },
                 &policy,
@@ -1569,7 +1819,7 @@ mod tests {
                 &next.sequences,
                 Terms {
                     first_in_region: false,
-                    reuse: Reuse::SelfFinancing,
+                    repeat: None,
                     ceiling: usize::MAX,
                 },
                 &policy,

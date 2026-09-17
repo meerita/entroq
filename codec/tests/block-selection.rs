@@ -204,6 +204,15 @@ fn decode(
         }
     }
     decoder.finish()?;
+    // The tables in force cross the blocks of a region and the tables of one block are held
+    // while it decodes, so the figure the ceiling has to cover is the widest set held at once
+    // and not the set any one block declared.
+    assert!(
+        decoder.peak_table_bytes() <= policy.max_table_bytes(),
+        "the decoder held {} table bytes against a ceiling of {}",
+        decoder.peak_table_bytes(),
+        policy.max_table_bytes()
+    );
     Ok(out)
 }
 
@@ -613,10 +622,10 @@ fn a_policy_that_admits_no_compressed_block_holds_no_buffers_for_one() -> Result
     let bare = Decoder::new(raw_only);
     let ready = Decoder::new(permissive());
     assert!(
-        bare.memory_bytes() < ready.memory_bytes(),
+        bare.steady_state_bytes() < ready.steady_state_bytes(),
         "a decoder that admits no compressed block held {} bytes against {}",
-        bare.memory_bytes(),
-        ready.memory_bytes()
+        bare.steady_state_bytes(),
+        ready.steady_state_bytes()
     );
 
     let plain = Class::Incompressible.content(40_000);

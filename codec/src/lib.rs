@@ -2,12 +2,17 @@
 //!
 //! The crate exports the format contract, the entropy coding the format's tables are declared
 //! and validated through, the sequence representation their symbols are drawn from, the
-//! compressed block that carries all three, the match finder and the parser that produce the
-//! sequences, the kernel dispatch the finder runs on, and the streaming pair that compresses
-//! through every block type the format defines and reads every one back. Every other module is
-//! private until the mechanism it owns is designed and measured.
+//! match finder and the parser that produce the sequences, the kernel dispatch the finder runs
+//! on, and the streaming pair that compresses through every block type the format defines and
+//! reads every one back. Every other module is private until the mechanism it owns is designed
+//! and measured.
+//!
+//! The compressed block is not among them. It carries three mechanisms whose state crosses the
+//! blocks of a region, and a caller that drove it directly would own invariants the streaming
+//! pair already holds. The streaming pair is the only thing that drives it, and the statistics
+//! a caller reads about it are on the streaming pair.
 
-pub mod block;
+mod block;
 mod checksum;
 mod decode;
 mod encode;

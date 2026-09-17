@@ -145,8 +145,8 @@ pub fn point(logical_bytes: u64) -> Result<Point> {
 
     let elapsed = started.elapsed();
     let interval = opened.until(alloc::counts());
-    let encoder_bytes = u64::try_from(encoder.memory_bytes()).unwrap_or(0);
-    let decoder_bytes = u64::try_from(decoder.memory_bytes()).unwrap_or(0);
+    let encoder_bytes = u64::try_from(encoder.steady_state_bytes()).unwrap_or(0);
+    let decoder_bytes = u64::try_from(decoder.steady_state_bytes()).unwrap_or(0);
 
     if run.checked != logical_bytes {
         return Err(Error::child(format!(

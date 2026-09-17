@@ -86,7 +86,7 @@ enum Closing {
 /// its blocks occupy and a compressed block does not know its stored length until it exists.
 ///
 /// The memory the encoder holds is one region of input, the blocks that region assembles to,
-/// the encoder state one block needs, and one header scratch. `memory_bytes` states it.
+/// the encoder state one block needs, and one header scratch. `steady_state_bytes` states it.
 /// Nothing is held after construction that was not allocated there.
 pub struct Encoder {
     header: FrameHeader,
@@ -131,7 +131,9 @@ impl Encoder {
             return Err(Error::InvalidParameter);
         }
         let layout = Layout::new(region_bytes, block_bytes)?;
-        let emitter = Emitter::new(DecoderPolicy::CONSERVATIVE, block_bytes)?;
+        // The layout is the one authority on how long a block is, so the emitter is sized from
+        // what it settled on rather than from the parameter beside it.
+        let emitter = Emitter::new(DecoderPolicy::CONSERVATIVE, layout.block_bytes())?;
         let physical = usize::try_from(layout.physical_bytes(region_bytes)?)
             .map_err(|_| Error::InvalidParameter)?;
         Ok(Self {
@@ -151,18 +153,23 @@ impl Encoder {
         })
     }
 
-    /// The bytes this encoder holds, beyond the buffers the caller passes it.
+    /// The bytes this encoder holds between calls, beyond the buffers the caller passes it.
     ///
-    /// The value is fixed at construction and does not move with the input. Assembling one
-    /// block allocates in proportion to that block and frees it before the call returns, so it
-    /// is not in this figure.
+    /// One region of staged input, the blocks that region assembles to, the parse state, the
+    /// payload scratch, the tables in force at the ceiling that bounds them, and one header
+    /// scratch. The figure does not move with the input.
+    ///
+    /// **This is not the peak.** Assembling one block allocates a buffer per coded section and
+    /// per table it builds, in proportion to that block, and frees them before the call
+    /// returns. Those bytes are real peak memory and they are outside this figure. The peak is
+    /// measured rather than declared, because no mode declares a bound yet and a figure that
+    /// was not measured would not be one.
     #[must_use]
-    pub fn memory_bytes(&self) -> usize {
-        let block_bytes = usize::try_from(self.layout.block_bytes()).unwrap_or(0);
+    pub fn steady_state_bytes(&self) -> usize {
         self.staged
             .capacity()
             .saturating_add(self.blocks.capacity())
-            .saturating_add(Emitter::state_bytes(block_bytes))
+            .saturating_add(self.emitter.steady_state_bytes())
             .saturating_add(SCRATCH_BYTES)
     }
 
@@ -546,13 +553,19 @@ impl Decoder {
         }
     }
 
-    /// The bytes this decoder holds, beyond the buffers the caller passes it.
+    /// The bytes this decoder holds between calls, beyond the buffers the caller passes it.
     ///
-    /// The header scratch and the two content buffers are fixed at construction. The tables a
-    /// COMPRESSED block builds are on top of it and are bounded by the table memory the policy
-    /// admits, which is the figure a block declares and this decoder refuses it against.
+    /// The header scratch and the two content buffers are fixed at construction. The tables in
+    /// force are counted at the table memory the policy admits, which is the figure this
+    /// decoder refuses a block against and therefore what bounds them.
+    ///
+    /// **This is not the peak.** Reading one COMPRESSED block allocates a symbol vector per
+    /// stream and a copy of each suffix section, in proportion to that block, and frees them
+    /// before the call returns. Those bytes are real peak memory and they are outside this
+    /// figure. The peak is measured rather than declared, because no mode declares a bound yet
+    /// and a figure that was not measured would not be one.
     #[must_use]
-    pub fn memory_bytes(&self) -> usize {
+    pub fn steady_state_bytes(&self) -> usize {
         SCRATCH_BYTES
             .saturating_add(self.stored.capacity())
             .saturating_add(self.window.capacity())
@@ -563,6 +576,27 @@ impl Decoder {
     #[must_use]
     pub const fn header(&self) -> Option<FrameHeader> {
         self.header
+    }
+
+    /// The decode tables this decoder has built, over every block of every region it has read.
+    ///
+    /// A count and not a time. It is what makes the position of a refusal measurable: a block
+    /// refused before the commitment point leaves it where it was.
+    #[must_use]
+    pub const fn tables_built(&self) -> u64 {
+        self.tables.tables_built()
+    }
+
+    /// The widest set of decode tables this decoder has held at once.
+    ///
+    /// The tables of one block are held while the block decodes, and the tables of the streams
+    /// a block does not code stay in force across it, so the figure is neither one block's
+    /// declaration nor the state a block settles at. It covers the transition from one block's
+    /// tables to the next one's, which is the point a decoder holds the most, and it never
+    /// rises above the table memory the policy admits.
+    #[must_use]
+    pub const fn peak_table_bytes(&self) -> u64 {
+        self.tables.peak_table_bytes()
     }
 
     /// Takes compressed input and writes decoded output.
@@ -1019,13 +1053,13 @@ mod tests {
     use super::{
         DEFAULT_BLOCK_BYTES, DEFAULT_REGION_BYTES, Decoder, Encoder, Progress, StreamState,
     };
-    use crate::encode::Emitter;
     use crate::entropy;
     use crate::format::{
         BLOCK_HEADER_BYTES, BlockHeader, Corruption, DEFAULT_MAX_BLOCK_BYTES, DecoderPolicy, Error,
         Feature, FrameHeader, IntegrityMode, Record, RegionHeader, RegionIndependence,
         ResourceClass,
     };
+    use crate::parser::Parser;
 
     /// The layout the malformed-structure fixtures are built on.
     ///
@@ -1685,7 +1719,7 @@ mod tests {
     }
 
     #[test]
-    fn the_declared_memory_bound_holds_across_a_decade_of_input_sizes() -> Result<(), Error> {
+    fn the_steady_state_figure_holds_across_a_decade_of_input_sizes() -> Result<(), Error> {
         let header = FrameHeader::new(
             ResourceClass::Small,
             RegionIndependence::Independent,
@@ -1701,21 +1735,24 @@ mod tests {
         }
         let first = bounds.first().copied().ok_or(Error::InvalidParameter)?;
         for bound in &bounds {
-            assert_eq!(*bound, first, "the bound moved with the input size");
+            assert_eq!(*bound, first, "the steady state moved with the input size");
         }
         let block_bytes = usize::try_from(DEFAULT_BLOCK_BYTES).unwrap_or(0);
         let region_blocks = DEFAULT_REGION_BYTES
             .div_ceil(block_bytes)
             .saturating_mul(BLOCK_HEADER_BYTES);
+        let tables = usize::try_from(entropy::MAX_BLOCK_TABLE_BYTES).unwrap_or(0);
         let encoder = DEFAULT_REGION_BYTES
             .saturating_add(DEFAULT_REGION_BYTES.saturating_add(region_blocks))
-            .saturating_add(Emitter::state_bytes(block_bytes))
+            .saturating_add(Parser::declared_bytes(block_bytes))
+            .saturating_add(block_bytes)
+            .saturating_add(tables)
             .saturating_add(super::SCRATCH_BYTES);
         let admitted = usize::try_from(DEFAULT_MAX_BLOCK_BYTES).unwrap_or(0);
         let decoder = super::SCRATCH_BYTES
             .saturating_add(admitted)
             .saturating_add(admitted.saturating_add(super::DECODER_WINDOW_SLACK))
-            .saturating_add(usize::try_from(entropy::MAX_BLOCK_TABLE_BYTES).unwrap_or(0));
+            .saturating_add(tables);
         assert_eq!(first, (encoder, decoder));
         Ok(())
     }
@@ -1729,7 +1766,7 @@ mod tests {
 
         let mut encoder = Encoder::new(header)?;
         let mut decoder = Decoder::new(permissive());
-        let bound = (encoder.memory_bytes(), decoder.memory_bytes());
+        let bound = (encoder.steady_state_bytes(), decoder.steady_state_bytes());
 
         let mut input = vec![0_u8; CHUNK];
         let mut coded = vec![0_u8; CHUNK];
@@ -1760,7 +1797,7 @@ mod tests {
                 )?;
             }
             fed = fed.saturating_add(span);
-            assert_eq!(encoder.memory_bytes(), bound.0, "the encoder grew");
+            assert_eq!(encoder.steady_state_bytes(), bound.0, "the encoder grew");
         }
         loop {
             let progress = encoder.finish(&mut coded)?;
@@ -1794,8 +1831,8 @@ mod tests {
             checked,
             u64::try_from(total).map_err(|_| Error::InvalidParameter)?
         );
-        assert_eq!(encoder.memory_bytes(), bound.0, "the encoder grew");
-        assert_eq!(decoder.memory_bytes(), bound.1, "the decoder grew");
+        assert_eq!(encoder.steady_state_bytes(), bound.0, "the encoder grew");
+        assert_eq!(decoder.steady_state_bytes(), bound.1, "the decoder grew");
         Ok(bound)
     }
 
