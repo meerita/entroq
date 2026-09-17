@@ -72,9 +72,10 @@
 #           Default:  ../runs
 #
 #   VECTORS The directory the two cross-architecture lanes write their format
-#           vectors into. `skeleton` reads it. It is outside the repository on
-#           purpose: the repository carries code, not evidence.
-#           Scope:    skeleton, skeleton-prepare, skeleton-resume.
+#           vectors into. `skeleton` reads it, and `fuzz-seed` writes one more
+#           set under it to seed from. It is outside the repository on purpose:
+#           the repository carries code, not evidence.
+#           Scope:    skeleton, skeleton-prepare, skeleton-resume, fuzz-seed.
 #           Required: no.
 #           Default:  $(RUNS)/byteorder
 #
@@ -112,7 +113,7 @@ PLATFORM ?=
 # Repository tooling, versioned with the code whose gates it runs.
 RUNNER = $(CARGO) run --quiet --release --package entroq-run --
 
-.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume skeleton-prepare skeleton skeleton-resume lab lab-resume corpus corpus-resume fuzz-list fuzz-driver fuzz bench-harness bench bench-resume report compare validate ci ci-validate clean
+.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume skeleton-prepare skeleton skeleton-resume lab lab-resume corpus corpus-resume fuzz-list fuzz-driver fuzz fuzz-seed bench-harness bench bench-resume report compare validate ci ci-validate clean
 
 help:
 	@echo "build      compile the workspace"
@@ -132,6 +133,7 @@ help:
 	@echo "corpus-resume  continue the current corpus campaign where it stopped"
 	@echo "fuzz-list  list every fuzz target and whether a driver exists for it"
 	@echo "fuzz       advance one fuzz target by one bounded segment (TARGET=<name>)"
+	@echo "fuzz-seed  seed the stream-reading fuzz targets from the format vectors"
 	@echo "bench      benchmark campaign at TIER, one segment per competitor"
 	@echo "bench-resume continue the current benchmark campaign where it stopped"
 	@echo "report     mark the dominated points in RESULTS=<record dir>"
@@ -187,8 +189,7 @@ gate-resume:
 skeleton-prepare:
 	$(CARGO) test --release --quiet --package codec --test skeleton --no-run
 	$(CARGO) build --quiet --release --package entroq-proof
-	$(RUNNER) fuzz build --target frame-parser
-	$(RUNNER) fuzz build --target streaming-decoder
+	$(RUNNER) fuzz prepare
 	VECTORS=$(VECTORS) PLATFORM=$(PLATFORM) ci/byteorder.sh prepare
 
 skeleton: skeleton-prepare
@@ -255,6 +256,24 @@ fuzz-driver:
 fuzz: fuzz-driver
 	$(RUNNER) fuzz run --target $(TARGET) --runs $(RUNS)
 
+# The seed. The format vector catalog is the only set of streams the project
+# produces that reaches every structure the format defines, so it is what the
+# two targets whose input is a whole stream start from.
+#
+# Seeding adds and never removes. A corpus file the catalog already seeded is
+# left alone, because the corpus holds what libFuzzer derived from it too.
+#
+# The other targets read a description, a block payload, or content, and a
+# whole frame is none of those. Each of them starts from the corpus its own
+# segments accumulate.
+
+fuzz-seed:
+	$(CARGO) build --quiet --release --package entroq-proof
+	$(CARGO) run --quiet --release --package entroq-proof -- \
+	    vectors --out $(VECTORS)/seed
+	$(RUNNER) fuzz seed --target frame-parser --from $(VECTORS)/seed --runs $(RUNS)
+	$(RUNNER) fuzz seed --target streaming-decoder --from $(VECTORS)/seed --runs $(RUNS)
+
 # The benchmark. One segment per competitor, and one per competitor, operating
 # point group, and size class at a segmented tier, so a segment holds one budget
 # and a resumed campaign re-measures only what did not pass. A segmented tier
@@ -264,8 +283,8 @@ fuzz: fuzz-driver
 #
 # Each segment measures its competitor in-process, through the library built into
 # $(LAB), and writes one machine-readable result into the segment's evidence
-# directory. Entroq has no codec path yet, so every result carries an empty
-# Entroq column and states why.
+# directory. The harness links no Entroq codec, so every result carries an
+# empty Entroq column and states why.
 #
 # The smoke tier is not recorded, so it takes no run root.
 #

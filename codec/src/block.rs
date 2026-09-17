@@ -468,20 +468,20 @@ impl Decoder {
         let mut held = 0u64;
         for index in 0..BLOCK_STREAMS {
             let stream = prologue.stream(index).ok_or(Error::InvalidParameter)?;
-            let standing = self
-                .tables
-                .get(index)
-                .and_then(Option::as_ref)
-                .map_or(0, InForce::table_bytes);
-            let after = fresh
-                .get(index)
-                .and_then(Option::as_ref)
-                .map_or(standing, Admitted::table_bytes);
+            // A table in force and the bytes it occupies are different facts, and only the
+            // first says whether a stream may name it. A Huffman code over one distinct symbol
+            // writes no bits and needs no table, so it is in force at zero bytes, and reading
+            // the figure for the fact would refuse the block that names it.
+            let standing = self.tables.get(index).and_then(Option::as_ref);
+            let after = fresh.get(index).and_then(Option::as_ref).map_or_else(
+                || standing.map_or(0, InForce::table_bytes),
+                Admitted::table_bytes,
+            );
             held = held.saturating_add(after);
             if stream.count == 0 {
                 continue;
             }
-            if stream.repeats && standing == 0 {
+            if stream.repeats && standing.is_none() {
                 return Err(Error::CorruptData(Corruption::TableUnset));
             }
             required = required.saturating_add(after);
@@ -1842,6 +1842,83 @@ mod tests {
         };
         let _spent = decoder.read(&block, &policy, &mut out)?;
         assert_eq!(out, next.content);
+        Ok(())
+    }
+
+    /// A table in force at zero bytes is still in force.
+    ///
+    /// A Huffman code over one distinct symbol writes no bits and needs no decode table, so it
+    /// is in force and occupies nothing. The decoder read the bytes for the fact and refused
+    /// the next block that named it, which is a valid stream refused as corrupt. The encoder
+    /// writes such a pair whenever a block's literals are one repeated byte, so the defect was
+    /// reachable from real content.
+    #[test]
+    fn a_literal_table_of_one_symbol_is_in_force_at_no_bytes() -> Result<(), Error> {
+        let shape = Shape {
+            run: 6,
+            length: 12,
+            distance: 40,
+            alphabet: 1,
+        };
+        let policy = DecoderPolicy::CONSERVATIVE;
+        let mut encoder = Encoder::at_region_start();
+        let mut decoder = Decoder::at_region_start();
+
+        let first = plan(shape, 2_048, &[], 71).ok_or(Error::InvalidParameter)?;
+        let opening = round_trip(&first, &[], true, FRESH, &mut encoder, &mut decoder)?;
+
+        // The literal code of the first block, read back from the block's own description.
+        let (declared, used) = BlockPrologue::decode(
+            &opening,
+            u32::try_from(first.content.len()).map_err(|_| Error::InvalidParameter)?,
+            true,
+            &policy,
+        )?;
+        let bits = declared
+            .description_bits
+            .get(LITERAL_BYTE_STREAM)
+            .copied()
+            .ok_or(Error::InvalidParameter)?;
+        let body = opening.get(used..).ok_or(Error::InvalidParameter)?;
+        let section = body
+            .get(..usize::try_from(bits.div_ceil(8)).map_err(|_| Error::InvalidParameter)?)
+            .ok_or(Error::InvalidParameter)?;
+        let code = huffman::Declared::parse(
+            &mut BitReader::new(section, bits),
+            Alphabet::LiteralByte.size(),
+        )?
+        .validate()?;
+        assert_eq!(
+            code.table_bytes(),
+            0,
+            "a code over one distinct symbol asked for a table"
+        );
+
+        // The second block names it, so it carries no description for its literals at all.
+        let mut repeat = FRESH;
+        let slot = repeat
+            .get_mut(LITERAL_BYTE_STREAM)
+            .ok_or(Error::InvalidParameter)?;
+        *slot = true;
+        let next = plan(shape, 2_048, &first.content, 72).ok_or(Error::InvalidParameter)?;
+        let payload = round_trip(
+            &next,
+            &first.content,
+            false,
+            repeat,
+            &mut encoder,
+            &mut decoder,
+        )?;
+        let (named, _used) = BlockPrologue::decode(
+            &payload,
+            u32::try_from(next.content.len()).map_err(|_| Error::InvalidParameter)?,
+            false,
+            &policy,
+        )?;
+        let literals = named
+            .stream(LITERAL_BYTE_STREAM)
+            .ok_or(Error::InvalidParameter)?;
+        assert!(literals.count > 0 && literals.repeats && literals.description_bits == 0);
         Ok(())
     }
 

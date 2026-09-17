@@ -77,6 +77,16 @@ fn fuzz_action(action: Fuzz) -> error::Result<ExitCode> {
                 ExitCode::from(EXIT_VALIDATION)
             })
         }
+        Fuzz::Prepare => {
+            let built = fuzz::prepare()?;
+            println!("built {} drivers: {}", built.len(), built.join(", "));
+            Ok(ExitCode::SUCCESS)
+        }
+        Fuzz::Seed { target, from, runs } => {
+            let outcome = fuzz::seed(&target, &from, &fuzz::runs_root(runs))?;
+            print!("{}", report::seed_console(&outcome));
+            Ok(ExitCode::SUCCESS)
+        }
         Fuzz::Routine { runs } => {
             let outcome = fuzz::routine(&fuzz::runs_root(runs))?;
             print!("{}", report::routine_console(&outcome));

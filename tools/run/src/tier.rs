@@ -542,7 +542,7 @@ macro_rules! skeleton_segment {
     };
 }
 
-/// The M2 closing gate: every heavy proof of the format skeleton, one per segment.
+/// The format skeleton's closing gate: every heavy proof of it, one per segment.
 const SKELETON_SEGMENTS: &[Segment] = &[
     skeleton_segment!(
         "skeleton-roundtrip-tiny",

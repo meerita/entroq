@@ -51,3 +51,31 @@ path  = "fuzz_targets/mechanism.rs"
 test  = false
 doc   = false
 bench = false
+
+[[bin]]
+name  = "entropy-table-parser"
+path  = "fuzz_targets/entropy-table-parser.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "sequence-decoder"
+path  = "fuzz_targets/sequence-decoder.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "block-parser"
+path  = "fuzz_targets/block-parser.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "round-trip"
+path  = "fuzz_targets/round-trip.rs"
+test  = false
+doc   = false
+bench = false

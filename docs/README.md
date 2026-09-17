@@ -18,16 +18,16 @@ A page here states what Entroq does now. A page that would state intent is not w
 | Page | Class | Covers |
 |---|---|---|
 | [benchmarks.md](benchmarks.md) | reference | the measurement laboratory, the corpus, the metric set, the tiers, and what a number from each tier licenses |
-| [format.md](format.md) | reference | the frame, region, and block structure of a stream, and what a conforming decoder accepts, refuses, and ignores |
+| [format.md](format.md) | reference | the frame, region, and block structure of a stream, the compressed block and the symbol model it carries, and what a conforming decoder accepts, refuses, and ignores |
 
 ## Pages that do not exist yet
 
-Entroq compresses nothing, exports no public API, and ships no command line tool. The pages
-below state behavior that does not exist, so they are named here and not written.
+Entroq admits no mode, publishes no number of its own, and ships no command line tool. The
+pages below state behavior that does not exist, so they are named here and not written.
 
 | Page | Will cover | Waits for |
 |---|---|---|
-| `architecture.md` | the model behind the codec | a codec |
+| `architecture.md` | the model behind the codec | an admitted mode, and the measurements that admitted it |
 | `streaming.md` | the streaming execution model and its bounds | a measured bound for each mode |
 | `memory.md` | the memory bound each mode declares | a mode |
 | `security.md` | behavior on malformed input, and the decoder resource policy | a decoder whose hardening has been campaigned, not sampled |

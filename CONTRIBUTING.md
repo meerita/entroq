@@ -225,6 +225,7 @@ arrives with the code it covers.
 ```sh
 make fuzz-list                 # every target, and whether a driver exists for it
 make fuzz TARGET=<name>        # advance one target by one bounded segment
+make fuzz-seed                 # seed the stream-reading targets from the format vectors
 ```
 
 A campaign that names fuzzing as one of its segments advances every runnable target inside
@@ -246,6 +247,12 @@ duration of one segment.
 
 Each target keeps its corpus at `../runs/fuzz-corpus/<target>/`, outside the repository. The
 next segment continues from it instead of starting cold. Set `RUNS` to change that path.
+
+`make fuzz-seed` writes the format vector catalog and copies it into the corpus of the targets
+whose input is a whole stream, with the prefix each of those drivers reads in front of it. It
+adds and never removes, and it leaves a file the corpus already holds alone. A target that
+reads a table description, a block payload, or content is not seeded from a frame, because a
+frame is none of those.
 
 Never delete a corpus to start clean. It is coverage that many segments already paid for,
 and deleting it discards every hour spent on the target.

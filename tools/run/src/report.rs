@@ -5,7 +5,7 @@
 //! and this module never produces one.
 
 use crate::campaign::Outcome;
-use crate::fuzz::{Outcome as FuzzOutcome, Routine};
+use crate::fuzz::{Outcome as FuzzOutcome, Routine, Seeded};
 use crate::record::Entry;
 use crate::workspace::{Environment, InputSet};
 
@@ -138,6 +138,28 @@ pub fn routine_console(routine: &Routine) -> String {
     ));
     lines.push(String::new());
     lines.join("\n")
+}
+
+/// The block a seeding invocation prints when it ends.
+///
+/// Seeding is not fuzzing and writes no record, so the block states what moved and where it
+/// landed. A corpus file the invocation left alone is counted as not copied.
+pub fn seed_console(seeded: &Seeded) -> String {
+    format!(
+        "Suite: fuzz seed\n\
+         Target: {target}\n\
+         From: {from}\n\
+         Corpus: {corpus}\n\
+         Seeds: {copied} copied, {left} already held\n\
+         Inputs: {before} before, {after} after\n",
+        target = seeded.target,
+        from = seeded.from.display(),
+        corpus = seeded.corpus.display(),
+        copied = seeded.copied,
+        left = seeded.held,
+        before = seeded.files_before,
+        after = seeded.files_after,
+    )
 }
 
 /// The summary a fuzz segment writes when it seals.
