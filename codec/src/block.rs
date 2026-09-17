@@ -721,7 +721,7 @@ fn frequencies(symbols: &[u16], alphabet: Alphabet) -> Result<Vec<u64>, Error> {
 /// produced before this block, and `out` is what this block has produced so far. Every step is
 /// checked against the block's remaining decoded bytes and against the bytes the region holds,
 /// so nothing here reaches past either.
-fn expand(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(), Error> {
+pub(crate) fn expand(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(), Error> {
     let literals = sequences.literals();
     let mut taken = 0usize;
     let mut written = 0usize;

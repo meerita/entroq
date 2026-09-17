@@ -2,9 +2,10 @@
 //!
 //! The crate exports the format contract, the entropy coding the format's tables are declared
 //! and validated through, the sequence representation their symbols are drawn from, the
-//! compressed block that carries all three, and the streaming pair that drives the block types
-//! it holds. Every other module is private until the mechanism it owns is designed and
-//! measured.
+//! compressed block that carries all three, the match finder and the parser that produce the
+//! sequences, the kernel dispatch the finder runs on, and the streaming pair that drives the
+//! block types it holds. Every other module is private until the mechanism it owns is designed
+//! and measured.
 
 pub mod block;
 mod checksum;
@@ -13,8 +14,8 @@ mod encode;
 pub mod entropy;
 pub mod format;
 mod index;
-mod matchfinder;
-mod parser;
+pub mod matchfinder;
+pub mod parser;
 pub mod sequence;
-mod simd;
+pub mod simd;
 pub mod stream;
