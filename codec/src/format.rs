@@ -190,6 +190,20 @@ pub enum Corruption {
     SymbolAlphabet,
     /// A coded payload does not decode under the table its block declared.
     CodedStream,
+    /// A sequence stream carries a symbol its alphabet does not hold.
+    SequenceSymbol,
+    /// A raw suffix takes a coded value past the domain its alphabet declares.
+    SequenceSuffix,
+    /// A sequence stream carries raw suffix bits that its symbols do not account for.
+    SequenceExtent,
+    /// The symbol counts of the four sequence streams do not describe one block.
+    SequenceCount,
+    /// The terminal symbol occurs anywhere but as the last match-length symbol of a block.
+    TerminalSymbol,
+    /// A repeat code names the offset slot before any match has set it.
+    RepeatUnset,
+    /// A repeat code resolves to a distance below one.
+    RepeatDistance,
 }
 
 impl fmt::Display for Error {
@@ -247,6 +261,13 @@ impl fmt::Display for Corruption {
             Self::FrequencySum => "the declared frequencies contradict the table total",
             Self::SymbolAlphabet => "a declared symbol is outside its alphabet",
             Self::CodedStream => "a coded payload does not decode under its declared table",
+            Self::SequenceSymbol => "a sequence symbol is outside its alphabet",
+            Self::SequenceSuffix => "a raw suffix names a value outside its domain",
+            Self::SequenceExtent => "a sequence stream carries suffix bits no symbol declared",
+            Self::SequenceCount => "the sequence stream counts do not describe one block",
+            Self::TerminalSymbol => "the terminal symbol occurs where a block does not end",
+            Self::RepeatUnset => "a repeat code names an unset offset slot",
+            Self::RepeatDistance => "a repeat code resolves to a distance below one",
         })
     }
 }

@@ -55,6 +55,27 @@ pub struct BitBuf {
 }
 
 impl BitBuf {
+    /// A stream of `bits` bits carried by `bytes`.
+    ///
+    /// The bit count is declared by whoever wrote the stream, so it is checked against the
+    /// bytes here. A reader over a count the bytes do not hold reads the shortfall as zeros,
+    /// which no reader can distinguish from content, so the check belongs at the one boundary
+    /// that sees both figures.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TruncatedInput` naming the bytes the declared count needs, when the bytes
+    /// carry fewer bits than the count declares.
+    pub fn new(bytes: Vec<u8>, bits: u64) -> Result<Self, Error> {
+        let needed = bits.div_ceil(8);
+        if needed > u64::try_from(bytes.len()).unwrap_or(u64::MAX) {
+            return Err(Error::TruncatedInput {
+                needed: usize::try_from(needed).unwrap_or(usize::MAX),
+            });
+        }
+        Ok(Self { bytes, bits })
+    }
+
     /// The bytes the stream occupies, final padding included.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
@@ -262,7 +283,7 @@ const fn bit_offset(at: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BitReader, BitWriter, MAX_WIDTH, mask};
+    use super::{BitBuf, BitReader, BitWriter, MAX_WIDTH, mask};
     use crate::format::{Corruption, Error};
 
     /// The widths a round trip is checked at: the boundaries, the byte crossings, the widest
@@ -385,6 +406,26 @@ mod tests {
         assert_eq!(reader.take(36), Ok(0), "a width past 64 leads with zeros");
         assert_eq!(reader.take(64), Ok(0x0123_4567_89AB_CDEF));
         assert!(!reader.overrun());
+    }
+
+    #[test]
+    fn a_declared_bit_count_the_bytes_do_not_hold_is_refused() {
+        assert_eq!(
+            BitBuf::new(vec![0xFF], 8).map(|buf| buf.bits()),
+            Ok(8),
+            "a count the bytes hold whole is admitted"
+        );
+        assert_eq!(BitBuf::new(vec![0xFF], 1).map(|buf| buf.bits()), Ok(1));
+        assert_eq!(BitBuf::new(Vec::new(), 0).map(|buf| buf.bits()), Ok(0));
+        assert_eq!(
+            BitBuf::new(vec![0xFF], 9),
+            Err(Error::TruncatedInput { needed: 2 }),
+            "a reader over the shortfall would read padding as content"
+        );
+        assert_eq!(
+            BitBuf::new(Vec::new(), 1),
+            Err(Error::TruncatedInput { needed: 1 })
+        );
     }
 
     #[test]
