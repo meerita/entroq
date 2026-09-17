@@ -6,6 +6,10 @@
 //! A payload is expanded in steps. Each step reads only the input it was given and writes
 //! only the output it was given, so a block larger than either buffer costs more steps and
 //! never more memory. Nothing here allocates.
+//!
+//! A COMPRESSED block is not expanded this way. A match in one may name any byte its region
+//! has already produced, so it needs its whole stored body and a window of that content, and
+//! the block module owns it.
 
 use crate::format::{BlockHeader, BlockType, Error, Feature};
 

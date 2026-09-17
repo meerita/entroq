@@ -205,6 +205,18 @@ impl Table {
         table_bytes_for(self.log)
     }
 
+    /// Whether this table gives `symbol` a slot.
+    ///
+    /// A symbol with no slot cannot be coded under this table. An encoder deciding whether a
+    /// stream can be written under a table built for another stream asks this before it
+    /// writes.
+    #[must_use]
+    pub fn carries(&self, symbol: u16) -> bool {
+        self.freq
+            .get(usize::from(symbol))
+            .is_some_and(|&frequency| frequency > 0)
+    }
+
     /// Writes the description a decoder rebuilds this table from.
     ///
     /// Each frequency is written in the width the unassigned total still admits, so the fields

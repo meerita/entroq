@@ -174,6 +174,21 @@ impl Code {
         self.max_length
     }
 
+    /// Whether this code carries `symbol`.
+    ///
+    /// A code carries the symbols the counts it was built over held, and no others. An encoder
+    /// deciding whether a stream can be written under a code built for another stream asks
+    /// this before it writes, because a symbol the code does not carry has no code word.
+    #[must_use]
+    pub fn carries(&self, symbol: u16) -> bool {
+        if let Some(single) = self.single {
+            return single == symbol;
+        }
+        self.lengths
+            .get(usize::from(symbol))
+            .is_some_and(|&length| length > 0)
+    }
+
     /// The bytes a decoder allocates for this code.
     #[must_use]
     pub const fn table_bytes(&self) -> u64 {
@@ -235,8 +250,11 @@ impl Code {
     pub fn encoder(&self) -> Result<Encoder, Error> {
         let span = usize::try_from(self.alphabet_size).map_err(|_| Error::InvalidParameter)?;
         let mut table = vec![CodeWord { value: 0, width: 0 }; span];
-        if self.single.is_some() {
-            return Ok(Encoder { table });
+        if let Some(single) = self.single {
+            return Ok(Encoder {
+                table,
+                single: Some(single),
+            });
         }
         for assigned in canonical(&self.lengths)? {
             let slot = table
@@ -247,7 +265,10 @@ impl Code {
                 width: assigned.length,
             };
         }
-        Ok(Encoder { table })
+        Ok(Encoder {
+            table,
+            single: None,
+        })
     }
 }
 
@@ -270,12 +291,16 @@ struct CodeWord {
 #[derive(Debug)]
 pub struct Encoder {
     table: Vec<CodeWord>,
+    /// The symbol of a single-symbol code, which is the one symbol that writes no bits.
+    single: Option<u16>,
 }
 
 impl Encoder {
     /// Writes every symbol of `symbols`.
     ///
-    /// A single-symbol code writes no bits, which is what its zero-length code means.
+    /// A single-symbol code writes no bits, which is what its zero-length code means. Every
+    /// other zero-length symbol is one the code does not carry, and writing it would spend no
+    /// bits and decode as something else, so it is refused instead.
     ///
     /// # Errors
     ///
@@ -289,7 +314,10 @@ impl Encoder {
                 .copied()
                 .ok_or(Error::InvalidParameter)?;
             if word.width == 0 {
-                continue;
+                if self.single == Some(symbol) {
+                    continue;
+                }
+                return Err(Error::InvalidParameter);
             }
             out.push(u64::from(word.value), word.width);
         }
@@ -760,6 +788,49 @@ mod tests {
             .filter(|&&length| length > 0)
             .map(|&length| shift_right_wide(super::KRAFT_UNIT, length))
             .sum()
+    }
+
+    /// A code carries the symbols it was built over and no others, and an encoder asked for
+    /// one it does not carry says so rather than spending no bits on it.
+    ///
+    /// A zero-width entry means two different things: the one symbol of a single-symbol code,
+    /// which is written in no bits, and a symbol the code never saw. Writing the second in no
+    /// bits produces a stream that decodes to other content.
+    #[test]
+    fn a_code_refuses_a_symbol_it_does_not_carry() -> Result<(), Error> {
+        let mut counts = vec![0_u64; 8];
+        for symbol in 0..3_usize {
+            let slot = counts.get_mut(symbol).ok_or(Error::InvalidParameter)?;
+            *slot = 4;
+        }
+        let code = Code::build(&counts, 8, LENGTH_LIMIT)?;
+        assert!(code.carries(0) && code.carries(2));
+        assert!(!code.carries(3), "a symbol no count held is not carried");
+
+        let mut out = BitWriter::new();
+        assert_eq!(
+            code.encoder()?.write(&[3], &mut out),
+            Err(Error::InvalidParameter)
+        );
+
+        let mut single_counts = vec![0_u64; 8];
+        let slot = single_counts.get_mut(5).ok_or(Error::InvalidParameter)?;
+        *slot = 9;
+        let single = Code::build(&single_counts, 8, LENGTH_LIMIT)?;
+        assert!(single.carries(5) && !single.carries(4));
+        let mut quiet = BitWriter::new();
+        single.encoder()?.write(&[5, 5, 5], &mut quiet)?;
+        assert_eq!(
+            quiet.finish().bits(),
+            0,
+            "a single-symbol code writes no bits"
+        );
+        let mut other = BitWriter::new();
+        assert_eq!(
+            single.encoder()?.write(&[4], &mut other),
+            Err(Error::InvalidParameter)
+        );
+        Ok(())
     }
 
     #[test]

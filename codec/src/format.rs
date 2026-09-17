@@ -99,6 +99,19 @@ const MODE_REJECT_RESERVED: u8 = 0b1111_0000;
 /// The block size field is 29 bits wide. The width is provisional.
 pub const MAX_BLOCK_BYTES: u32 = 0x1FFF_FFFF;
 
+/// The decoded size of a COMPRESSED block a default policy admits.
+///
+/// A COMPRESSED block is not expanded one step at a time: a decoder holds its whole stored
+/// body and the whole content it decodes to, because a match in it may name any byte the
+/// block has already produced. So the decoded size a block declares is a memory requirement,
+/// and a decoder states the figure it will hold before a block arrives rather than sizing
+/// itself from whatever the stream asks for. A block declaring more is `LimitExceeded`, and a
+/// caller that wants to decode one raises the limit deliberately.
+///
+/// The value is a decoder resource policy and not a format constant. It is the block length
+/// this generation of the encoder cuts at, and it is provisional.
+pub const DEFAULT_MAX_BLOCK_BYTES: u32 = 65_536;
+
 const CONTENT_LENGTH_BYTES: usize = 8;
 const DICTIONARY_ID_BYTES: usize = 4;
 const INDEX_LOCATION_BYTES: usize = 8;
@@ -172,10 +185,12 @@ pub enum Error {
 pub enum Feature {
     /// A frame flag in ignore-reserved space that version 1 does not define.
     ReservedFrameFlag,
-    /// A compressed block, on a path that does not carry one.
+    /// A compressed block, on a path that reads a payload from its header alone.
     ///
-    /// The format defines the type and this build decodes it. The streaming pair does not
-    /// drive it yet, and it says so here rather than reporting the block as damaged.
+    /// The streaming pair reads the type. `BlockHeader::payload` and `BlockHeader::expand`
+    /// answer from the header, and a COMPRESSED block declares its stored length in its own
+    /// prologue rather than in its header, so those two say so here rather than reporting the
+    /// block as damaged.
     CompressedBlock,
     /// A symbol model a COMPRESSED block names and this build does not implement.
     BlockModel {
@@ -265,6 +280,8 @@ pub enum Corruption {
     BlockContent,
     /// A match reaches back past the bytes its region has produced.
     MatchReach,
+    /// A COMPRESSED block stores at least the bytes it decodes to.
+    BlockExpansion,
 }
 
 impl fmt::Display for Error {
@@ -295,7 +312,7 @@ impl fmt::Display for Feature {
         match *self {
             Self::ReservedFrameFlag => out.write_str("a frame flag this version does not define"),
             Self::CompressedBlock => {
-                out.write_str("a compressed block on a path that does not carry one")
+                out.write_str("a compressed block on a path that reads only a header")
             }
             Self::BlockModel { model } => write!(out, "symbol model {model} is not implemented"),
         }
@@ -344,6 +361,7 @@ impl fmt::Display for Corruption {
             Self::BlockExtent => "the declared extents do not spend the block's stored body",
             Self::BlockContent => "the sequences do not spend the block's decoded size",
             Self::MatchReach => "a match reaches past the bytes its region has produced",
+            Self::BlockExpansion => "a compressed block stores at least its decoded size",
         })
     }
 }
@@ -714,8 +732,9 @@ impl FrameHeader {
 /// The limits a caller places on a frame before a decoder commits memory to it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DecoderPolicy {
-    max_history_bytes: u64,
-    max_table_bytes: u64,
+    history_bytes: u64,
+    table_bytes: u64,
+    block_ceiling: u32,
 }
 
 impl DecoderPolicy {
@@ -725,16 +744,18 @@ impl DecoderPolicy {
     /// A caller raises the history limit deliberately, and can only lower the table limit:
     /// the version 1 ceiling is a format constant and no policy widens it.
     pub const CONSERVATIVE: Self = Self {
-        max_history_bytes: ResourceClass::Small.history_bytes(),
-        max_table_bytes: crate::entropy::MAX_BLOCK_TABLE_BYTES,
+        history_bytes: ResourceClass::Small.history_bytes(),
+        table_bytes: crate::entropy::MAX_BLOCK_TABLE_BYTES,
+        block_ceiling: DEFAULT_MAX_BLOCK_BYTES,
     };
 
     /// A policy that admits a frame declaring at most `bytes` of decoder history.
     #[must_use]
     pub const fn with_max_history_bytes(bytes: u64) -> Self {
         Self {
-            max_history_bytes: bytes,
-            max_table_bytes: crate::entropy::MAX_BLOCK_TABLE_BYTES,
+            history_bytes: bytes,
+            table_bytes: crate::entropy::MAX_BLOCK_TABLE_BYTES,
+            block_ceiling: DEFAULT_MAX_BLOCK_BYTES,
         }
     }
 
@@ -742,15 +763,51 @@ impl DecoderPolicy {
     #[must_use]
     pub const fn with_max_table_bytes(self, bytes: u64) -> Self {
         Self {
-            max_history_bytes: self.max_history_bytes,
-            max_table_bytes: bytes,
+            history_bytes: self.history_bytes,
+            table_bytes: bytes,
+            block_ceiling: self.block_ceiling,
+        }
+    }
+
+    /// The same policy, admitting a COMPRESSED block that decodes to at most `bytes`.
+    ///
+    /// The figure sizes the buffers a decoder holds for one such block, so raising it raises
+    /// the memory a decoder commits before it reads one.
+    #[must_use]
+    pub const fn with_max_block_bytes(self, bytes: u32) -> Self {
+        Self {
+            history_bytes: self.history_bytes,
+            table_bytes: self.table_bytes,
+            block_ceiling: bytes,
         }
     }
 
     /// The table memory this policy admits, which is never above the version 1 ceiling.
     #[must_use]
     pub const fn max_table_bytes(&self) -> u64 {
-        self.max_table_bytes
+        self.table_bytes
+    }
+
+    /// The decoded size of a COMPRESSED block this policy admits.
+    #[must_use]
+    pub const fn max_block_bytes(&self) -> u32 {
+        self.block_ceiling
+    }
+
+    /// The bytes a decoder commits for one COMPRESSED block, when policy admits it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LimitExceeded` with the requirement and the ceiling when the block decodes to
+    /// more than this policy allows.
+    pub fn admit_block_bytes(&self, declared: u32) -> Result<u32, Error> {
+        if declared > self.block_ceiling {
+            return Err(Error::LimitExceeded {
+                declared: u64::from(declared),
+                allowed: u64::from(self.block_ceiling),
+            });
+        }
+        Ok(declared)
     }
 
     /// The table memory a decoder commits for one block, when policy admits it.
@@ -769,10 +826,10 @@ impl DecoderPolicy {
             Ok(value) => value,
             Err(error) => return Err(error),
         };
-        if declared > self.max_table_bytes {
+        if declared > self.table_bytes {
             return Err(Error::LimitExceeded {
                 declared,
-                allowed: self.max_table_bytes,
+                allowed: self.table_bytes,
             });
         }
         Ok(declared)
@@ -786,10 +843,10 @@ impl DecoderPolicy {
     /// the frame asks for more than policy allows.
     pub const fn admit(&self, header: &FrameHeader) -> Result<u64, Error> {
         let declared = header.resource_class.history_bytes();
-        if declared > self.max_history_bytes {
+        if declared > self.history_bytes {
             return Err(Error::LimitExceeded {
                 declared,
-                allowed: self.max_history_bytes,
+                allowed: self.history_bytes,
             });
         }
         Ok(declared)

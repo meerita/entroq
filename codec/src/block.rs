@@ -23,7 +23,15 @@
 //! inside one region and the frame flag that declares region independence still covers all of
 //! them.
 //!
-//! # The bound
+//! # The expansion bound
+//!
+//! A COMPRESSED block whose stored payload is not below the size it decodes to is refused as
+//! corrupt, before the payload is read. The version 1 bound on what a frame may add to its
+//! content then holds for every stream a decoder accepts, and not only for every stream a
+//! conforming encoder wrote. It costs a conforming encoder nothing: a rule that assembles
+//! every type and emits the cheapest never produces such a block.
+//!
+//! # The table bound
 //!
 //! The bound is taken over the state the mechanism holds, which is the four tables in force,
 //! and not over the four tables one block declares. The two are equal exactly when every
@@ -258,8 +266,9 @@ impl Decoder {
     ///
     /// Returns `UnsupportedFeature` for a symbol model this build does not implement,
     /// `LimitExceeded` when the tables the block needs are above policy, `CorruptData` when a
-    /// declared quantity contradicts another or the block's own content, and `TruncatedInput`
-    /// when the stored bytes the block declares have not arrived.
+    /// declared quantity contradicts another or the block's own content or when the block
+    /// stores at least the bytes it decodes to, and `TruncatedInput` when the stored bytes the
+    /// block declares have not arrived.
     pub fn read(
         &mut self,
         block: &Block<'_>,
@@ -270,7 +279,7 @@ impl Decoder {
             u32::try_from(out.len()).map_err(|_| Error::CorruptData(Corruption::BlockSize))?;
         let (prologue, used) =
             BlockPrologue::decode(block.arrived, decoded_size, block.first_in_region, policy)?;
-        let body = Self::locate_body(block, &prologue, used)?;
+        let body = Self::locate_body(block, &prologue, used, decoded_size)?;
 
         let mut at = 0usize;
         let descriptions = locate(&prologue.description_bits, &mut at)?;
@@ -329,6 +338,7 @@ impl Decoder {
         block: &Block<'a>,
         prologue: &BlockPrologue,
         used: usize,
+        decoded_size: u32,
     ) -> Result<&'a [u8], Error> {
         let body_bytes = prologue
             .body_bytes()
@@ -337,6 +347,9 @@ impl Decoder {
             .ok()
             .and_then(|prologue_bytes| prologue_bytes.checked_add(body_bytes))
             .ok_or(Error::CorruptData(Corruption::BlockExtent))?;
+        if stored >= u64::from(decoded_size) {
+            return Err(Error::CorruptData(Corruption::BlockExpansion));
+        }
         if stored > block.declared {
             return Err(Error::CorruptData(Corruption::BlockExtent));
         }
@@ -449,6 +462,17 @@ enum Built {
 }
 
 impl Built {
+    /// Whether this table can code every symbol of `symbols`.
+    ///
+    /// A table built for another block carries the symbols that block held. One that does not
+    /// carry a symbol of this block cannot code it, so a stream may not name it in force.
+    fn carries(&self, symbols: &[u16]) -> bool {
+        symbols.iter().all(|&symbol| match *self {
+            Self::Huffman(ref code) => code.carries(symbol),
+            Self::Rans(ref table, _) => table.carries(symbol),
+        })
+    }
+
     /// The bytes a decoder allocates for this table.
     const fn table_bytes(&self) -> u64 {
         match *self {
@@ -514,35 +538,52 @@ impl Encoder {
         total
     }
 
-    /// Assembles the payload of one COMPRESSED block.
+    /// Assembles the payload of one COMPRESSED block into `out`, leaving this encoder unmoved.
     ///
-    /// `repeat` names, per stream, the streams that code under the table already in force.
-    /// Which streams those are is the encoder's choice and not the format's; what the format
-    /// decides is that a block may carry no description for such a stream.
+    /// `out` is cleared and filled with the block's stored payload. Nothing here changes the
+    /// two histories: the caller decides whether this block is the one it emits, and a block
+    /// it discards must leave no trace, because a decoder never sees a candidate. `adopt`
+    /// takes the returned assembly when the caller emits it.
+    ///
+    /// `reuse` states how a stream may name the table already in force for its class. Which
+    /// streams do is the encoder's choice and not the format's; what the format decides is
+    /// that a block may carry no description for such a stream.
+    ///
+    /// `ceiling` is the stored length this block must stay below, which is the decoded size a
+    /// decoder refuses a COMPRESSED block at. An assembly that does not is answered with
+    /// `None` and nothing is written, so `out` never holds more than `ceiling` bytes.
     ///
     /// Each class may spend a quarter of the policy ceiling on its table, so the four tables
     /// this encoder holds stay inside the ceiling whichever streams a block carries.
     ///
+    /// Coding one block allocates in proportion to that block and frees it before this call
+    /// returns. Nothing allocated here is held between calls.
+    ///
     /// # Errors
     ///
-    /// Returns `InvalidParameter` when a stream is asked to repeat a table that cannot code it
-    /// or that no block has built, and when the first block of a region is asked to repeat
+    /// Returns `InvalidParameter` when a stream is named to repeat a table that cannot code it
+    /// or that no block has built, and when the first block of a region is named to repeat
     /// anything. Returns `LimitExceeded` when a table the block needs does not fit its share of
     /// the ceiling, which is the block the caller emits under another type.
-    pub fn assemble(
-        &mut self,
+    pub fn assemble_into(
+        &self,
         sequences: &Sequences,
-        first_in_region: bool,
-        repeat: [bool; BLOCK_STREAMS],
+        terms: Terms,
         policy: &DecoderPolicy,
-    ) -> Result<Vec<u8>, Error> {
+        out: &mut Vec<u8>,
+    ) -> Result<Option<Assembly>, Error> {
+        let Terms {
+            first_in_region,
+            reuse,
+            ceiling,
+        } = terms;
         let mut cache = self.cache;
         let streams = Streams::of(sequences, &mut cache)?;
         let share = policy
             .max_table_bytes()
             .checked_div(TABLE_SHARES)
             .ok_or(Error::InvalidParameter)?;
-        let assembled = self.code(&streams, first_in_region, repeat, share)?;
+        let assembled = self.code(&streams, first_in_region, reuse, share)?;
 
         let mut held = 0u64;
         for (index, built) in assembled.fresh.iter().enumerate() {
@@ -559,8 +600,22 @@ impl Encoder {
         }
         let _held = policy.admit_table_bytes(held)?;
 
-        let mut out = Vec::new();
-        out.extend_from_slice(assembled.prologue.encode(first_in_region).as_bytes());
+        let prologue = assembled.prologue.encode(first_in_region);
+        let body = assembled
+            .prologue
+            .body_bytes()
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or(Error::InvalidParameter)?;
+        let stored = prologue
+            .len()
+            .checked_add(body)
+            .ok_or(Error::InvalidParameter)?;
+        if stored >= ceiling {
+            return Ok(None);
+        }
+
+        out.clear();
+        out.extend_from_slice(prologue.as_bytes());
         for group in [
             &assembled.descriptions,
             &assembled.payloads,
@@ -571,14 +626,24 @@ impl Encoder {
             }
         }
 
-        for (index, built) in assembled.fresh.into_iter().enumerate() {
-            if let Some(built) = built {
-                let slot = self.tables.get_mut(index).ok_or(Error::InvalidParameter)?;
+        Ok(Some(Assembly {
+            fresh: assembled.fresh,
+            cache,
+            repeated: assembled.repeated,
+        }))
+    }
+
+    /// Takes the two histories of an assembly this encoder produced and the caller emitted.
+    ///
+    /// A block that was assembled and not emitted is never adopted, because a decoder that
+    /// never saw it rebuilds neither history from it.
+    pub fn adopt(&mut self, assembly: Assembly) {
+        for (index, built) in assembly.fresh.into_iter().enumerate() {
+            if let (Some(built), Some(slot)) = (built, self.tables.get_mut(index)) {
                 *slot = Some(built);
             }
         }
-        self.cache = cache;
-        Ok(out)
+        self.cache = assembly.cache;
     }
 
     /// Codes the four streams and declares what each one spent.
@@ -586,7 +651,7 @@ impl Encoder {
         &self,
         streams: &Streams,
         first_in_region: bool,
-        repeat: [bool; BLOCK_STREAMS],
+        reuse: Reuse,
         share: u64,
     ) -> Result<Assembled, Error> {
         let mut assembled = Assembled::default();
@@ -603,7 +668,7 @@ impl Encoder {
             let (coder, alphabet) = class_of(index)?;
             let stream = streams.stream(alphabet);
             let symbols = stream.symbols();
-            let repeats = repeat.get(index).copied().unwrap_or(false);
+            let named = reuse.names(index);
             prologue.counts = spend(
                 prologue.counts,
                 index,
@@ -613,7 +678,7 @@ impl Encoder {
             assembled.suffixes.push(stream.suffix().clone());
 
             if symbols.is_empty() {
-                if repeats {
+                if named {
                     return Err(Error::InvalidParameter);
                 }
                 assembled.descriptions.push(BitWriter::new().finish());
@@ -621,42 +686,157 @@ impl Encoder {
                 continue;
             }
 
-            let (built, description) = if repeats {
-                if first_in_region {
-                    return Err(Error::InvalidParameter);
-                }
-                prologue.mode |= mode_mask(index)?;
-                let held = self
-                    .tables
-                    .get(index)
-                    .and_then(Option::as_ref)
-                    .ok_or(Error::InvalidParameter)?
-                    .clone();
-                (held, BitWriter::new().finish())
+            let in_force = if first_in_region {
+                None
             } else {
-                let built = build(coder, alphabet, symbols, share)?;
-                let description = built.describe();
-                (built, description)
+                self.tables.get(index).and_then(Option::as_ref)
             };
-            prologue.description_bits =
-                spend(prologue.description_bits, index, description.bits())?;
-            assembled.descriptions.push(description);
+            let written = match reuse {
+                Reuse::Named(_) if named => {
+                    let held = in_force.ok_or(Error::InvalidParameter)?;
+                    Coded {
+                        description: BitWriter::new().finish(),
+                        payload: held.write(symbols)?,
+                        built: held.clone(),
+                        repeats: true,
+                    }
+                }
+                Reuse::Named(_) => Self::fresh(coder, alphabet, symbols, share)?,
+                Reuse::SelfFinancing => {
+                    let fresh = Self::fresh(coder, alphabet, symbols, share)?;
+                    Self::cheaper(fresh, in_force, symbols)?
+                }
+            };
 
-            let payload = built.write(symbols)?;
-            prologue.payload_bits = spend(prologue.payload_bits, index, payload.bits())?;
-            assembled.payloads.push(payload);
-            prologue.table_bytes = prologue.table_bytes.saturating_add(built.table_bytes());
-            if !repeats {
+            if written.repeats {
+                prologue.mode |= mode_mask(index)?;
+                assembled.repeated = spend_flag(assembled.repeated, index, true)?;
+            } else {
                 let slot = assembled
                     .fresh
                     .get_mut(index)
                     .ok_or(Error::InvalidParameter)?;
-                *slot = Some(built);
+                *slot = Some(written.built.clone());
             }
+            prologue.description_bits =
+                spend(prologue.description_bits, index, written.description.bits())?;
+            prologue.payload_bits = spend(prologue.payload_bits, index, written.payload.bits())?;
+            prologue.table_bytes = prologue
+                .table_bytes
+                .saturating_add(written.built.table_bytes());
+            assembled.descriptions.push(written.description);
+            assembled.payloads.push(written.payload);
         }
         assembled.prologue = prologue;
         Ok(assembled)
     }
+
+    /// One stream coded under a table built for it, with the description that rebuilds it.
+    fn fresh(
+        coder: Coder,
+        alphabet: Alphabet,
+        symbols: &[u16],
+        share: u64,
+    ) -> Result<Coded, Error> {
+        let built = build(coder, alphabet, symbols, share)?;
+        let description = built.describe();
+        let payload = built.write(symbols)?;
+        Ok(Coded {
+            description,
+            payload,
+            built,
+            repeats: false,
+        })
+    }
+
+    /// The cheaper of coding a stream fresh and coding it under the table in force.
+    ///
+    /// The trigger is self-financing and it is per stream: a stream names the table in force
+    /// only when the bits it then spends are fewer than the description and the payload a
+    /// fresh table would cost together. The mode field is not on either side of the
+    /// comparison, because a block that is not the first of its region carries it whether or
+    /// not a bit of it is set.
+    fn cheaper(fresh: Coded, in_force: Option<&Built>, symbols: &[u16]) -> Result<Coded, Error> {
+        let Some(held) = in_force else {
+            return Ok(fresh);
+        };
+        if !held.carries(symbols) {
+            return Ok(fresh);
+        }
+        let payload = held.write(symbols)?;
+        let spent = fresh
+            .description
+            .bits()
+            .saturating_add(fresh.payload.bits());
+        if payload.bits() >= spent {
+            return Ok(fresh);
+        }
+        Ok(Coded {
+            description: BitWriter::new().finish(),
+            payload,
+            built: held.clone(),
+            repeats: true,
+        })
+    }
+}
+
+/// The terms one block is assembled under.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Terms {
+    /// Whether this is the first block of its region, where the mode field is absent.
+    pub first_in_region: bool,
+    /// How this block's streams may name the table already in force for their class.
+    pub reuse: Reuse,
+    /// The stored length this block must stay below, which is the decoded size a decoder
+    /// refuses a COMPRESSED block at.
+    pub ceiling: usize,
+}
+
+/// How a block's streams may name the table already in force for their class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Reuse {
+    /// A stream names the table in force when doing so spends fewer bits than a fresh one.
+    SelfFinancing,
+    /// The named streams name the table in force, whatever it costs them.
+    Named([bool; BLOCK_STREAMS]),
+}
+
+impl Reuse {
+    /// Whether this rule names one stream outright.
+    fn names(self, stream: usize) -> bool {
+        match self {
+            Self::SelfFinancing => false,
+            Self::Named(mask) => mask.get(stream).copied().unwrap_or(false),
+        }
+    }
+}
+
+/// The two histories one assembled block leaves behind, and what its streams did.
+///
+/// An assembly is produced without changing the encoder that made it, so a caller that
+/// assembles several candidates and emits one passes that one to `adopt` and drops the rest.
+#[derive(Debug)]
+pub struct Assembly {
+    fresh: [Option<Built>; BLOCK_STREAMS],
+    cache: OffsetCache,
+    repeated: [bool; BLOCK_STREAMS],
+}
+
+impl Assembly {
+    /// The streams of this block that named the table already in force for their class.
+    #[must_use]
+    pub const fn repeated(&self) -> [bool; BLOCK_STREAMS] {
+        self.repeated
+    }
+}
+
+/// One stream's coded form, and the table it was coded under.
+#[derive(Debug)]
+struct Coded {
+    description: BitBuf,
+    payload: BitBuf,
+    built: Built,
+    repeats: bool,
 }
 
 /// What one block's four streams coded to, and what its prologue declares about them.
@@ -667,6 +847,7 @@ struct Assembled {
     payloads: Vec<BitBuf>,
     suffixes: Vec<BitBuf>,
     fresh: [Option<Built>; BLOCK_STREAMS],
+    repeated: [bool; BLOCK_STREAMS],
 }
 
 /// Builds the table one stream codes under, inside the share its class may spend.
@@ -689,6 +870,17 @@ fn build(coder: Coder, alphabet: Alphabet, symbols: &[u16], share: u64) -> Resul
             Ok(Built::Rans(table, states))
         }
     }
+}
+
+/// Places one flag in its stream's slot.
+fn spend_flag(
+    mut group: [bool; BLOCK_STREAMS],
+    index: usize,
+    value: bool,
+) -> Result<[bool; BLOCK_STREAMS], Error> {
+    let slot = group.get_mut(index).ok_or(Error::InvalidParameter)?;
+    *slot = value;
+    Ok(group)
 }
 
 /// Places one declared quantity in its stream's slot.
@@ -789,7 +981,7 @@ pub(crate) fn expand(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{Block, Decoder, Encoder};
+    use super::{Block, Decoder, Encoder, Reuse, Terms};
     use crate::format::{
         BLOCK_MODEL_V1, BLOCK_STREAMS, BlockPrologue, Corruption, DecoderPolicy, Error, Feature,
         LITERAL_BYTE_STREAM, LITERAL_RUN_STREAM, MATCH_DISTANCE_STREAM, MATCH_LENGTH_STREAM,
@@ -901,11 +1093,21 @@ mod tests {
     /// asks for a distance the block has not yet produced still produces that distance.
     fn plan(shape: Shape, size: usize, history: &[u8], seed: u64) -> Option<Plan> {
         let mut builder = Builder::new(history, seed, shape.alphabet);
-        let mut first = true;
+        fill(&mut builder, shape, size, history.len())?;
+        builder.finish(history.len())
+    }
+
+    /// Steps a builder in `shape` until the block it is building holds `size` bytes.
+    ///
+    /// A block a test builds by hand is a few dozen bytes, and the expansion bound refuses a
+    /// COMPRESSED block that small whatever it holds. So a test that needs a readable block
+    /// tops its own steps up to a length a table can pay for.
+    fn fill(builder: &mut Builder, shape: Shape, size: usize, history_bytes: usize) -> Option<()> {
+        let mut first = builder.produced == 0;
         let distance = usize::try_from(shape.distance).ok()?;
         while builder.produced < size {
             let left = size.checked_sub(builder.produced)?;
-            let reach = history.len().checked_add(builder.produced)?;
+            let reach = history_bytes.checked_add(builder.produced)?;
             let mut run = usize::try_from(shape.run).ok()?.min(left);
             if first && reach < distance {
                 run = run.max(distance.checked_sub(reach)?).min(left);
@@ -930,7 +1132,7 @@ mod tests {
                 }),
             )?;
         }
-        builder.finish(history.len())
+        Some(())
     }
 
     /// The shapes every round trip is checked over.
@@ -975,6 +1177,30 @@ mod tests {
         ]
     }
 
+    /// Assembles one block's payload and adopts it, which is what emitting it would do.
+    fn assemble(
+        encoder: &mut Encoder,
+        sequences: &Sequences,
+        first_in_region: bool,
+        repeat: [bool; BLOCK_STREAMS],
+    ) -> Result<Vec<u8>, Error> {
+        let mut payload = Vec::new();
+        let assembly = encoder
+            .assemble_into(
+                sequences,
+                Terms {
+                    first_in_region,
+                    reuse: Reuse::Named(repeat),
+                    ceiling: usize::MAX,
+                },
+                &DecoderPolicy::CONSERVATIVE,
+                &mut payload,
+            )?
+            .ok_or(Error::InvalidParameter)?;
+        encoder.adopt(assembly);
+        Ok(payload)
+    }
+
     /// Assembles one block and reads it back, and reports its stored payload.
     fn round_trip(
         plan: &Plan,
@@ -985,7 +1211,20 @@ mod tests {
         decoder: &mut Decoder,
     ) -> Result<Vec<u8>, Error> {
         let policy = DecoderPolicy::CONSERVATIVE;
-        let payload = encoder.assemble(&plan.sequences, first_in_region, repeat, &policy)?;
+        let mut payload = Vec::new();
+        let assembly = encoder
+            .assemble_into(
+                &plan.sequences,
+                Terms {
+                    first_in_region,
+                    reuse: Reuse::Named(repeat),
+                    ceiling: usize::MAX,
+                },
+                &policy,
+                &mut payload,
+            )?
+            .ok_or(Error::InvalidParameter)?;
+        encoder.adopt(assembly);
         let mut out = vec![0_u8; plan.content.len()];
         let block = Block {
             arrived: &payload,
@@ -1064,17 +1303,69 @@ mod tests {
     fn a_compressed_block_round_trips_at_every_shape_and_size() -> Result<(), Error> {
         let sizes = [1_usize, 2, 4_096, 16_384, 65_536];
         let mut checked = 0usize;
+        let mut carried = 0usize;
         for size in sizes {
             for (index, shape) in shapes().into_iter().enumerate() {
                 let seed = u64::try_from(index).unwrap_or(0).saturating_add(1);
                 let plan = plan(shape, size, &[], seed).ok_or(Error::InvalidParameter)?;
                 assert_eq!(plan.content.len(), size, "the plan did not fill the block");
-                let payload = one_block(&plan)?;
+                let mut encoder = Encoder::at_region_start();
+                let mut decoder = Decoder::at_region_start();
+                let mut payload = Vec::new();
+                let assembly = encoder
+                    .assemble_into(
+                        &plan.sequences,
+                        Terms {
+                            first_in_region: true,
+                            reuse: Reuse::Named(FRESH),
+                            ceiling: usize::MAX,
+                        },
+                        &DecoderPolicy::CONSERVATIVE,
+                        &mut payload,
+                    )?
+                    .ok_or(Error::InvalidParameter)?;
+                encoder.adopt(assembly);
                 assert!(
                     !payload.is_empty(),
                     "a block of {size} bytes in shape {index} stored nothing"
                 );
                 checked = checked.saturating_add(1);
+
+                let compresses = payload.len() < size;
+                let read = read_with(
+                    &payload,
+                    u64::try_from(payload.len()).unwrap_or(u64::MAX),
+                    size,
+                    true,
+                    &[],
+                    &mut decoder,
+                );
+                if compresses {
+                    assert_eq!(
+                        read,
+                        Ok(payload.len()),
+                        "shape {index} at {size} bytes did not spend its payload"
+                    );
+                    carried = carried.saturating_add(1);
+                } else {
+                    assert_eq!(
+                        read,
+                        Err(Error::CorruptData(Corruption::BlockExpansion)),
+                        "shape {index} at {size} bytes stored {} bytes and was not refused",
+                        payload.len()
+                    );
+                }
+
+                // A block of one or two bytes is narrower than any prologue, and the shape
+                // that holds no structure is above its own size until the literal code has a
+                // whole block of symbols to amortize its description over.
+                let expands = size < 4_096 || (index == 0 && size < 65_536);
+                assert_eq!(
+                    compresses,
+                    !expands,
+                    "shape {index} at {size} bytes stored {} bytes",
+                    payload.len()
+                );
             }
         }
         assert_eq!(
@@ -1082,6 +1373,225 @@ mod tests {
             sizes.len().saturating_mul(shapes().len()),
             "a shape was skipped rather than round-tripped"
         );
+        assert_eq!(
+            carried, 16,
+            "every block below its own decoded size carried, and no other did"
+        );
+        Ok(())
+    }
+
+    /// The expansion bound: a block that stores at least what it decodes to is refused, and
+    /// the refusal precedes every allocation the block would size.
+    #[test]
+    fn a_compressed_block_that_stores_its_decoded_size_is_refused_before_its_payload()
+    -> Result<(), Error> {
+        let shape = Shape {
+            run: 8,
+            length: 0,
+            distance: 0,
+            alphabet: 256,
+        };
+        let plan = plan(shape, 64, &[], 91).ok_or(Error::InvalidParameter)?;
+        let mut encoder = Encoder::at_region_start();
+        let mut payload = Vec::new();
+        let assembly = encoder
+            .assemble_into(
+                &plan.sequences,
+                Terms {
+                    first_in_region: true,
+                    reuse: Reuse::Named(FRESH),
+                    ceiling: usize::MAX,
+                },
+                &DecoderPolicy::CONSERVATIVE,
+                &mut payload,
+            )?
+            .ok_or(Error::InvalidParameter)?;
+        encoder.adopt(assembly);
+        assert!(
+            payload.len() >= plan.content.len(),
+            "the block was meant to be one no encoder would emit"
+        );
+
+        let mut refused = Vec::new();
+        assert!(
+            encoder
+                .assemble_into(
+                    &plan.sequences,
+                    Terms {
+                        first_in_region: true,
+                        reuse: Reuse::Named(FRESH),
+                        ceiling: plan.content.len(),
+                    },
+                    &DecoderPolicy::CONSERVATIVE,
+                    &mut refused,
+                )?
+                .is_none(),
+            "an assembly at the size a decoder refuses was written out"
+        );
+        assert!(refused.is_empty(), "a refused assembly wrote bytes");
+
+        let (error, built) = refuse(&payload, plan.content.len());
+        assert_eq!(error, Error::CorruptData(Corruption::BlockExpansion));
+        assert_eq!(
+            built, 0,
+            "the bound is read from the twelve extents, before a table exists"
+        );
+
+        // One byte of decoded size more than the block stores is the first size it is not
+        // refused at, which is what makes the refusal a boundary and not a constant.
+        let mut wider = plan.content.clone();
+        wider.resize(payload.len().saturating_add(1), 0);
+        let mut decoder = Decoder::at_region_start();
+        let read = read_with(
+            &payload,
+            u64::try_from(payload.len()).unwrap_or(u64::MAX),
+            wider.len(),
+            true,
+            &[],
+            &mut decoder,
+        );
+        assert_ne!(read, Err(Error::CorruptData(Corruption::BlockExpansion)));
+        Ok(())
+    }
+
+    /// The reuse trigger: a stream names the table in force only when that spends fewer bits.
+    #[test]
+    fn a_stream_repeats_a_table_only_when_repeating_is_cheaper() -> Result<(), Error> {
+        let shape = Shape {
+            run: 9,
+            length: 14,
+            distance: 48,
+            alphabet: 40,
+        };
+        let mut encoder = Encoder::at_region_start();
+        let mut decoder = Decoder::at_region_start();
+        let first = plan(shape, 4_096, &[], 51).ok_or(Error::InvalidParameter)?;
+        let _first = round_trip(&first, &[], true, FRESH, &mut encoder, &mut decoder)?;
+
+        let next = plan(shape, 4_096, &first.content, 52).ok_or(Error::InvalidParameter)?;
+        let policy = DecoderPolicy::CONSERVATIVE;
+        let mut fresh = Vec::new();
+        let _fresh = encoder.assemble_into(
+            &next.sequences,
+            Terms {
+                first_in_region: false,
+                reuse: Reuse::Named(FRESH),
+                ceiling: usize::MAX,
+            },
+            &policy,
+            &mut fresh,
+        )?;
+        let mut chosen = Vec::new();
+        let assembly = encoder
+            .assemble_into(
+                &next.sequences,
+                Terms {
+                    first_in_region: false,
+                    reuse: Reuse::SelfFinancing,
+                    ceiling: usize::MAX,
+                },
+                &policy,
+                &mut chosen,
+            )?
+            .ok_or(Error::InvalidParameter)?;
+        let repeated = assembly.repeated();
+        encoder.adopt(assembly);
+
+        assert!(
+            repeated.iter().any(|&stream| stream),
+            "no stream of a block that follows a like block named the table in force"
+        );
+        assert!(
+            chosen.len() <= fresh.len(),
+            "the trigger chose {} stored bytes where a description in every stream cost {}",
+            chosen.len(),
+            fresh.len()
+        );
+
+        let size = u32::try_from(next.content.len()).map_err(|_| Error::InvalidParameter)?;
+        let (prologue, _used) = BlockPrologue::decode(&chosen, size, false, &policy)?;
+        for index in 0..BLOCK_STREAMS {
+            let stream = prologue.stream(index).ok_or(Error::InvalidParameter)?;
+            assert_eq!(
+                stream.repeats,
+                repeated.get(index).copied().unwrap_or(false),
+                "stream {index} declared a mode bit the assembly did not report"
+            );
+            if stream.repeats {
+                assert_eq!(
+                    stream.description_bits, 0,
+                    "stream {index} repeated and described"
+                );
+            }
+        }
+
+        let mut out = vec![0_u8; next.content.len()];
+        let block = Block {
+            arrived: &chosen,
+            declared: u64::try_from(chosen.len()).unwrap_or(u64::MAX),
+            first_in_region: false,
+            history: &first.content,
+        };
+        let spent = decoder.read(&block, &policy, &mut out)?;
+        assert_eq!(spent, chosen.len());
+        assert_eq!(
+            out, next.content,
+            "a repeating block did not decode to its content"
+        );
+        Ok(())
+    }
+
+    /// A table in force that cannot code a symbol of the next block is not named by it.
+    #[test]
+    fn a_stream_does_not_repeat_a_table_that_cannot_code_it() -> Result<(), Error> {
+        let narrow = Shape {
+            run: 6,
+            length: 10,
+            distance: 32,
+            alphabet: 2,
+        };
+        let wide = Shape {
+            run: 6,
+            length: 10,
+            distance: 32,
+            alphabet: 200,
+        };
+        let mut encoder = Encoder::at_region_start();
+        let mut decoder = Decoder::at_region_start();
+        let first = plan(narrow, 4_096, &[], 61).ok_or(Error::InvalidParameter)?;
+        let _first = round_trip(&first, &[], true, FRESH, &mut encoder, &mut decoder)?;
+
+        let next = plan(wide, 4_096, &first.content, 62).ok_or(Error::InvalidParameter)?;
+        let policy = DecoderPolicy::CONSERVATIVE;
+        let mut payload = Vec::new();
+        let assembly = encoder
+            .assemble_into(
+                &next.sequences,
+                Terms {
+                    first_in_region: false,
+                    reuse: Reuse::SelfFinancing,
+                    ceiling: usize::MAX,
+                },
+                &policy,
+                &mut payload,
+            )?
+            .ok_or(Error::InvalidParameter)?;
+        let repeated = assembly.repeated();
+        encoder.adopt(assembly);
+        assert!(
+            !repeated.get(LITERAL_BYTE_STREAM).copied().unwrap_or(true),
+            "a literal code built over two symbols was named for a block of two hundred"
+        );
+
+        let mut out = vec![0_u8; next.content.len()];
+        let block = Block {
+            arrived: &payload,
+            declared: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+            first_in_region: false,
+            history: &first.content,
+        };
+        let _spent = decoder.read(&block, &policy, &mut out)?;
+        assert_eq!(out, next.content);
         Ok(())
     }
 
@@ -1140,7 +1650,17 @@ mod tests {
                 }),
             )
             .ok_or(Error::InvalidParameter)?;
-        builder.step(3, None).ok_or(Error::InvalidParameter)?;
+        // The tail is one literal run rather than more matches, so the block is long enough
+        // for a table to pay for itself and still carries exactly the two coded offsets.
+        let tail = 2_048_usize
+            .checked_sub(builder.produced)
+            .ok_or(Error::InvalidParameter)?;
+        builder
+            .step(
+                u32::try_from(tail).map_err(|_| Error::InvalidParameter)?,
+                None,
+            )
+            .ok_or(Error::InvalidParameter)?;
         let third = builder
             .finish(region.len())
             .ok_or(Error::InvalidParameter)?;
@@ -1188,12 +1708,11 @@ mod tests {
                 }),
             )
             .ok_or(Error::InvalidParameter)?;
-        builder.step(4, None).ok_or(Error::InvalidParameter)?;
+        fill(&mut builder, shape, 2_048, first.content.len()).ok_or(Error::InvalidParameter)?;
         let next = builder
             .finish(first.content.len())
             .ok_or(Error::InvalidParameter)?;
-        let payload =
-            encoder.assemble(&next.sequences, false, FRESH, &DecoderPolicy::CONSERVATIVE)?;
+        let payload = assemble(&mut encoder, &next.sequences, false, FRESH)?;
 
         decoder.reset();
         assert_eq!(decoder.table_bytes(), 0, "a region boundary kept a table");
@@ -1556,8 +2075,7 @@ mod tests {
             alphabet: 32,
         };
         let next = plan(shape, 256, &first.content, 132).ok_or(Error::InvalidParameter)?;
-        let payload =
-            encoder.assemble(&next.sequences, false, FRESH, &DecoderPolicy::CONSERVATIVE)?;
+        let payload = assemble(&mut encoder, &next.sequences, false, FRESH)?;
         let named = edited(&payload, false, false, |prologue| {
             prologue.mode = 0b0000_1000;
             if let Some(slot) = prologue.description_bits.get_mut(MATCH_DISTANCE_STREAM) {
@@ -1578,8 +2096,7 @@ mod tests {
         // A stream that declares no symbols names no table either, which is the other half of
         // the same rule and is answered before a description is parsed.
         let quiet = plan(literals, 256, &first.content, 133).ok_or(Error::InvalidParameter)?;
-        let payload =
-            encoder.assemble(&quiet.sequences, false, FRESH, &DecoderPolicy::CONSERVATIVE)?;
+        let payload = assemble(&mut encoder, &quiet.sequences, false, FRESH)?;
         let named = edited(&payload, false, false, |prologue| {
             prologue.mode = 0b0000_1000;
         })?;
@@ -1692,7 +2209,13 @@ mod tests {
     /// exit condition that owns the count.
     #[test]
     fn a_block_that_ends_with_a_symbol_count_unspent_is_corrupt() -> Result<(), Error> {
-        let mut builder = Builder::new(&[], 161, 48);
+        let shape = Shape {
+            run: 12,
+            length: 8,
+            distance: 64,
+            alphabet: 48,
+        };
+        let mut builder = Builder::new(&[], 161, shape.alphabet);
         builder
             .step(
                 100,
@@ -1702,7 +2225,7 @@ mod tests {
                 }),
             )
             .ok_or(Error::InvalidParameter)?;
-        builder.step(50, None).ok_or(Error::InvalidParameter)?;
+        fill(&mut builder, shape, 2_048, 0).ok_or(Error::InvalidParameter)?;
         let plan = builder.finish(0).ok_or(Error::InvalidParameter)?;
         let payload = one_block(&plan)?;
 
