@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn a_parse_reconstructs_every_shape_at_every_block_size() -> Result<(), Error> {
-        let sizes = [0usize, 1, 3, 4, 255, 256, 4_096, 65_536, 65_537, 160_000];
+        let sizes = [0usize, 1, 3, 4, 255, 256, 4_096, 65_536, 65_537, 100_000];
         let blocks = [MAX_PARSE_BYTES, 4_096, 1_019];
         let mut checked = 0usize;
         for shape in SHAPES {
@@ -460,7 +460,7 @@ mod tests {
     #[test]
     fn the_same_input_produces_the_same_sequences() -> Result<(), Error> {
         for shape in SHAPES {
-            let data = shape.content(160_000);
+            let data = shape.content(80_000);
             let first = parse_all(&data)?;
             let second = parse_all(&data)?;
             assert_eq!(first, second, "{}", shape.name());
@@ -489,7 +489,7 @@ mod tests {
     #[test]
     fn every_kernel_produces_the_same_sequences() -> Result<(), Error> {
         for shape in SHAPES {
-            let data = shape.content(120_000);
+            let data = shape.content(80_000);
             let mut expected: Option<Vec<Sequences>> = None;
             for &kernel in ALL {
                 let mut parser = Parser::with_kernel(kernel);

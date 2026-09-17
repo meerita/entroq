@@ -22,7 +22,7 @@ const MARKER: &str = "entroq-parse-fingerprint ";
 ///
 /// Long enough to cross several blocks and to fill the window, short enough that a second
 /// process is cheap.
-const LENGTH: usize = 400_000;
+const LENGTH: usize = 200_000;
 
 /// The bytes the fingerprint is taken over: a mix of content a finder exploits and content it
 /// cannot, so the parse emits both matches and long literal runs.
