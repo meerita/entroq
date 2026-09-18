@@ -23,8 +23,10 @@
 //! with the reason.
 //!
 //! A host that has not built the laboratory compiles this tool, builds the laboratory with
-//! it, and links on the next build. Until then a measurement fails and says so; it never
-//! reports a partial set of competitors as if it were the set.
+//! it, and links on the next build. Until then a measurement fails and says so, whichever
+//! codec it names: this tool exists to compare, and a binary that could measure one side of a
+//! comparison alone would produce a number nobody could place. It never reports a partial set
+//! of competitors as if it were the set.
 //!
 //! Both build inputs live outside the repository. This tool writes no artifact inside it.
 
