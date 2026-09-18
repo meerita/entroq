@@ -24,6 +24,7 @@ use crate::error::{Error, Result};
 use crate::measure::{Measurement, Outcome, Sampling};
 use crate::parse::SCHEMA;
 use crate::plan::Request;
+use crate::subject::Subject;
 
 /// The file a segment's document is written to inside its evidence directory.
 const FILE: &str = "result.json";
@@ -31,17 +32,32 @@ const FILE: &str = "result.json";
 /// The variable the runner sets to the directory a segment's evidence goes to.
 pub const SEGMENT_DIR: &str = "ENTROQ_SEGMENT_DIR";
 
-/// Why the Entroq column of every result is empty.
+/// What the Entroq column of a result means, for a segment that measured the codec.
+const ENTROQ_MEASURED: &str = "This segment measured Entroq, driven in-process through the \
+crate of this workspace at the revision the environment records. It crossed the same \
+boundary a competitor crosses: one call, one process, no subprocess and no command line \
+tool.";
+
+/// What the Entroq column of a result means, for a segment that measured a competitor.
 ///
-/// It is empty because this harness links no Entroq codec. It is stated rather than left
-/// blank, and no zero, no placeholder, and no absent row stands in for it.
-const ENTROQ_ABSENT: &str = "This harness links no Entroq codec at this revision. The \
-encoder and decoder that exist store content without compressing it, so there is no \
-compressed size and no compression work to time, and this result carries no Entroq row. No \
-zero, no placeholder, and no default stands in for one.";
+/// It is stated rather than left blank, and no zero, no placeholder, and no absent row stands
+/// in for a number nobody measured here.
+const ENTROQ_ELSEWHERE: &str = "This segment measured a competitor, so it carries no Entroq \
+row. The harness links the Entroq codec and measures it in its own segment. No zero, no \
+placeholder, and no default stands in for a number this segment did not produce.";
+
+/// The Entroq column of one segment's result.
+fn entroq_column(request: &Request) -> (bool, &'static str) {
+    if request.subject == Subject::Entroq {
+        (true, ENTROQ_MEASURED)
+    } else {
+        (false, ENTROQ_ELSEWHERE)
+    }
+}
 
 /// Builds the document for one segment.
 pub fn document(request: &Request, outcome: &Outcome, produced_at: &str) -> Value {
+    let (measured, reason) = entroq_column(request);
     json!({
         "schema": SCHEMA,
         "produced_at": produced_at,
@@ -49,14 +65,14 @@ pub fn document(request: &Request, outcome: &Outcome, produced_at: &str) -> Valu
         "tier": request.tier.name(),
         "tier_is_publication": request.tier.is_publication(),
         "tier_licence": request.tier.licence(),
-        "codec": request.codec.name,
+        "codec": request.subject.name(),
         "size_class": request.class.map_or(Value::Null, |class| Value::from(class.name())),
         "operating_point_group": request
             .points
             .map_or(Value::Null, |group| Value::from(group.name)),
         "entroq": {
-            "measured": false,
-            "reason": ENTROQ_ABSENT,
+            "measured": measured,
+            "reason": reason,
         },
         "environment": environment_json(outcome),
         "laboratory": laboratory_json(request, outcome),
@@ -89,7 +105,7 @@ fn environment_json(outcome: &Outcome) -> Value {
         "build_profile": environment.build_profile,
         "entroq_revision": environment.revision,
         "harness_version": environment.harness_version,
-        "encoder_version": Value::Null,
+        "encoder_version": codec::VERSION,
         "statistics_enabled": false,
         "counter_backend": {
             "name": environment.counter.name,
@@ -104,10 +120,11 @@ fn environment_json(outcome: &Outcome) -> Value {
 }
 
 fn laboratory_json(request: &Request, outcome: &Outcome) -> Value {
+    let name = request.subject.name();
     let libraries = outcome
         .laboratory
         .iter()
-        .filter(|check| check.codec == request.codec.name)
+        .filter(|check| check.codec == name)
         .map(|check| {
             json!({
                 "codec": check.codec,
@@ -120,26 +137,43 @@ fn laboratory_json(request: &Request, outcome: &Outcome) -> Value {
             })
         })
         .collect::<Vec<_>>();
+    // Entroq has no upstream pin and no archive. Its provenance is the repository revision,
+    // which is what a rebuild of this binary reproduces it from, so the field that names a
+    // competitor's commit names that revision and the provenance says so.
+    let commit = request
+        .subject
+        .competitor()
+        .map_or(outcome.environment.revision.as_str(), |codec| codec.commit);
     json!({
-        "codec": request.codec.name,
-        "pinned_version": request.codec.version,
-        "upstream_commit": request.codec.commit,
+        "codec": name,
+        "pinned_version": request.subject.version(),
+        "upstream_commit": commit,
         "reported_version": outcome.linked_version.clone().map_or(Value::Null, Value::from),
         "version_agrees": outcome
             .linked_version
             .as_ref()
             .map_or(Value::Null, |reported| {
-                Value::from(request.codec.version.contains(reported.as_str()))
+                Value::from(request.subject.version().contains(reported.as_str()))
             }),
         "libraries": libraries,
         "other_codecs_linked": other_codecs(request, outcome),
-        "provenance": "Every archive the linker was given is named by absolute path above, \
-                       and its digest is the digest the laboratory manifest records. The \
-                       linker was given no search path other than the laboratory's own, so \
-                       a copy of the same project installed elsewhere on this host was not \
-                       reachable. A competitor whose library publishes its version reports \
-                       it above, checked against the version the catalog pins.",
+        "provenance": provenance(request),
     })
+}
+
+/// How the bytes this segment measured were obtained.
+const fn provenance(request: &Request) -> &'static str {
+    if request.subject.competitor().is_none() {
+        return "Entroq is a crate of this workspace and no archive was linked for it, so the \
+                commit above is the repository revision this binary was built from and the \
+                library list is empty. The version above is the one the codec crate declares \
+                for itself, which the session reports back at run time.";
+    }
+    "Every archive the linker was given is named by absolute path above, and its digest is \
+     the digest the laboratory manifest records. The linker was given no search path other \
+     than the laboratory's own, so a copy of the same project installed elsewhere on this \
+     host was not reachable. A competitor whose library publishes its version reports it \
+     above, checked against the version the catalog pins."
 }
 
 /// The competitors this binary also linked, named once each.
@@ -149,7 +183,7 @@ fn laboratory_json(request: &Request, outcome: &Outcome) -> Value {
 fn other_codecs(request: &Request, outcome: &Outcome) -> Vec<Value> {
     let mut named: Vec<String> = Vec::new();
     for check in &outcome.laboratory {
-        if check.codec == request.codec.name {
+        if check.codec == request.subject.name() {
             continue;
         }
         let entry = format!("{} {}", check.codec, check.version);
@@ -259,7 +293,7 @@ fn limits(request: &Request, outcome: &Outcome) -> Value {
     let counter = counters::unavailable_reason(&outcome.environment.counter);
     let mut limits = vec![
         String::from(request.tier.licence()),
-        String::from(ENTROQ_ABSENT),
+        String::from(entroq_column(request).1),
         String::from(
             "Every number here was produced on one host and one architecture. Nothing here \
              compares two environments.",
@@ -319,7 +353,7 @@ pub fn emit(document: &Value) -> Result<Option<PathBuf>> {
 pub fn log(request: &Request, outcome: &Outcome, written: Option<&Path>) {
     eprintln!(
         "{} at the {} tier: {} measurements over {} entries, {} bytes",
-        request.codec.display,
+        request.subject.display(),
         request.tier.name(),
         outcome.measurements.len(),
         outcome.selection.selected.len(),
@@ -328,7 +362,7 @@ pub fn log(request: &Request, outcome: &Outcome, written: Option<&Path>) {
     for check in outcome
         .laboratory
         .iter()
-        .filter(|check| check.codec == request.codec.name)
+        .filter(|check| check.codec == request.subject.name())
     {
         eprintln!(
             "  linked {} {}  {}  manifest {}",
@@ -363,7 +397,7 @@ pub fn log(request: &Request, outcome: &Outcome, written: Option<&Path>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ENTROQ_ABSENT, SCHEMA, SEGMENT_DIR};
+    use super::{ENTROQ_ELSEWHERE, ENTROQ_MEASURED, SCHEMA, SEGMENT_DIR};
 
     #[test]
     fn the_schema_is_versioned_so_a_parser_can_match_on_it() {
@@ -371,9 +405,11 @@ mod tests {
     }
 
     #[test]
-    fn the_entroq_column_says_why_it_is_empty() {
-        assert!(ENTROQ_ABSENT.contains("links no Entroq codec"));
-        assert!(ENTROQ_ABSENT.contains("No zero"));
+    fn the_entroq_column_says_what_it_holds_either_way() {
+        assert!(ENTROQ_MEASURED.contains("measured Entroq"));
+        assert!(ENTROQ_MEASURED.contains("same boundary"));
+        assert!(ENTROQ_ELSEWHERE.contains("no Entroq row"));
+        assert!(ENTROQ_ELSEWHERE.contains("No zero"));
     }
 
     #[test]

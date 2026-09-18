@@ -65,10 +65,52 @@ pub const RECORD_TAG_BYTES: usize = 1;
 /// The bytes the terminator occupies.
 pub const TERMINATOR_BYTES: usize = RECORD_TAG_BYTES;
 
+/// The streams a COMPRESSED block carries, one per symbol class.
+pub const BLOCK_STREAMS: usize = 4;
+
+/// The stream of the literal bytes, which carries no raw suffix.
+pub const LITERAL_BYTE_STREAM: usize = 0;
+
+/// The stream of the literal-run lengths.
+pub const LITERAL_RUN_STREAM: usize = 1;
+
+/// The stream of the match lengths, which carries the symbol that ends a block.
+pub const MATCH_LENGTH_STREAM: usize = 2;
+
+/// The stream of the match distances, which carries the code that names the offset slot.
+pub const MATCH_DISTANCE_STREAM: usize = 3;
+
+/// The symbol model version 1 defines.
+///
+/// It names the boundary set every alphabet of a COMPRESSED block is built from and the depth
+/// of the offset cache. Every other value is a well-formed model this build does not implement.
+pub const BLOCK_MODEL_V1: u8 = 0;
+
+/// The bytes the widest COMPRESSED prologue occupies.
+///
+/// The model byte, the mode byte, and seventeen declared quantities of ten bytes each.
+pub const BLOCK_PROLOGUE_MAX_BYTES: usize = 172;
+
+/// The mode-field bits version 1 does not define, and that a decoder rejects when set.
+const MODE_REJECT_RESERVED: u8 = 0b1111_0000;
+
 /// The largest size a block header can declare.
 ///
 /// The block size field is 29 bits wide. The width is provisional.
 pub const MAX_BLOCK_BYTES: u32 = 0x1FFF_FFFF;
+
+/// The decoded size of a COMPRESSED block a default policy admits.
+///
+/// A COMPRESSED block is not expanded one step at a time: a decoder holds its whole stored
+/// body and the whole content it decodes to, because a match in it may name any byte the
+/// block has already produced. So the decoded size a block declares is a memory requirement,
+/// and a decoder states the figure it will hold before a block arrives rather than sizing
+/// itself from whatever the stream asks for. A block declaring more is `LimitExceeded`, and a
+/// caller that wants to decode one raises the limit deliberately.
+///
+/// The value is a decoder resource policy and not a format constant. It is the block length
+/// this generation of the encoder cuts at, and it is provisional.
+pub const DEFAULT_MAX_BLOCK_BYTES: u32 = 65_536;
 
 const CONTENT_LENGTH_BYTES: usize = 8;
 const DICTIONARY_ID_BYTES: usize = 4;
@@ -143,8 +185,18 @@ pub enum Error {
 pub enum Feature {
     /// A frame flag in ignore-reserved space that version 1 does not define.
     ReservedFrameFlag,
-    /// A compressed block, which the type space reserves and no version yet defines.
+    /// A compressed block, on a path that reads a payload from its header alone.
+    ///
+    /// The streaming pair reads the type. `BlockHeader::payload` and `BlockHeader::expand`
+    /// answer from the header, and a COMPRESSED block declares its stored length in its own
+    /// prologue rather than in its header, so those two say so here rather than reporting the
+    /// block as damaged.
     CompressedBlock,
+    /// A symbol model a COMPRESSED block names and this build does not implement.
+    BlockModel {
+        /// The value the block declared.
+        model: u8,
+    },
 }
 
 /// The format contract a stream violated.
@@ -174,6 +226,62 @@ pub enum Corruption {
     ContentLength,
     /// A header needs more bytes than the widest form the format defines.
     HeaderWidth,
+    /// A table description declares a code longer than the format permits.
+    CodeLength,
+    /// The declared code lengths are not a complete prefix code.
+    KraftSum,
+    /// A table description carries a length count its alphabet does not admit.
+    LengthCount,
+    /// A table description token repeats a value nothing declared, or runs past its alphabet.
+    DescriptionToken,
+    /// A table description declares a table log outside the range the format permits.
+    TableLog,
+    /// The declared frequencies do not sum to the table total they declare.
+    FrequencySum,
+    /// A table description names a symbol outside the alphabet it declares.
+    SymbolAlphabet,
+    /// A coded payload does not decode under the table its block declared.
+    CodedStream,
+    /// A sequence stream carries a symbol its alphabet does not hold.
+    SequenceSymbol,
+    /// A raw suffix takes a coded value past the domain its alphabet declares.
+    SequenceSuffix,
+    /// A sequence stream carries raw suffix bits that its symbols do not account for.
+    SequenceExtent,
+    /// The symbol counts of the four sequence streams do not describe one block.
+    SequenceCount,
+    /// The terminal symbol occurs anywhere but as the last match-length symbol of a block.
+    TerminalSymbol,
+    /// A repeat code names the offset slot before any match has set it.
+    RepeatUnset,
+    /// A repeat code resolves to a distance below one.
+    RepeatDistance,
+    /// A declared quantity continues past the width a 64-bit value has.
+    Varint,
+    /// The mode field of a COMPRESSED block sets a reject-reserved bit.
+    ModeReserved,
+    /// The mode field names a table in force for a stream that declares no symbols.
+    ModeStream,
+    /// A stream names a table in force that no block of its region has built.
+    TableUnset,
+    /// The declared peak table memory contradicts the tables the block decodes under.
+    TableMemory,
+    /// A declared symbol count is above the ceiling the block's decoded size implies.
+    BlockCount,
+    /// A description extent contradicts the table its stream named.
+    BlockDescription,
+    /// A payload extent contradicts what the coder consumed under the declared table.
+    BlockPayload,
+    /// A stream declares a section its class or its symbol count does not carry.
+    BlockSection,
+    /// The declared extents do not spend the block's stored body.
+    BlockExtent,
+    /// The sequences do not spend the block's decoded size exactly.
+    BlockContent,
+    /// A match reaches back past the bytes its region has produced.
+    MatchReach,
+    /// A COMPRESSED block stores at least the bytes it decodes to.
+    BlockExpansion,
 }
 
 impl fmt::Display for Error {
@@ -201,10 +309,13 @@ impl fmt::Display for Error {
 
 impl fmt::Display for Feature {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
-        out.write_str(match *self {
-            Self::ReservedFrameFlag => "a frame flag this version does not define",
-            Self::CompressedBlock => "a compressed block",
-        })
+        match *self {
+            Self::ReservedFrameFlag => out.write_str("a frame flag this version does not define"),
+            Self::CompressedBlock => {
+                out.write_str("a compressed block on a path that reads only a header")
+            }
+            Self::BlockModel { model } => write!(out, "symbol model {model} is not implemented"),
+        }
     }
 }
 
@@ -223,6 +334,34 @@ impl fmt::Display for Corruption {
             Self::RegionMismatch => "the region contents contradict its header",
             Self::ContentLength => "the frame length contradicts its header",
             Self::HeaderWidth => "a header is wider than the format defines",
+            Self::CodeLength => "a declared code is longer than the format permits",
+            Self::KraftSum => "the declared code lengths are not a complete prefix code",
+            Self::LengthCount => "the declared length count contradicts the alphabet",
+            Self::DescriptionToken => "a table description token is undefined at its position",
+            Self::TableLog => "the table log is out of range",
+            Self::FrequencySum => "the declared frequencies contradict the table total",
+            Self::SymbolAlphabet => "a declared symbol is outside its alphabet",
+            Self::CodedStream => "a coded payload does not decode under its declared table",
+            Self::SequenceSymbol => "a sequence symbol is outside its alphabet",
+            Self::SequenceSuffix => "a raw suffix names a value outside its domain",
+            Self::SequenceExtent => "a sequence stream carries suffix bits no symbol declared",
+            Self::SequenceCount => "the sequence stream counts do not describe one block",
+            Self::TerminalSymbol => "the terminal symbol occurs where a block does not end",
+            Self::RepeatUnset => "a repeat code names an unset offset slot",
+            Self::RepeatDistance => "a repeat code resolves to a distance below one",
+            Self::Varint => "a declared quantity is wider than the format permits",
+            Self::ModeReserved => "the block mode field sets a reserved bit",
+            Self::ModeStream => "a stream with no symbols names a table in force",
+            Self::TableUnset => "a stream names a table in force that nothing has built",
+            Self::TableMemory => "the declared table memory contradicts the block's descriptions",
+            Self::BlockCount => "a declared symbol count contradicts the block's decoded size",
+            Self::BlockDescription => "a description extent contradicts the table its stream named",
+            Self::BlockPayload => "a payload extent contradicts what the coder consumed",
+            Self::BlockSection => "a stream declares a section it does not carry",
+            Self::BlockExtent => "the declared extents do not spend the block's stored body",
+            Self::BlockContent => "the sequences do not spend the block's decoded size",
+            Self::MatchReach => "a match reaches past the bytes its region has produced",
+            Self::BlockExpansion => "a compressed block stores at least its decoded size",
         })
     }
 }
@@ -593,23 +732,107 @@ impl FrameHeader {
 /// The limits a caller places on a frame before a decoder commits memory to it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DecoderPolicy {
-    max_history_bytes: u64,
+    history_bytes: u64,
+    table_bytes: u64,
+    block_ceiling: u32,
 }
 
 impl DecoderPolicy {
-    /// The default policy, which admits a frame up to the small resource class.
+    /// The default policy, which admits a frame up to the small resource class and a block
+    /// whose tables reach the version 1 ceiling.
     ///
-    /// A caller raises the limit deliberately.
+    /// A caller raises the history limit deliberately, and can only lower the table limit:
+    /// the version 1 ceiling is a format constant and no policy widens it.
     pub const CONSERVATIVE: Self = Self {
-        max_history_bytes: ResourceClass::Small.history_bytes(),
+        history_bytes: ResourceClass::Small.history_bytes(),
+        table_bytes: crate::entropy::MAX_BLOCK_TABLE_BYTES,
+        block_ceiling: DEFAULT_MAX_BLOCK_BYTES,
     };
 
     /// A policy that admits a frame declaring at most `bytes` of decoder history.
     #[must_use]
     pub const fn with_max_history_bytes(bytes: u64) -> Self {
         Self {
-            max_history_bytes: bytes,
+            history_bytes: bytes,
+            table_bytes: crate::entropy::MAX_BLOCK_TABLE_BYTES,
+            block_ceiling: DEFAULT_MAX_BLOCK_BYTES,
         }
+    }
+
+    /// The same policy, admitting at most `bytes` of table memory per block.
+    #[must_use]
+    pub const fn with_max_table_bytes(self, bytes: u64) -> Self {
+        Self {
+            history_bytes: self.history_bytes,
+            table_bytes: bytes,
+            block_ceiling: self.block_ceiling,
+        }
+    }
+
+    /// The same policy, admitting a COMPRESSED block that decodes to at most `bytes`.
+    ///
+    /// The figure sizes the buffers a decoder holds for one such block, so raising it raises
+    /// the memory a decoder commits before it reads one.
+    #[must_use]
+    pub const fn with_max_block_bytes(self, bytes: u32) -> Self {
+        Self {
+            history_bytes: self.history_bytes,
+            table_bytes: self.table_bytes,
+            block_ceiling: bytes,
+        }
+    }
+
+    /// The table memory this policy admits, which is never above the version 1 ceiling.
+    #[must_use]
+    pub const fn max_table_bytes(&self) -> u64 {
+        self.table_bytes
+    }
+
+    /// The decoded size of a COMPRESSED block this policy admits.
+    #[must_use]
+    pub const fn max_block_bytes(&self) -> u32 {
+        self.block_ceiling
+    }
+
+    /// The bytes a decoder commits for one COMPRESSED block, when policy admits it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LimitExceeded` with the requirement and the ceiling when the block decodes to
+    /// more than this policy allows.
+    pub fn admit_block_bytes(&self, declared: u32) -> Result<u32, Error> {
+        if declared > self.block_ceiling {
+            return Err(Error::LimitExceeded {
+                declared: u64::from(declared),
+                allowed: u64::from(self.block_ceiling),
+            });
+        }
+        Ok(declared)
+    }
+
+    /// The table memory a decoder commits for one block, when policy admits it.
+    ///
+    /// The figure is the whole of what a decoder holds in tables while the block decodes: the
+    /// tables it decodes under, and the tables its region still holds for the streams this
+    /// block does not code. A bound over the block's own declaration alone is one a decoder
+    /// exceeds as soon as a stream carries no symbols.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LimitExceeded` with the requirement and the ceiling when the figure is above
+    /// the version 1 ceiling or above what this policy allows.
+    pub const fn admit_table_bytes(&self, declared: u64) -> Result<u64, Error> {
+        let declared = match crate::entropy::admit_table_bytes(declared) {
+            Ok(value) => value,
+            Err(error) => return Err(error),
+        };
+        if declared > self.table_bytes {
+            return Err(Error::LimitExceeded {
+                declared,
+                allowed: self.table_bytes,
+            });
+        }
+        Ok(declared)
     }
 
     /// The history a decoder must reserve for this frame, when policy admits it.
@@ -620,10 +843,10 @@ impl DecoderPolicy {
     /// the frame asks for more than policy allows.
     pub const fn admit(&self, header: &FrameHeader) -> Result<u64, Error> {
         let declared = header.resource_class.history_bytes();
-        if declared > self.max_history_bytes {
+        if declared > self.history_bytes {
             return Err(Error::LimitExceeded {
                 declared,
-                allowed: self.max_history_bytes,
+                allowed: self.history_bytes,
             });
         }
         Ok(declared)
@@ -811,6 +1034,8 @@ pub enum BlockType {
     Raw,
     /// The payload is one byte, repeated to the declared size.
     Rle,
+    /// The payload is a prologue and four coded symbol streams.
+    Compressed,
 }
 
 /// What a decoder learns about one block before it reads the payload.
@@ -825,7 +1050,8 @@ pub enum BlockType {
 ///
 /// The size is the decoded size for every type. A RAW block stores that many bytes and an
 /// RLE block stores one, which is what makes a run cost one byte instead of a length and a
-/// value.
+/// value. A COMPRESSED block stores what its own prologue declares, which is why the header
+/// alone does not state its stored length.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockHeader {
     /// Whether this is the last block of its region.
@@ -855,12 +1081,25 @@ impl BlockHeader {
         Self::build(last, BlockType::Rle, size)
     }
 
-    /// The bytes this block's payload occupies on the wire.
+    /// A COMPRESSED block header, which declares the decoded size of a coded payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParameter` when the size is zero or above the field's range.
+    pub const fn compressed(last: bool, size: u32) -> Result<Self, Error> {
+        Self::build(last, BlockType::Compressed, size)
+    }
+
+    /// The bytes this block's payload occupies on the wire, when the header declares them.
+    ///
+    /// A COMPRESSED block declares its sections in its own prologue and its stored length is
+    /// the sum of them, so the header alone answers nothing and says so.
     #[must_use]
-    pub const fn stored_len(&self) -> u32 {
+    pub const fn stored_len(&self) -> Option<u32> {
         match self.kind {
-            BlockType::Raw => self.size,
-            BlockType::Rle => 1,
+            BlockType::Raw => Some(self.size),
+            BlockType::Rle => Some(1),
+            BlockType::Compressed => None,
         }
     }
 
@@ -876,6 +1115,7 @@ impl BlockHeader {
         let code = match self.kind {
             BlockType::Raw => BLOCK_CODE_RAW,
             BlockType::Rle => BLOCK_CODE_RLE,
+            BlockType::Compressed => BLOCK_CODE_COMPRESSED,
         };
         let word = u32::from(self.last)
             | shift_left(code, BLOCK_TYPE_SHIFT)
@@ -889,9 +1129,8 @@ impl BlockHeader {
     ///
     /// # Errors
     ///
-    /// Returns `UnsupportedFeature` for a compressed block, `CorruptData` for the reserved
-    /// block type or a size the format does not permit, and `TruncatedInput` when the input
-    /// is shorter than the header.
+    /// Returns `CorruptData` for the reserved block type or a size the format does not
+    /// permit, and `TruncatedInput` when the input is shorter than the header.
     pub fn decode(input: &[u8]) -> Result<(Self, usize), Error> {
         let mut reader = Reader::new(input);
         let short = reader.truncated(BLOCK_HEADER_BYTES);
@@ -900,9 +1139,7 @@ impl BlockHeader {
         let kind = match shift_right(word, BLOCK_TYPE_SHIFT) & BLOCK_TYPE_MASK {
             BLOCK_CODE_RAW => BlockType::Raw,
             BLOCK_CODE_RLE => BlockType::Rle,
-            BLOCK_CODE_COMPRESSED => {
-                return Err(Error::UnsupportedFeature(Feature::CompressedBlock));
-            }
+            BLOCK_CODE_COMPRESSED => BlockType::Compressed,
             _ => return Err(Error::CorruptData(Corruption::BlockType)),
         };
         let size = shift_right(word, BLOCK_SIZE_SHIFT);
@@ -924,9 +1161,11 @@ impl BlockHeader {
     ///
     /// # Errors
     ///
-    /// Returns `TruncatedInput` when `input` is shorter than the payload.
+    /// Returns `TruncatedInput` when `input` is shorter than the payload, and
+    /// `UnsupportedFeature` for a COMPRESSED block, whose stored length this header does not
+    /// declare.
     pub fn payload<'a>(&self, input: &'a [u8]) -> Result<&'a [u8], Error> {
-        let stored = as_usize(self.stored_len())?;
+        let stored = as_usize(self.header_stored_len()?)?;
         input
             .get(..stored)
             .ok_or(Error::TruncatedInput { needed: stored })
@@ -939,10 +1178,11 @@ impl BlockHeader {
     ///
     /// # Errors
     ///
-    /// Returns `OutputTooSmall` when the buffer is shorter than the declared size, and
-    /// `CorruptData` when the payload does not match what the header declared.
+    /// Returns `OutputTooSmall` when the buffer is shorter than the declared size,
+    /// `CorruptData` when the payload does not match what the header declared, and
+    /// `UnsupportedFeature` for a COMPRESSED block, whose payload the block module reads.
     pub fn expand(&self, payload: &[u8], out: &mut [u8]) -> Result<usize, Error> {
-        let stored = as_usize(self.stored_len())?;
+        let stored = as_usize(self.header_stored_len()?)?;
         let decoded = as_usize(self.decoded_len())?;
         if payload.len() != stored {
             return Err(Error::CorruptData(Corruption::BlockSize));
@@ -959,8 +1199,18 @@ impl BlockHeader {
                     .ok_or(Error::CorruptData(Corruption::BlockSize))?;
                 target.fill(value);
             }
+            BlockType::Compressed => {
+                return Err(Error::UnsupportedFeature(Feature::CompressedBlock));
+            }
         }
         Ok(decoded)
+    }
+
+    const fn header_stored_len(self) -> Result<u32, Error> {
+        match self.stored_len() {
+            Some(stored) => Ok(stored),
+            None => Err(Error::UnsupportedFeature(Feature::CompressedBlock)),
+        }
     }
 
     const fn build(last: bool, kind: BlockType, size: u32) -> Result<Self, Error> {
@@ -968,6 +1218,259 @@ impl BlockHeader {
             return Err(Error::InvalidParameter);
         }
         Ok(Self { last, kind, size })
+    }
+}
+
+/// What one stream of a COMPRESSED block declares.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamDeclaration {
+    /// The symbols the stream carries.
+    pub count: u64,
+    /// The bits its description occupies, zero when it names a table in force.
+    pub description_bits: u64,
+    /// The bits its coded payload occupies.
+    pub payload_bits: u64,
+    /// The bits its raw suffixes occupy.
+    pub suffix_bits: u64,
+    /// Whether the stream decodes under the table already in force for its class.
+    pub repeats: bool,
+}
+
+/// What a decoder learns about a COMPRESSED block before it parses a description.
+///
+/// ```text
+/// 1       model
+/// varint  peak table memory
+/// 1       mode, absent on the first block of a region
+/// varint  symbol count, one per stream
+/// varint  description extent, one per stream, in bits
+/// varint  payload extent, one per stream, in bits
+/// varint  suffix extent, one per stream, in bits
+/// ```
+///
+/// The stored body follows: four descriptions, four payloads, then four suffixes, each
+/// starting on a byte. The twelve extents are what let a decoder locate every section before
+/// it decodes any of them, and what let it tell a block that needs more bytes from a block
+/// that is damaged.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BlockPrologue {
+    /// The bytes the tables this block decodes under occupy together.
+    pub table_bytes: u64,
+    /// One bit per stream naming the table in force for it, and zero on the first block of a
+    /// region, where the field is absent and fresh is implied for every stream.
+    pub mode: u8,
+    /// The symbols each stream carries.
+    pub counts: [u64; BLOCK_STREAMS],
+    /// The bits each stream's description occupies.
+    pub description_bits: [u64; BLOCK_STREAMS],
+    /// The bits each stream's coded payload occupies.
+    pub payload_bits: [u64; BLOCK_STREAMS],
+    /// The bits each stream's raw suffixes occupy.
+    pub suffix_bits: [u64; BLOCK_STREAMS],
+}
+
+impl BlockPrologue {
+    /// What one stream declares, or `None` when the block carries no such stream.
+    #[must_use]
+    pub fn stream(&self, index: usize) -> Option<StreamDeclaration> {
+        Some(StreamDeclaration {
+            count: self.counts.get(index).copied()?,
+            description_bits: self.description_bits.get(index).copied()?,
+            payload_bits: self.payload_bits.get(index).copied()?,
+            suffix_bits: self.suffix_bits.get(index).copied()?,
+            repeats: mode_bit(self.mode, index),
+        })
+    }
+
+    /// The bytes the block's twelve sections occupy together.
+    ///
+    /// Every section starts on a byte, so a section of `n` bits occupies `ceil(n / 8)` of
+    /// them. `None` when the twelve do not fit a 64-bit count, which no block can ask for.
+    #[must_use]
+    pub fn body_bytes(&self) -> Option<u64> {
+        let mut total = 0u64;
+        for group in [
+            &self.description_bits,
+            &self.payload_bits,
+            &self.suffix_bits,
+        ] {
+            for &bits in group {
+                total = total.checked_add(bits.div_ceil(8))?;
+            }
+        }
+        Some(total)
+    }
+
+    /// Serializes this prologue.
+    ///
+    /// The mode field is written only when the block is not the first of its region, because
+    /// the field does not exist there.
+    #[must_use]
+    pub fn encode(&self, first_in_region: bool) -> Encoded<BLOCK_PROLOGUE_MAX_BYTES> {
+        let mut writer = Writer::<BLOCK_PROLOGUE_MAX_BYTES>::new();
+        writer.put(u64::from(BLOCK_MODEL_V1), 1);
+        writer.leb128(self.table_bytes);
+        if !first_in_region {
+            writer.put(u64::from(self.mode), 1);
+        }
+        for &count in &self.counts {
+            writer.leb128(count);
+        }
+        for group in [
+            &self.description_bits,
+            &self.payload_bits,
+            &self.suffix_bits,
+        ] {
+            for &bits in group {
+                writer.leb128(bits);
+            }
+        }
+        writer.finish()
+    }
+
+    /// Parses a prologue and reports the bytes it consumed.
+    ///
+    /// The order is the contract. The model is read first, so a block this build does not
+    /// implement is named before anything else is believed. The declared table memory is read
+    /// next, so a block above policy is refused before a symbol count exists. The counts are
+    /// held against the ceiling the decoded size implies, so a block cannot ask for work its
+    /// own header says it cannot produce. Nothing here allocates, and nothing here reads the
+    /// stored body.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnsupportedFeature` for a model this build does not implement, `LimitExceeded`
+    /// when the declared table memory is above policy, `CorruptData` when a field contradicts
+    /// another field or the block's decoded size, and `TruncatedInput` when the input ends
+    /// inside the prologue.
+    pub fn decode(
+        input: &[u8],
+        decoded_size: u32,
+        first_in_region: bool,
+        policy: &DecoderPolicy,
+    ) -> Result<(Self, usize), Error> {
+        let mut reader = Reader::new(input);
+
+        let short = reader.truncated(1);
+        let model = reader.u8().ok_or(short)?;
+        if model != BLOCK_MODEL_V1 {
+            return Err(Error::UnsupportedFeature(Feature::BlockModel { model }));
+        }
+
+        let table_bytes = policy.admit_table_bytes(reader.leb128()?)?;
+
+        let mode = if first_in_region {
+            0
+        } else {
+            let short = reader.truncated(1);
+            let field = reader.u8().ok_or(short)?;
+            if field & MODE_REJECT_RESERVED != 0 {
+                return Err(Error::CorruptData(Corruption::ModeReserved));
+            }
+            field
+        };
+
+        let decoded = u64::from(decoded_size);
+        let mut counts = [0u64; BLOCK_STREAMS];
+        for (index, count) in counts.iter_mut().enumerate() {
+            let declared = reader.leb128()?;
+            if declared > count_ceiling(index, decoded) {
+                return Err(Error::CorruptData(Corruption::BlockCount));
+            }
+            if declared == 0 && mode_bit(mode, index) {
+                return Err(Error::CorruptData(Corruption::ModeStream));
+            }
+            *count = declared;
+        }
+        if counts.get(LITERAL_RUN_STREAM) != counts.get(MATCH_LENGTH_STREAM)
+            || counts.get(MATCH_DISTANCE_STREAM) > counts.get(MATCH_LENGTH_STREAM)
+        {
+            return Err(Error::CorruptData(Corruption::SequenceCount));
+        }
+
+        let mut description_bits = [0u64; BLOCK_STREAMS];
+        let mut payload_bits = [0u64; BLOCK_STREAMS];
+        let mut suffix_bits = [0u64; BLOCK_STREAMS];
+        for group in [&mut description_bits, &mut payload_bits, &mut suffix_bits] {
+            for bits in group.iter_mut() {
+                *bits = reader.leb128()?;
+            }
+        }
+
+        let prologue = Self {
+            table_bytes,
+            mode,
+            counts,
+            description_bits,
+            payload_bits,
+            suffix_bits,
+        };
+        prologue.sections_agree()?;
+        Ok((prologue, reader.position()))
+    }
+
+    /// The rules the twelve extents answer to, each a property of the prologue alone.
+    fn sections_agree(&self) -> Result<(), Error> {
+        for index in 0..BLOCK_STREAMS {
+            let stream = self.stream(index).ok_or(Error::InvalidParameter)?;
+            if stream.count == 0 {
+                if stream.description_bits != 0
+                    || stream.payload_bits != 0
+                    || stream.suffix_bits != 0
+                {
+                    return Err(Error::CorruptData(Corruption::BlockSection));
+                }
+                continue;
+            }
+            if index == LITERAL_BYTE_STREAM && stream.suffix_bits != 0 {
+                return Err(Error::CorruptData(Corruption::BlockSection));
+            }
+            if stream.repeats != (stream.description_bits == 0) {
+                return Err(Error::CorruptData(Corruption::BlockDescription));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The largest symbol count a stream may declare, given the decoded size the header declared.
+///
+/// Every sequence produces at least one content byte except the one that ends a block with an
+/// empty literal run and no match, so a block of `d` content bytes holds at most `d + 1`
+/// sequences and at most `d` literal bytes. A block whose counts exceed that asks for work its
+/// own header says it cannot produce.
+const fn count_ceiling(stream: usize, decoded_bytes: u64) -> u64 {
+    if stream == LITERAL_BYTE_STREAM {
+        decoded_bytes
+    } else {
+        decoded_bytes.saturating_add(1)
+    }
+}
+
+/// Whether the mode field names the table in force for one stream.
+const fn mode_bit(mode: u8, stream: usize) -> bool {
+    let bit = match stream {
+        LITERAL_BYTE_STREAM => 0b0000_0001,
+        LITERAL_RUN_STREAM => 0b0000_0010,
+        MATCH_LENGTH_STREAM => 0b0000_0100,
+        MATCH_DISTANCE_STREAM => 0b0000_1000,
+        _ => 0,
+    };
+    mode & bit != 0
+}
+
+/// The mode field bit that names the table in force for one stream.
+///
+/// # Errors
+///
+/// Returns `InvalidParameter` for a stream this block does not carry.
+pub const fn mode_mask(stream: usize) -> Result<u8, Error> {
+    match stream {
+        LITERAL_BYTE_STREAM => Ok(0b0000_0001),
+        LITERAL_RUN_STREAM => Ok(0b0000_0010),
+        MATCH_LENGTH_STREAM => Ok(0b0000_0100),
+        MATCH_DISTANCE_STREAM => Ok(0b0000_1000),
+        _ => Err(Error::InvalidParameter),
     }
 }
 
@@ -1068,6 +1571,32 @@ impl<'a> Reader<'a> {
     fn u64(&mut self) -> Option<u64> {
         Some(little_endian(self.take(8)?))
     }
+
+    /// One declared quantity, seven bits a byte, least significant first.
+    ///
+    /// The width is bounded at what a 64-bit value holds. An unbounded continuation is a loop
+    /// a stream must not be able to ask for, and the bound sits here rather than at each
+    /// caller.
+    fn leb128(&mut self) -> Result<u64, Error> {
+        let mut value = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let short = self.truncated(1);
+            let byte = self.u8().ok_or(short)?;
+            if shift >= 64 {
+                return Err(Error::CorruptData(Corruption::Varint));
+            }
+            let part = shift_left_u64(u64::from(byte & 0x7F), shift);
+            if shift_right_u64(part, shift) != u64::from(byte & 0x7F) {
+                return Err(Error::CorruptData(Corruption::Varint));
+            }
+            value |= part;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+            shift = shift.saturating_add(7);
+        }
+    }
 }
 
 struct Writer<const N: usize> {
@@ -1098,12 +1627,42 @@ impl<const N: usize> Writer<N> {
         }
     }
 
+    /// Appends one declared quantity, seven bits a byte, least significant first.
+    fn leb128(&mut self, mut value: u64) {
+        loop {
+            let byte = low_seven(value);
+            value = shift_right_u64(value, 7);
+            if value == 0 {
+                self.put(u64::from(byte), 1);
+                return;
+            }
+            self.put(u64::from(byte | 0x80), 1);
+        }
+    }
+
     const fn finish(self) -> Encoded<N> {
         Encoded {
             bytes: self.bytes,
             len: self.len,
         }
     }
+}
+
+/// The low seven bits of a value, as one byte.
+#[allow(clippy::cast_possible_truncation)]
+const fn low_seven(value: u64) -> u8 {
+    (value & 0x7F) as u8
+}
+
+// A shift at or above the width of the value clears it, which is what the caller checks for.
+#[allow(clippy::arithmetic_side_effects)]
+const fn shift_left_u64(value: u64, by: u32) -> u64 {
+    if by >= 64 { 0 } else { value << by }
+}
+
+#[allow(clippy::arithmetic_side_effects)]
+const fn shift_right_u64(value: u64, by: u32) -> u64 {
+    if by >= 64 { 0 } else { value >> by }
 }
 
 /// Reads up to eight bytes as one little-endian value, by explicit byte position and shift.
@@ -1701,7 +2260,7 @@ mod tests {
     fn rle_declares_its_decoded_size_with_a_one_byte_payload() -> Result<(), Error> {
         let count: u32 = 131_072;
         let block = BlockHeader::rle(true, count)?;
-        assert_eq!(block.stored_len(), 1);
+        assert_eq!(block.stored_len(), Some(1));
         assert_eq!(block.decoded_len(), count);
 
         let encoded = block.encode();
@@ -1743,8 +2302,11 @@ mod tests {
         Ok(())
     }
 
+    /// The type the skeleton reserved is the type this representation names, and the header
+    /// alone does not say how many bytes it stores.
     #[test]
-    fn a_compressed_block_is_an_unsupported_feature() {
+    fn a_compressed_block_header_names_its_type_and_declares_no_stored_length() -> Result<(), Error>
+    {
         let word: u32 = 0b0000_0100 | 0b1000_0000;
         let bytes = [
             byte_of(u64::from(word), 0),
@@ -1752,10 +2314,17 @@ mod tests {
             byte_of(u64::from(word), 2),
             byte_of(u64::from(word), 3),
         ];
+        let (block, used) = BlockHeader::decode(&bytes)?;
+        assert_eq!(used, BLOCK_HEADER_BYTES);
+        assert_eq!(block.kind, BlockType::Compressed);
+        assert_eq!(block.decoded_len(), 16);
+        assert_eq!(block.stored_len(), None);
         assert_eq!(
-            BlockHeader::decode(&bytes),
-            Err(Error::UnsupportedFeature(Feature::CompressedBlock))
+            block.payload(&[0; 8]),
+            Err(Error::UnsupportedFeature(Feature::CompressedBlock)),
+            "the header alone cannot locate a coded payload"
         );
+        Ok(())
     }
 
     #[test]

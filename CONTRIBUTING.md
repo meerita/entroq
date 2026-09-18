@@ -183,8 +183,11 @@ A number leaves the repository only from a sealed publication-tier record. A dev
 never appears in a document, a release note, or a comparison claim.
 
 Every metric is reported as measured, with the call that produced it, or as unavailable, with
-the reason. No metric is reported as a zero. The harness links no Entroq codec, so every
-result carries an empty Entroq column and says why.
+the reason. No metric is reported as a zero. The harness drives Entroq through the crate of
+this workspace and each competitor through the library the laboratory built, so both cross one
+call and one process. A result states whether it measured Entroq; one that measured a
+competitor says the Entroq row belongs to the segment that measures it, and carries no
+placeholder for it.
 
 Two reports read what a campaign recorded. Both take a run record directory and read every
 result under it.
@@ -225,6 +228,7 @@ arrives with the code it covers.
 ```sh
 make fuzz-list                 # every target, and whether a driver exists for it
 make fuzz TARGET=<name>        # advance one target by one bounded segment
+make fuzz-seed                 # seed the stream-reading targets from the format vectors
 ```
 
 A campaign that names fuzzing as one of its segments advances every runnable target inside
@@ -246,6 +250,12 @@ duration of one segment.
 
 Each target keeps its corpus at `../runs/fuzz-corpus/<target>/`, outside the repository. The
 next segment continues from it instead of starting cold. Set `RUNS` to change that path.
+
+`make fuzz-seed` writes the format vector catalog and copies it into the corpus of the targets
+whose input is a whole stream, with the prefix each of those drivers reads in front of it. It
+adds and never removes, and it leaves a file the corpus already holds alone. A target that
+reads a table description, a block payload, or content is not seeded from a frame, because a
+frame is none of those.
 
 Never delete a corpus to start clean. It is coverage that many segments already paid for,
 and deleting it discards every hour spent on the target.

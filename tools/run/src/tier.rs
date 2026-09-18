@@ -298,11 +298,13 @@ const CORPUS_SEGMENTS: &[Segment] = &[
     },
 ];
 
-/// One benchmark segment: one competitor, at one tier, over the size classes the tier names
-/// or over the one class the segment names.
+/// One benchmark segment: one codec, at one tier, over the size classes the tier names or
+/// over the one class the segment names.
 ///
 /// A segment is one harness process, so the resident-set figure it reports is its own and a
-/// failure blocks one competitor rather than the campaign.
+/// failure blocks one codec rather than the campaign. Every codec is driven in-process: a
+/// competitor through the library the laboratory built, and the subject through the crate of
+/// this workspace.
 macro_rules! bench_segment {
     ($tier:literal, $codec:literal) => {
         Segment {
@@ -312,7 +314,7 @@ macro_rules! bench_segment {
                 $tier,
                 " tier covers, for ",
                 $codec,
-                ", measured in-process through the library the laboratory built."
+                ", measured in-process."
             ),
             steps: &[Step {
                 program: "cargo",
@@ -369,6 +371,7 @@ macro_rules! bench_segment {
 /// The cheap tiers measure every class they cover in one segment per competitor, so a
 /// campaign that has to fit one budget stays five processes rather than twenty.
 const BENCH_SMOKE_SEGMENTS: &[Segment] = &[
+    bench_segment!("smoke", "entroq"),
     bench_segment!("smoke", "lz4"),
     bench_segment!("smoke", "zstd"),
     bench_segment!("smoke", "brotli"),
@@ -377,6 +380,7 @@ const BENCH_SMOKE_SEGMENTS: &[Segment] = &[
 ];
 
 const BENCH_DEV_SEGMENTS: &[Segment] = &[
+    bench_segment!("dev", "entroq"),
     bench_segment!("dev", "lz4"),
     bench_segment!("dev", "zstd"),
     bench_segment!("dev", "brotli"),
@@ -434,9 +438,16 @@ macro_rules! baseline_segment {
     };
 }
 
-/// The competitor baseline. One segment per competitor, operating point group, and size
-/// class, which is the unit that holds one budget and that a resumed campaign re-runs alone.
+/// The baseline. One segment per codec, operating point group, and size class, which is the
+/// unit that holds one budget and that a resumed campaign re-runs alone.
+///
+/// The subject comes first, because a comparison with no subject in it is a table of
+/// competitors. It has one operating point group, because this revision admits no mode.
 const BENCH_GATE_SEGMENTS: &[Segment] = &[
+    baseline_segment!("entroq", "default", "tiny"),
+    baseline_segment!("entroq", "default", "small"),
+    baseline_segment!("entroq", "default", "medium"),
+    baseline_segment!("entroq", "default", "large"),
     baseline_segment!("lz4", "fast", "tiny"),
     baseline_segment!("lz4", "fast", "small"),
     baseline_segment!("lz4", "fast", "medium"),
@@ -484,6 +495,11 @@ const BENCH_GATE_SEGMENTS: &[Segment] = &[
 ];
 
 const BENCH_PUBLICATION_SEGMENTS: &[Segment] = &[
+    bench_segment!("publication", "entroq", "tiny"),
+    bench_segment!("publication", "entroq", "small"),
+    bench_segment!("publication", "entroq", "medium"),
+    bench_segment!("publication", "entroq", "large"),
+    bench_segment!("publication", "entroq", "huge"),
     bench_segment!("publication", "lz4", "tiny"),
     bench_segment!("publication", "lz4", "small"),
     bench_segment!("publication", "lz4", "medium"),
@@ -542,7 +558,7 @@ macro_rules! skeleton_segment {
     };
 }
 
-/// The M2 closing gate: every heavy proof of the format skeleton, one per segment.
+/// The format skeleton's closing gate: every heavy proof of it, one per segment.
 const SKELETON_SEGMENTS: &[Segment] = &[
     skeleton_segment!(
         "skeleton-roundtrip-tiny",
@@ -627,6 +643,144 @@ const SKELETON_SEGMENTS: &[Segment] = &[
     },
 ];
 
+/// One compressed segment: one test of the gate-scale proof binary of the compressed block.
+///
+/// The same shape as a skeleton segment and a separate macro, because the two name different
+/// test binaries and a segment names its binary rather than deriving it.
+macro_rules! compressed_segment {
+    ($id:literal, $test:literal, $description:literal) => {
+        Segment {
+            id: $id,
+            description: $description,
+            steps: &[Step {
+                program: "cargo",
+                args: &[
+                    "test",
+                    "--release",
+                    "--quiet",
+                    "--package",
+                    "codec",
+                    "--test",
+                    "compressed",
+                    "--",
+                    "--ignored",
+                    "--nocapture",
+                    "--exact",
+                    $test,
+                ],
+            }],
+        }
+    };
+}
+
+/// The compressed block's closing gate: every heavy proof of it, one per segment.
+const COMPRESSED_SEGMENTS: &[Segment] = &[
+    compressed_segment!(
+        "compressed-roundtrip-tiny",
+        "compressed_roundtrip_tiny",
+        "Every length below one kibibyte round-trips, through every content class, both \
+         integrity modes, four chunkings, and a pseudo-random one."
+    ),
+    compressed_segment!(
+        "compressed-roundtrip-small",
+        "compressed_roundtrip_small",
+        "Every kibibyte boundary to sixty-four, and one byte either side of each, round-trips."
+    ),
+    compressed_segment!(
+        "compressed-roundtrip-medium",
+        "compressed_roundtrip_medium",
+        "The block boundary, the region boundary and the sizes around them round-trip, so the \
+         tables in force and the offset cache are carried across one and discarded at the \
+         other."
+    ),
+    compressed_segment!(
+        "compressed-roundtrip-large",
+        "compressed_roundtrip_large",
+        "Multi-region inputs from four to twelve mebibytes round-trip."
+    ),
+    compressed_segment!(
+        "compressed-chunk-permutation-encode",
+        "compressed_chunk_permutation_encode",
+        "One input encodes to the same bytes at every input and output chunk size."
+    ),
+    compressed_segment!(
+        "compressed-chunk-permutation-decode",
+        "compressed_chunk_permutation_decode",
+        "One stream decodes to the same bytes at every input and output chunk size."
+    ),
+    compressed_segment!(
+        "compressed-corruption-matrix",
+        "compressed_corruption_matrix",
+        "Every byte of every fixture stream, mutated in four byte classes, yields a typed \
+         error of a declared class or a decode that holds the content length its frame \
+         declares."
+    ),
+    compressed_segment!(
+        "compressed-truncation-matrix",
+        "compressed_truncation_matrix",
+        "Every stream of the structural fixture set, cut at every byte offset, is refused \
+         rather than read as a whole frame."
+    ),
+    Segment {
+        id: "compressed-memory-curve-1gib",
+        description: "The memory growth curve from one mebibyte to one gibibyte of logical \
+                      input holds the five-clause criterion the tool states before it runs, \
+                      including the table refusal that precedes the allocation counter.",
+        steps: &[Step {
+            program: "cargo",
+            args: &[
+                "run",
+                "--quiet",
+                "--release",
+                "--package",
+                "entroq-proof",
+                "--",
+                "curve",
+            ],
+        }],
+    },
+    compressed_segment!(
+        "compressed-corpus-coverage",
+        "compressed_corpus_coverage",
+        "Every representative corpus entry round-trips, and the block type histogram of each \
+         is recorded. A host that does not hold the corpus fails this segment rather than \
+         passing on an empty set."
+    ),
+    compressed_segment!(
+        "compressed-block-types-visible",
+        "compressed_block_types_visible",
+        "The type of every block of every frame is read from its header, without expanding a \
+         payload, and the three types are each reached."
+    ),
+    Segment {
+        id: "compressed-vectors-cross-arch",
+        description: "Two architectures write the same format vectors, the compressed ones \
+                      included, and each decodes the other's.",
+        steps: &[Step {
+            program: "ci/byteorder.sh",
+            args: &["run"],
+        }],
+    },
+    Segment {
+        id: "compressed-fuzz-routine",
+        description: "Every runnable fuzz target that reaches codec code advances by one \
+                      bounded invocation, and none leaves a reproducer behind.",
+        steps: &[Step {
+            program: "cargo",
+            args: &[
+                "run",
+                "--quiet",
+                "--release",
+                "--package",
+                "entroq-run",
+                "--",
+                "fuzz",
+                "routine",
+            ],
+        }],
+    },
+];
+
 /// A named set of segments, and what a campaign over that set does and does not cover.
 ///
 /// A suite is what is run. A tier is how it is bounded and recorded.
@@ -644,6 +798,8 @@ pub enum Suite {
     Bench,
     /// The format skeleton's closing gate: every heavy proof the cheap tiers defer.
     Skeleton,
+    /// The compressed block's closing gate: every heavy proof the cheap tiers defer.
+    Compressed,
 }
 
 impl Suite {
@@ -655,6 +811,7 @@ impl Suite {
             "corpus" => Some(Self::Corpus),
             "bench" => Some(Self::Bench),
             "skeleton" => Some(Self::Skeleton),
+            "compressed" => Some(Self::Compressed),
             _ => None,
         }
     }
@@ -666,6 +823,7 @@ impl Suite {
             Self::Corpus => "corpus",
             Self::Bench => "bench",
             Self::Skeleton => "skeleton",
+            Self::Compressed => "compressed",
         }
     }
 
@@ -677,6 +835,7 @@ impl Suite {
             Self::Corpus => "corpus-registry",
             Self::Bench => "bench-baseline",
             Self::Skeleton => "skeleton-gate",
+            Self::Compressed => "compressed-gate",
         }
     }
 
@@ -708,6 +867,10 @@ impl Suite {
             Self::Skeleton => match tier {
                 Tier::Smoke | Tier::Dev => &[],
                 Tier::Gate | Tier::Publication => SKELETON_SEGMENTS,
+            },
+            Self::Compressed => match tier {
+                Tier::Smoke | Tier::Dev => &[],
+                Tier::Gate | Tier::Publication => COMPRESSED_SEGMENTS,
             },
         }
     }
@@ -741,13 +904,15 @@ impl Suite {
                  twice from its recorded seed."
             }
             Self::Bench => {
-                "Competitor measurement only. Each segment drives one competitor \
-                 in-process, through the library the laboratory built, over the registered \
-                 corpus entries its tier's budget reaches, and emits one machine-readable \
-                 result. A segmented tier covers one operating point group and one size \
-                 class per segment, and the groups of a competitor cover every point the \
-                 catalog pins for it. The harness links no Entroq codec at this revision, \
-                 so every result carries an empty Entroq column and states why."
+                "Measurement only. Each segment drives one codec in-process over the \
+                 registered corpus entries its tier's budget reaches, and emits one \
+                 machine-readable result. A competitor is driven through the library the \
+                 laboratory built; the subject is driven through the crate of this \
+                 workspace, at the revision the result records, so both sides cross one \
+                 call and one process. A segmented tier covers one operating point group \
+                 and one size class per segment, and the groups of a codec cover every \
+                 point declared for it. The subject declares one, because this revision \
+                 admits no mode."
             }
             Self::Skeleton => {
                 "The format skeleton's closing gate. Seven segments round-trip generated \
@@ -759,6 +924,21 @@ impl Suite {
                  architectures and has each decode the other's. One advances every runnable \
                  fuzz target that reaches codec code. No segment compresses a byte: every block this revision \
                  writes is stored."
+            }
+            Self::Compressed => {
+                "The compressed block's closing gate. Eight segments drive the public API \
+                 over generated content in nine classes across four size classes, at every \
+                 chunk size and at a pseudo-random one, cut every fixture stream at every \
+                 byte offset, mutate every byte of every fixture stream in four byte \
+                 classes, and read the type of every block of every frame from its header \
+                 without expanding a payload. One measures what the streaming pair holds as \
+                 the logical input grows from one mebibyte to one gibibyte, and whether a \
+                 block above the table ceiling is refused before the allocation counter \
+                 moves. One round-trips the registered corpus entries and records the block \
+                 type histogram of each. One writes the format vectors on two architectures \
+                 and has each decode the other's. One advances every runnable fuzz target \
+                 that reaches codec code. No segment measures a throughput and no segment \
+                 measures a competitor."
             }
         }
     }
@@ -812,6 +992,22 @@ impl Suite {
                  is a result. The fuzz segment shortens each target's invocation to fit one \
                  segment, so the accumulated figure is the one to read, not this run's. The \
                  round trips cover generated content, not the registered corpus."
+            }
+            Self::Compressed => {
+                "The campaign ran on one host and one architecture. It measured no \
+                 throughput and no competitor, and the compressed sizes it records are \
+                 lengths rather than a ratio anyone compared. The memory figures are the \
+                 declared bound, the process allocator counters, and the resident-set \
+                 high-water mark of the child that performed each run; none of them \
+                 attributes memory to one call, and the per-block allocation figure is a \
+                 bounded cost rather than the absence of one. Version 1 computes no \
+                 integrity field, so the corruption matrix records how many mutations were \
+                 accepted with other content instead of asserting that none was. The \
+                 cross-architecture segment runs one lane under emulation, which settles \
+                 byte order and nothing about speed. The fuzz segment shortens each target's \
+                 invocation to fit one segment, so the accumulated figure is the one to \
+                 read, not this run's. The corpus segment reads a prefix of each entry rather \
+                 than the whole of it, which is what keeps it inside one segment budget."
             }
         }
     }
@@ -876,12 +1072,13 @@ mod tests {
     use super::{Duration, SEGMENT_BUDGET, Suite, Tier};
 
     const TIERS: [Tier; 4] = [Tier::Smoke, Tier::Dev, Tier::Gate, Tier::Publication];
-    const SUITES: [Suite; 5] = [
+    const SUITES: [Suite; 6] = [
         Suite::Workspace,
         Suite::Lab,
         Suite::Corpus,
         Suite::Bench,
         Suite::Skeleton,
+        Suite::Compressed,
     ];
 
     #[test]
@@ -1027,22 +1224,25 @@ mod tests {
     }
 
     #[test]
-    fn the_bench_suite_runs_one_segment_per_competitor_at_a_tier_that_holds_one_budget() {
+    fn the_bench_suite_runs_one_segment_per_codec_at_a_tier_that_holds_one_budget() {
+        // Five competitors and the subject.
         for tier in [Tier::Smoke, Tier::Dev] {
-            assert_eq!(Suite::Bench.segments(tier).len(), 5, "{}", tier.name());
+            assert_eq!(Suite::Bench.segments(tier).len(), 6, "{}", tier.name());
         }
     }
 
     #[test]
     fn the_baseline_splits_by_operating_point_group_and_by_size_class() {
-        assert_eq!(Suite::Bench.segments(Tier::Gate).len(), 44);
-        assert_eq!(Suite::Bench.segments(Tier::Publication).len(), 25);
+        assert_eq!(Suite::Bench.segments(Tier::Gate).len(), 48);
+        assert_eq!(Suite::Bench.segments(Tier::Publication).len(), 30);
         let ids: Vec<&str> = Suite::Bench
             .segments(Tier::Gate)
             .iter()
             .map(|segment| segment.id)
             .collect();
         for expected in [
+            "baseline-entroq-default-tiny",
+            "baseline-entroq-default-large",
             "baseline-lz4-fast-tiny",
             "baseline-brotli-max-large",
             "baseline-zstd-max-large",
@@ -1083,10 +1283,22 @@ mod tests {
     }
 
     #[test]
-    fn the_bench_suite_says_the_entroq_column_is_empty_and_the_counter_is_not_granted() {
-        assert!(Suite::Bench.coverage().contains("empty"));
+    fn the_bench_suite_says_both_sides_cross_one_boundary_and_the_counter_is_not_granted() {
+        assert!(Suite::Bench.coverage().contains("one call and one process"));
         assert!(Suite::Bench.limits().contains("counter"));
         assert!(Suite::Bench.limits().contains("elapsed time"));
+    }
+
+    #[test]
+    fn every_bench_tier_measures_the_subject_and_not_only_its_competitors() {
+        for tier in TIERS {
+            let segments = Suite::Bench.segments(tier);
+            assert!(
+                segments.iter().any(|segment| segment.id.contains("entroq")),
+                "the {} tier measures no Entroq segment",
+                tier.name()
+            );
+        }
     }
 
     #[test]
@@ -1144,6 +1356,77 @@ mod tests {
         assert!(Suite::Skeleton.coverage().contains("compresses a byte"));
         assert!(Suite::Skeleton.limits().contains("no throughput"));
         assert!(Suite::Skeleton.limits().contains("emulation"));
+    }
+
+    #[test]
+    fn the_compressed_suite_runs_every_segment_the_closing_gate_names() {
+        let segments = Suite::Compressed.segments(Tier::Gate);
+        let ids: Vec<&str> = segments.iter().map(|segment| segment.id).collect();
+        for expected in [
+            "compressed-roundtrip-tiny",
+            "compressed-roundtrip-small",
+            "compressed-roundtrip-medium",
+            "compressed-roundtrip-large",
+            "compressed-chunk-permutation-encode",
+            "compressed-chunk-permutation-decode",
+            "compressed-corruption-matrix",
+            "compressed-truncation-matrix",
+            "compressed-memory-curve-1gib",
+            "compressed-corpus-coverage",
+            "compressed-block-types-visible",
+            "compressed-vectors-cross-arch",
+            "compressed-fuzz-routine",
+        ] {
+            assert!(ids.contains(&expected), "{expected} is not a segment");
+        }
+        assert_eq!(segments.len(), 13);
+    }
+
+    #[test]
+    fn the_compressed_suite_has_no_segments_at_a_tier_that_does_not_segment() {
+        assert!(Suite::Compressed.segments(Tier::Smoke).is_empty());
+        assert!(Suite::Compressed.segments(Tier::Dev).is_empty());
+    }
+
+    #[test]
+    fn every_compressed_test_segment_names_one_ignored_test_of_its_own_binary() {
+        for segment in Suite::Compressed.segments(Tier::Gate) {
+            let args: Vec<&str> = segment
+                .steps
+                .iter()
+                .flat_map(|step| step.args.iter().copied())
+                .collect();
+            if !args.contains(&"test") {
+                continue;
+            }
+            assert!(args.contains(&"compressed"), "{}", segment.id);
+            assert!(args.contains(&"--ignored"), "{}", segment.id);
+            assert!(args.contains(&"--exact"), "{}", segment.id);
+            assert!(args.contains(&"--release"), "{}", segment.id);
+        }
+    }
+
+    #[test]
+    fn the_compressed_suite_says_what_no_integrity_field_costs_and_claims_no_speed() {
+        let limits = Suite::Compressed.limits();
+        assert!(limits.contains("no integrity field"), "{limits}");
+        assert!(limits.contains("no throughput"), "{limits}");
+        assert!(
+            Suite::Compressed
+                .coverage()
+                .contains("no segment measures a competitor"),
+            "{}",
+            Suite::Compressed.coverage()
+        );
+    }
+
+    #[test]
+    fn the_two_closing_gates_share_no_segment_identifier() {
+        for skeleton in Suite::Skeleton.segments(Tier::Gate) {
+            for compressed in Suite::Compressed.segments(Tier::Gate) {
+                assert_ne!(skeleton.id, compressed.id);
+            }
+        }
     }
 
     #[test]

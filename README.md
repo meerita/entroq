@@ -9,14 +9,21 @@ Deflate, and it is not bitstream compatible with any of them.
 
 Early development.
 
-The codec crate exports a format module and a streaming module. Between them they hold the
-frame, region and block structure, a streaming encoder, and a streaming decoder. Every other
-module in the crate is private, because the mechanism it owns has not been designed and
-measured. There is no Entroq command line tool.
+The codec crate exports the format contract, the entropy coding a format table is declared and
+validated through, the sequence representation its symbols are drawn from, the match finder and
+the parser that produce the sequences, the kernel dispatch the finder runs on, and the streaming
+pair. The compressed block is private: it carries state that crosses the blocks of a region, and
+the streaming pair is the only thing that drives it. There is no Entroq command line tool.
 
-The structure carries no compression. Content travels literally or as a run, so a stream is
-a validated container and not yet a compressed representation. There is nothing to compress
-with yet.
+Entroq compresses. The encoder finds matches, parses them, codes four symbol streams, assembles
+every block type a block admits, and emits the one storing the fewest bytes. The decoder reads
+every block type and returns the input byte for byte. `docs/format.md` states what a conforming
+decoder accepts.
+
+One encode path ships and it declares no mode. It is a bounded hash chain at a search depth of
+8 and a greedy parser, at a window of 65 536 bytes. No operating point is claimed against any
+competitor: the numbers in `docs/benchmarks.md` are gate-tier measurements of one machine, and
+no Entroq number has left a publication-tier record.
 
 Beyond that, the repository holds the measurement foundation the codec is built against:
 
@@ -31,13 +38,17 @@ Beyond that, the repository holds the measurement foundation the codec is built 
 * A result parser, a Pareto report, and a comparison that states whether one recorded
   campaign reproduced another.
 * Fuzz infrastructure. Eleven targets are declared against the parsers and decoders Entroq
-  will have. Two carry a driver, for the frame header parser and for the streaming decoder;
-  the other nine wait for the code they cover. A twelfth target exercises the fuzz runner
-  itself and covers no Entroq code.
+  will have. Six carry a driver: the frame header parser, the block parser, the entropy table
+  parser, the sequence decoder, the streaming decode path, and the round trip. The other five
+  wait for the code they cover. A twelfth target exercises the fuzz runner itself and covers no
+  Entroq code.
 * An integration lane that runs the gates on a clean Linux host, in a container.
 
-Every number these produce is a competitor number. No Entroq number exists, and every
-result says so rather than carrying a zero.
+The benchmark harness drives Entroq and every pinned competitor in-process, through one call
+and one process each, so neither side of a comparison is charged for a boundary the other does
+not pay. `docs/benchmarks.md` carries the first measured comparison and the scope it is read
+under. It is a gate-tier measurement of one machine and it is not a claim against any
+competitor.
 
 The next section states goals. Read no sentence in it as current behavior.
 

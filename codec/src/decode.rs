@@ -6,8 +6,12 @@
 //! A payload is expanded in steps. Each step reads only the input it was given and writes
 //! only the output it was given, so a block larger than either buffer costs more steps and
 //! never more memory. Nothing here allocates.
+//!
+//! A COMPRESSED block is not expanded this way. A match in one may name any byte its region
+//! has already produced, so it needs its whole stored body and a window of that content, and
+//! the block module owns it.
 
-use crate::format::{BlockHeader, BlockType, Error};
+use crate::format::{BlockHeader, BlockType, Error, Feature};
 
 /// What one expansion step moved.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,16 +41,21 @@ pub enum Payload {
 
 impl Payload {
     /// The payload a block header describes, before any of it has arrived.
-    #[must_use]
-    pub const fn new(header: BlockHeader) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnsupportedFeature` for a COMPRESSED block, whose payload is a prologue and
+    /// four coded streams and does not move through this engine.
+    pub const fn new(header: BlockHeader) -> Result<Self, Error> {
         match header.kind {
-            BlockType::Raw => Self::Raw {
+            BlockType::Raw => Ok(Self::Raw {
                 remaining: header.size,
-            },
-            BlockType::Rle => Self::Rle {
+            }),
+            BlockType::Rle => Ok(Self::Rle {
                 value: None,
                 remaining: header.size,
-            },
+            }),
+            BlockType::Compressed => Err(Error::UnsupportedFeature(Feature::CompressedBlock)),
         }
     }
 
@@ -153,7 +162,7 @@ mod tests {
     #[test]
     fn a_raw_payload_copies_what_both_buffers_allow() -> Result<(), Error> {
         let block = BlockHeader::raw(true, 8)?;
-        let mut payload = Payload::new(block);
+        let mut payload = Payload::new(block)?;
         assert_eq!(payload.stored_remaining(), 8);
 
         let mut out = [0_u8; 8];
@@ -184,7 +193,7 @@ mod tests {
     #[test]
     fn a_raw_payload_moves_nothing_when_a_buffer_is_empty() -> Result<(), Error> {
         let block = BlockHeader::raw(true, 4)?;
-        let mut payload = Payload::new(block);
+        let mut payload = Payload::new(block)?;
         let mut out = [0_u8; 4];
         assert_eq!(
             payload.step(&[], &mut out)?,
@@ -207,7 +216,7 @@ mod tests {
     #[test]
     fn an_rle_payload_takes_one_stored_byte_and_then_writes_only_output() -> Result<(), Error> {
         let block = BlockHeader::rle(true, 5)?;
-        let mut payload = Payload::new(block);
+        let mut payload = Payload::new(block)?;
         assert_eq!(payload.stored_remaining(), 1);
 
         let mut out = [0_u8; 5];
@@ -246,7 +255,7 @@ mod tests {
     #[test]
     fn a_payload_never_writes_past_the_output_it_was_given() -> Result<(), Error> {
         let block = BlockHeader::rle(true, 1_000)?;
-        let mut payload = Payload::new(block);
+        let mut payload = Payload::new(block)?;
         let mut out = [0_u8; 16];
         let moved = payload.step(&[0x11], &mut out)?;
         assert_eq!(moved.consumed, 1);

@@ -1,12 +1,13 @@
-//! Owns the competitor boundary: how the harness drives a linked competitor library, and
-//! what each project publishes for the metrics a result carries.
+//! Owns the boundary a measurement drives a codec across: this repository's codec through its
+//! own crate, every pinned competitor through the library its project publishes, and what
+//! each side publishes for the metrics a result carries.
 //!
-//! Every competitor is measured in-process, through the library API its own project
-//! publishes, linked from the laboratory. A command line invocation costs milliseconds on
-//! the development host against tens of microseconds for the codec work, so a subprocess
+//! Every codec is measured in-process. A command line invocation costs milliseconds on the
+//! development host against tens of microseconds for the codec work, so a subprocess
 //! measurement reports process creation; two of the five competitors publish no command line
 //! tool at all; and neither a state size nor an allocation count is reachable from outside
-//! the process.
+//! the process. Entroq crosses the same boundary, so neither side of a comparison is charged
+//! for a boundary the other does not pay.
 //!
 //! A competitor gets the configuration its own project recommends and nothing else. Where
 //! the project publishes an allocator hook, it is handed the harness allocator, so one
@@ -14,19 +15,21 @@
 //! metric is unavailable and why, and never reports a zero that a reader would take for a
 //! measurement.
 //!
-//! The unsafe surface of this crate is here and in the allocator. It exists to cross a C
-//! boundary, not to make anything faster, and no Entroq codec path reaches it.
+//! The unsafe surface of this crate is in the competitor files here and in the allocator. It
+//! exists to cross a C boundary, not to make anything faster, and the Entroq file beside them
+//! reaches none of it: the codec is a crate of this workspace and needs no boundary crossing.
 //!
 //! This module does not own what is measured, how it is timed, or where it is written.
 
 mod brotli;
+mod entroq;
 mod lz4;
 mod snappy;
 mod zlib;
 mod zstd;
 
-use crate::catalog::Codec;
 use crate::error::{Error, Result};
+use crate::subject::Subject;
 
 /// Where one metric's number comes from, or why there is none.
 pub enum Method {
@@ -78,8 +81,9 @@ pub struct Chunk {
     pub elapsed_ns: u64,
 }
 
-/// One competitor, configured at one operating point, ready to measure.
+/// One codec, configured at one operating point, ready to measure.
 pub enum Session {
+    Entroq(entroq::Session),
     Lz4(lz4::Session),
     Zstd(zstd::Session),
     Brotli(brotli::Session),
@@ -88,24 +92,25 @@ pub enum Session {
 }
 
 impl Session {
-    /// Opens one competitor at one of the operating points its catalog entry names.
+    /// Opens one codec at one of the operating points its subject names.
     ///
     /// # Errors
     ///
-    /// Fails when the codec is not one the laboratory holds, the operating point is not one
-    /// the catalog names for it, or the library refuses to produce a context.
-    pub fn open(codec: &Codec, point: &str) -> Result<Self> {
-        if !codec.operating_points().contains(&point) {
+    /// Fails when the operating point is not one the subject declares, when a competitor is
+    /// not linked into this harness, or when a library refuses to produce a context.
+    pub fn open(subject: Subject, point: &str) -> Result<Self> {
+        if !subject.operating_points().contains(&point) {
             return Err(Error::measure(
                 format!("the operating point `{point}`"),
                 format!(
-                    "is not one of the points the catalog pins for {}: {}",
-                    codec.display,
-                    codec.operating_points().join(", ")
+                    "is not one of the points declared for {}: {}",
+                    subject.display(),
+                    subject.operating_points().join(", ")
                 ),
             ));
         }
-        match codec.name {
+        match subject.name() {
+            crate::subject::ENTROQ => entroq::Session::open(point).map(Self::Entroq),
             "lz4" => lz4::Session::open(point).map(Self::Lz4),
             "zstd" => zstd::Session::open(point).map(Self::Zstd),
             "brotli" => brotli::Session::open(point).map(Self::Brotli),
@@ -125,6 +130,7 @@ impl Session {
     /// laboratory did not build.
     pub fn linked_version(&self) -> Option<String> {
         match self {
+            Self::Entroq(session) => session.linked_version(),
             Self::Lz4(session) => session.linked_version(),
             Self::Zstd(session) => session.linked_version(),
             Self::Brotli(session) => session.linked_version(),
@@ -135,6 +141,7 @@ impl Session {
 
     pub const fn notes(&self) -> Notes {
         match self {
+            Self::Entroq(session) => session.notes(),
             Self::Lz4(session) => session.notes(),
             Self::Zstd(session) => session.notes(),
             Self::Brotli(session) => session.notes(),
@@ -146,6 +153,7 @@ impl Session {
     /// The output capacity a compression of `input` bytes needs.
     pub fn compress_bound(&self, input: usize) -> usize {
         match self {
+            Self::Entroq(session) => session.compress_bound(input),
             Self::Lz4(session) => session.compress_bound(input),
             Self::Zstd(session) => session.compress_bound(input),
             Self::Brotli(session) => session.compress_bound(input),
@@ -162,6 +170,7 @@ impl Session {
     /// accepts.
     pub fn compress(&mut self, src: &[u8], dst: &mut [u8]) -> Result<usize> {
         match self {
+            Self::Entroq(session) => session.compress(src, dst),
             Self::Lz4(session) => session.compress(src, dst),
             Self::Zstd(session) => session.compress(src, dst),
             Self::Brotli(session) => session.compress(src, dst),
@@ -177,6 +186,7 @@ impl Session {
     /// Fails when the library reports an error.
     pub fn decompress(&mut self, src: &[u8], dst: &mut [u8]) -> Result<usize> {
         match self {
+            Self::Entroq(session) => session.decompress(src, dst),
             Self::Lz4(session) => session.decompress(src, dst),
             Self::Zstd(session) => session.decompress(src, dst),
             Self::Brotli(session) => session.decompress(src, dst),
@@ -188,6 +198,7 @@ impl Session {
     /// The bytes the encoder holds, as the project's own interface reports them.
     pub fn encoder_state_bytes(&self) -> Option<u64> {
         match self {
+            Self::Entroq(session) => session.encoder_state_bytes(),
             Self::Lz4(session) => session.encoder_state_bytes(),
             Self::Zstd(session) => session.encoder_state_bytes(),
             Self::Brotli(_) | Self::Snappy(_) | Self::Zlib(_) => None,
@@ -197,6 +208,7 @@ impl Session {
     /// The bytes the decoder holds, as the project's own interface reports them.
     pub fn decoder_state_bytes(&self) -> Option<u64> {
         match self {
+            Self::Entroq(session) => session.decoder_state_bytes(),
             Self::Zstd(session) => session.decoder_state_bytes(),
             Self::Lz4(_) | Self::Brotli(_) | Self::Snappy(_) | Self::Zlib(_) => None,
         }
@@ -212,6 +224,7 @@ impl Session {
     /// asks.
     pub fn stream(&mut self, src: &[u8], chunk: usize, dst: &mut [u8]) -> Result<Vec<Chunk>> {
         match self {
+            Self::Entroq(session) => session.stream(src, chunk, dst),
             Self::Lz4(session) => session.stream(src, chunk, dst),
             Self::Zstd(session) => session.stream(src, chunk, dst),
             Self::Brotli(session) => session.stream(src, chunk, dst),
@@ -234,7 +247,9 @@ impl Session {
     pub fn threaded(&self, workers: u32, src: &[u8], dst: &mut [u8]) -> Option<Result<usize>> {
         match self {
             Self::Zstd(session) => Some(session.threaded(workers, src, dst)),
-            Self::Lz4(_) | Self::Brotli(_) | Self::Snappy(_) | Self::Zlib(_) => None,
+            Self::Entroq(_) | Self::Lz4(_) | Self::Brotli(_) | Self::Snappy(_) | Self::Zlib(_) => {
+                None
+            }
         }
     }
 }
@@ -260,7 +275,7 @@ fn as_int(len: usize, what: &str) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::{Method, Session, as_int, parameter};
-    use crate::catalog::find;
+    use crate::subject::Subject;
 
     #[test]
     fn a_point_carries_its_parameter_in_its_name() {
@@ -289,44 +304,52 @@ mod tests {
     }
 
     #[test]
-    fn a_point_the_catalog_does_not_pin_is_refused() {
-        let Some(codec) = find("zstd") else { return };
-        let failure = Session::open(codec, "level-99");
+    fn a_point_the_subject_does_not_declare_is_refused() {
+        let Some(zstd) = Subject::parse("zstd") else {
+            return;
+        };
+        let failure = Session::open(zstd, "level-99");
         assert!(failure.is_err());
         let message = failure.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(message.contains("level-22"), "{message}");
+
+        assert!(Session::open(Subject::Entroq, "level-1").is_err());
     }
 
     #[test]
-    fn every_pinned_competitor_opens_at_every_point_the_catalog_names() {
-        for codec in crate::catalog::CODECS {
-            for point in codec.operating_points() {
+    fn every_subject_opens_at_every_point_it_declares() {
+        let mut subjects = vec![Subject::Entroq];
+        subjects.extend(crate::catalog::CODECS.iter().map(Subject::Competitor));
+        for subject in subjects {
+            for point in subject.operating_points() {
                 assert!(
-                    Session::open(codec, point).is_ok(),
+                    Session::open(subject, point).is_ok(),
                     "{} does not open at {point}",
-                    codec.name
+                    subject.name()
                 );
             }
         }
     }
 
     #[test]
-    fn every_linked_library_reports_the_version_the_catalog_pins() {
-        for codec in crate::catalog::CODECS {
-            let Some(point) = codec.operating_points().first().copied() else {
+    fn every_subject_that_reports_a_version_reports_the_one_it_is_pinned_to() {
+        let mut subjects = vec![Subject::Entroq];
+        subjects.extend(crate::catalog::CODECS.iter().map(Subject::Competitor));
+        for subject in subjects {
+            let Some(point) = subject.operating_points().first().copied() else {
                 continue;
             };
-            let Ok(session) = Session::open(codec, point) else {
+            let Ok(session) = Session::open(subject, point) else {
                 continue;
             };
             let Some(reported) = session.linked_version() else {
                 continue;
             };
             assert!(
-                codec.version.contains(&reported),
-                "{} links a library that reports {reported}, and the catalog pins {}",
-                codec.name,
-                codec.version
+                subject.version().contains(&reported),
+                "{} reports {reported}, and it is pinned to {}",
+                subject.name(),
+                subject.version()
             );
         }
     }

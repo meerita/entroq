@@ -17,7 +17,12 @@ build = "build.rs"
 # The competitor libraries are linked by `build.rs` from the laboratory, not declared here.
 # They are build inputs produced outside this repository, so no version of them appears in
 # the lock file.
+#
+# `codec` is the subject. A comparison measures both sides through the same boundary, so the
+# harness drives Entroq in-process through its own crate exactly as it drives a competitor
+# through the library that project publishes.
 [dependencies]
+codec = { path = "../../codec" }
 libc = "0.2"
 serde_json = "1"
 sha2 = "0.10"

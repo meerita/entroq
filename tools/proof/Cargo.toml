@@ -7,11 +7,15 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 # `libc` reaches the one host fact no Rust standard library call exposes: the resident-set
-# high-water mark of a process. Nothing else is needed: the tool drives the codec through its
-# public API and compares bytes, so it owns no hash and no serialization dependency.
+# high-water mark of a process.
+#
+# `sha2` is the plaintext hash a format vector records. A vector states the content it decodes
+# to, and a hash is how it states it without carrying the content. Entroq owns a checksum of
+# its own format and not a general hash, and a vector's hash is evidence rather than format.
 [dependencies]
 codec = { path = "../../codec" }
 libc = "0.2"
+sha2 = "0.10"
 
 [lints]
 workspace = true

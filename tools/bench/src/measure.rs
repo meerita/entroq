@@ -16,10 +16,9 @@
 
 use std::time::Instant;
 
-use crate::catalog::Codec;
 use crate::clock::{self, Samples};
-use crate::competitor::{Method, Session};
 use crate::corpus;
+use crate::driver::{Method, Session};
 use crate::environment::{self, Environment};
 use crate::error::{Error, Result};
 use crate::lab;
@@ -27,6 +26,7 @@ use crate::laboratory::{self, Check};
 use crate::metric::{Metric, Set};
 use crate::plan::{self, Request, STREAM_CHUNK, Selection, Tier};
 use crate::registry::{ENTRIES, Entry, SizeClass};
+use crate::subject::Subject;
 use crate::{alloc, counters};
 
 /// What one segment already knows before it measures a row.
@@ -107,7 +107,7 @@ pub fn run(request: &Request) -> Result<Outcome> {
     for entry in &selection.selected {
         let data = corpus::load(entry, &corpus_layout)?;
         for point in &points {
-            let session = Session::open(request.codec, point)?;
+            let session = Session::open(request.subject, point)?;
             if linked_version.is_none() {
                 linked_version = session.linked_version();
             }
@@ -185,7 +185,8 @@ fn measure(
         return Err(Error::measure(
             format!(
                 "the {} round trip over {}",
-                request.codec.display, entry.name
+                request.subject.display(),
+                entry.name
             ),
             "did not return the input it was given, so no number from it means anything",
         ));
@@ -231,7 +232,7 @@ fn measure(
     // The cold pass: a fresh session, one compression, and release, all inside one allocator
     // interval. It is what an allocation count and a working-set figure are about.
     let cold = if representative {
-        Some(cold_pass(request.codec, point, data, &mut compressed)?)
+        Some(cold_pass(request.subject, point, data, &mut compressed)?)
     } else {
         None
     };
@@ -317,9 +318,9 @@ fn measure(
     }
 
     Ok(Measurement {
-        codec: request.codec.name,
-        display_name: request.codec.display,
-        version: request.codec.version,
+        codec: request.subject.name(),
+        display_name: request.subject.display(),
+        version: request.subject.version(),
         operating_point: String::from(point),
         format: notes.format,
         integrity: notes.integrity,
@@ -355,12 +356,12 @@ struct Cold {
     peak_bytes: u64,
 }
 
-fn cold_pass(codec: &Codec, point: &str, data: &[u8], into: &mut [u8]) -> Result<Cold> {
+fn cold_pass(subject: Subject, point: &str, data: &[u8], into: &mut [u8]) -> Result<Cold> {
     let interval = alloc::open();
     let outcome = {
         // The session opens, compresses, and releases inside the interval, so the count is
         // what one compression costs from cold rather than what a warm context costs.
-        match Session::open(codec, point) {
+        match Session::open(subject, point) {
             Ok(mut session) => session.compress(data, into),
             Err(failure) => Err(failure),
         }

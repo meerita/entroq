@@ -81,6 +81,13 @@ pub struct Target {
     /// still not codec coverage. A routine that fuzzes on a codec campaign's behalf advances
     /// only the targets that reach the codec, so none of its budget buys coverage of itself.
     pub codec: bool,
+    /// The bytes a seed file needs in front of it to mean what the driver reads.
+    ///
+    /// A seed is a whole stream and a driver's input is whatever that driver declares, so a
+    /// seed that carries no prefix reaches a driver that reads control bytes first as content
+    /// shifted by two positions. The prefix is declared here, beside the target, because the
+    /// driver states its own input shape and the runner copies files.
+    pub seed_prefix: &'static [u8],
 }
 
 const fn declared(name: &'static str, covers: &'static str) -> Target {
@@ -89,6 +96,7 @@ const fn declared(name: &'static str, covers: &'static str) -> Target {
         covers,
         state: State::Declared,
         codec: true,
+        seed_prefix: &[],
     }
 }
 
@@ -98,6 +106,7 @@ const fn runnable_target(name: &'static str, covers: &'static str) -> Target {
         covers,
         state: State::Runnable,
         codec: true,
+        seed_prefix: &[],
     }
 }
 
@@ -114,20 +123,34 @@ const fn runnable_target(name: &'static str, covers: &'static str) -> Target {
 const TARGETS: &[Target] = &[
     runnable_target("frame-parser", "the frame header parser"),
     declared("region-parser", "the region header parser"),
-    declared("block-parser", "the block header parser"),
-    declared("entropy-table-parser", "the entropy table parser"),
+    runnable_target(
+        "block-parser",
+        "the block header, the COMPRESSED prologue, and the stored body it locates",
+    ),
+    runnable_target("entropy-table-parser", "the entropy table parser"),
     declared("entropy-decoder", "the entropy decoder"),
-    declared("sequence-decoder", "the sequence decoder"),
+    runnable_target("sequence-decoder", "the sequence decoder"),
     declared("full-decoder", "the full decode path"),
-    runnable_target("streaming-decoder", "the streaming decode path"),
+    Target {
+        name: "streaming-decoder",
+        covers: "the streaming decode path",
+        state: State::Runnable,
+        codec: true,
+        // The driver reads a chunk size and an output size before the stream, so a seed that
+        // is a whole stream arrives two bytes short of what it is. Both bytes ask for the
+        // widest buffers the driver admits, which is the arrival pattern a vector was written
+        // under.
+        seed_prefix: &[0xFF, 0xFF],
+    },
     declared("index-parser", "the index parser"),
     declared("range-decoder", "the range decoder"),
-    declared("round-trip", "encode followed by decode"),
+    runnable_target("round-trip", "encode followed by decode"),
     Target {
         name: "mechanism",
         covers: "the runner, the segment budget, and the persistent corpus. No Entroq code",
         state: State::Runnable,
         codec: false,
+        seed_prefix: &[],
     },
 ];
 
@@ -412,6 +435,97 @@ pub fn routine(runs: &Path) -> Result<Routine> {
     })
 }
 
+/// Builds every driver a routine advances.
+///
+/// A routine runs inside one segment, so the drivers it advances are compiled before the
+/// segment starts. The list is this module's, so a caller that prepares a routine does not
+/// repeat it and cannot fall behind it.
+///
+/// # Errors
+///
+/// Fails when cargo-fuzz is absent, or when a driver does not build.
+pub fn prepare() -> Result<Vec<&'static str>> {
+    let mut built = Vec::new();
+    for target in TARGETS
+        .iter()
+        .filter(|target| target.state == State::Runnable && target.codec)
+    {
+        build(target.name)?;
+        built.push(target.name);
+    }
+    Ok(built)
+}
+
+/// What one seeding invocation did.
+pub struct Seeded {
+    pub target: &'static str,
+    pub from: PathBuf,
+    pub corpus: PathBuf,
+    pub files_before: usize,
+    pub files_after: usize,
+    pub copied: usize,
+    pub held: usize,
+}
+
+/// Copies a directory of streams into one target's corpus.
+///
+/// A corpus is coverage, so seeding adds and never removes. A file already in the corpus
+/// under the same name is left as it is: the corpus holds what libFuzzer derived from it as
+/// well, and overwriting the seed would not remove what grew from it.
+///
+/// Each file is written with the prefix the target declares in front of it, because a driver
+/// reads its own input shape and a stream is not that shape for every driver.
+///
+/// # Errors
+///
+/// Fails when the target has no driver, when the source directory cannot be read, or when the
+/// corpus cannot be written.
+pub fn seed(name: &str, from: &Path, runs: &Path) -> Result<Seeded> {
+    let target = runnable(name)?;
+    let corpus = Corpus::open(runs, target.name)?;
+    let files_before = corpus.files()?;
+
+    let listing = fs::read_dir(from).map_err(|e| Error::at("read", from, e))?;
+    let mut names: Vec<PathBuf> = Vec::new();
+    for entry in listing {
+        let entry = entry.map_err(|e| Error::at("read", from, e))?;
+        if entry.path().is_file() {
+            names.push(entry.path());
+        }
+    }
+    names.sort();
+
+    let mut copied = 0_usize;
+    let mut held = 0_usize;
+    for path in &names {
+        let Some(stem) = path.file_name() else {
+            continue;
+        };
+        let landing = corpus.dir.join(format!(
+            "seed-{}",
+            stem.to_string_lossy().replace(['/', '\\'], "-")
+        ));
+        if landing.exists() {
+            held = held.saturating_add(1);
+            continue;
+        }
+        let mut bytes = target.seed_prefix.to_vec();
+        bytes.extend_from_slice(&fs::read(path).map_err(|e| Error::at("read", path, e))?);
+        fs::write(&landing, &bytes).map_err(|e| Error::at("write", &landing, e))?;
+        copied = copied.saturating_add(1);
+    }
+
+    Ok(Seeded {
+        target: target.name,
+        from: absolute(from)?,
+        files_before,
+        files_after: corpus.files()?,
+        corpus: corpus.dir,
+        copied,
+        held,
+    })
+}
+
 /// The target a `--target` argument names, when a driver exists for it.
 fn runnable(name: &str) -> Result<&'static Target> {
     let Some(target) = TARGETS.iter().find(|target| target.name == name) else {
@@ -570,7 +684,17 @@ mod tests {
             .filter(|target| target.state == State::Runnable && target.codec)
             .map(|target| target.name)
             .collect();
-        assert_eq!(advanced, ["frame-parser", "streaming-decoder"]);
+        assert_eq!(
+            advanced,
+            [
+                "frame-parser",
+                "block-parser",
+                "entropy-table-parser",
+                "sequence-decoder",
+                "streaming-decoder",
+                "round-trip",
+            ]
+        );
         assert!(!advanced.contains(&"mechanism"), "the runner's own target");
     }
 
@@ -630,7 +754,18 @@ mod tests {
             .filter(|target| target.state == State::Runnable)
             .map(|target| target.name)
             .collect();
-        assert_eq!(found, ["frame-parser", "streaming-decoder", "mechanism"]);
+        assert_eq!(
+            found,
+            [
+                "frame-parser",
+                "block-parser",
+                "entropy-table-parser",
+                "sequence-decoder",
+                "streaming-decoder",
+                "round-trip",
+                "mechanism",
+            ]
+        );
     }
 
     #[test]
@@ -661,9 +796,76 @@ mod tests {
 
     #[test]
     fn every_driver_that_exists_is_runnable() {
-        for name in ["frame-parser", "streaming-decoder", "mechanism"] {
+        for name in [
+            "frame-parser",
+            "block-parser",
+            "entropy-table-parser",
+            "sequence-decoder",
+            "streaming-decoder",
+            "round-trip",
+            "mechanism",
+        ] {
             assert_eq!(runnable(name).map(|target| target.name).ok(), Some(name));
         }
+    }
+
+    /// A seed prefix is a driver's input shape, so only a target whose driver reads control
+    /// bytes carries one, and a target that carries one is runnable.
+    #[test]
+    fn only_a_runnable_target_declares_a_seed_prefix() {
+        for target in TARGETS {
+            if !target.seed_prefix.is_empty() {
+                assert_eq!(target.state, State::Runnable, "{}", target.name);
+            }
+        }
+        let streaming = TARGETS
+            .iter()
+            .find(|target| target.name == "streaming-decoder")
+            .map(|target| target.seed_prefix.len());
+        assert_eq!(streaming, Some(2));
+    }
+
+    /// Seeding adds and never removes, and it leaves a file the corpus already holds alone.
+    #[test]
+    fn seeding_adds_and_leaves_what_the_corpus_already_holds() {
+        let root = std::env::temp_dir().join("entroq-run-seed");
+        let _ = std::fs::remove_dir_all(&root);
+        let from = root.join("streams");
+        assert!(std::fs::create_dir_all(&from).is_ok());
+        assert!(std::fs::write(from.join("a.eqz"), [1_u8, 2, 3]).is_ok());
+        assert!(std::fs::write(from.join("b.eqz"), [4_u8, 5]).is_ok());
+
+        let runs = root.join("runs");
+        let first = super::seed("streaming-decoder", &from, &runs);
+        let Ok(first) = first else {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        };
+        assert_eq!(first.copied, 2);
+        assert_eq!(first.held, 0);
+        assert_eq!(first.files_after.saturating_sub(first.files_before), 2);
+
+        let landed = std::fs::read(first.corpus.join("seed-a.eqz")).unwrap_or_default();
+        assert_eq!(
+            landed,
+            [0xFF_u8, 0xFF, 1, 2, 3],
+            "the prefix is not in front"
+        );
+
+        let again = super::seed("streaming-decoder", &from, &runs);
+        let Ok(again) = again else {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        };
+        assert_eq!(again.copied, 0);
+        assert_eq!(again.held, 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn seeding_a_target_with_no_driver_is_refused() {
+        let root = std::env::temp_dir().join("entroq-run-seed-declared");
+        assert!(super::seed("index-parser", &root, &root).is_err());
     }
 
     #[test]

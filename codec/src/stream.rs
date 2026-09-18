@@ -4,30 +4,39 @@
 //! This module does not own encode or decode logic. It drives them within a declared bound.
 //!
 //! Both directions work on caller-supplied buffers and report what they moved, so neither
-//! holds a whole input or a whole output. The encoder holds one region of staged input,
-//! because a region header declares the bytes its blocks occupy before the first of them is
-//! written. The decoder holds a header scratch sized for the widest header the format
-//! defines, and nothing else: a payload travels from the caller's input to the caller's
-//! output without being stored. Neither side allocates once it is running.
+//! holds a whole input or a whole output. The encoder holds one region of staged input and the
+//! blocks that region assembled to, because a region header declares the bytes its blocks
+//! occupy before the first of them is written and a compressed block's stored length is known
+//! only once it exists. The decoder holds a header scratch, one window of the bytes its region
+//! produced, and room for one compressed block; a RAW or an RLE payload still travels from the
+//! caller's input to the caller's output without being stored.
 //!
 //! Chunk size is the caller's choice and never reaches the bytes. The encoder closes a region
 //! when the region is full, and otherwise only when the caller asks, so one input produces
 //! one stream at every chunk size.
 
+use crate::block;
 use crate::decode::Payload;
-use crate::encode::Layout;
+use crate::encode::{Emitter, Layout};
 use crate::format::{
-    BLOCK_HEADER_BYTES, BlockHeader, Corruption, DecoderPolicy, Error, FRAME_HEADER_FIXED_BYTES,
-    FRAME_HEADER_MAX_BYTES, FrameHeader, RECORD_TAG_BYTES, Record,
+    BLOCK_HEADER_BYTES, BlockHeader, BlockPrologue, BlockType, Corruption, DecoderPolicy, Error,
+    FRAME_HEADER_FIXED_BYTES, FRAME_HEADER_MAX_BYTES, FrameHeader, RECORD_TAG_BYTES, Record,
 };
+use crate::sequence::WINDOW;
 
-pub use crate::encode::{DEFAULT_BLOCK_BYTES, DEFAULT_REGION_BYTES};
+pub use crate::encode::{DEFAULT_BLOCK_BYTES, DEFAULT_REGION_BYTES, Statistics};
 
 /// The bytes a streaming machine keeps for one header.
 ///
 /// The widest header the format defines is a frame header carrying every optional field, so a
 /// full scratch always holds a complete header of any kind.
 const SCRATCH_BYTES: usize = FRAME_HEADER_MAX_BYTES;
+
+/// The bytes the produced content a decoder keeps room for, beyond one block.
+///
+/// One window is what a match may reach back into, and one more is the slack that lets a RAW
+/// payload be remembered a chunk at a time rather than moved on every byte.
+const DECODER_WINDOW_SLACK: usize = (WINDOW as usize).saturating_mul(2);
 
 /// Why a streaming call returned.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,7 +64,7 @@ pub struct Progress {
 enum Emitting {
     Start,
     Open,
-    Blocks,
+    Region,
     Terminator,
     Done,
 }
@@ -69,22 +78,26 @@ enum Closing {
 
 /// Turns input into a frame, at whatever chunk size the caller has.
 ///
-/// The encoder stages one region of input, closes it when it is full, and writes it out as
-/// RAW blocks. `flush` closes the current region early and keeps the stream open. `finish`
-/// closes it and writes the terminator.
+/// The encoder stages one region of input, closes it when it is full, assembles its blocks,
+/// and writes the region out. `flush` closes the current region early and keeps the stream
+/// open. `finish` closes it and writes the terminator.
 ///
-/// The memory the encoder holds is one region plus one header scratch, and `memory_bytes`
-/// states it. Nothing is allocated after construction.
+/// A region is assembled before its header is written, because the header declares the bytes
+/// its blocks occupy and a compressed block does not know its stored length until it exists.
+///
+/// The memory the encoder holds is one region of input, the blocks that region assembles to,
+/// the encoder state one block needs, and one header scratch. `steady_state_bytes` states it.
+/// Nothing is held after construction that was not allocated there.
 pub struct Encoder {
     header: FrameHeader,
     layout: Layout,
+    emitter: Emitter,
     staged: Vec<u8>,
+    blocks: Vec<u8>,
     scratch: [u8; SCRATCH_BYTES],
     scratch_len: usize,
     scratch_at: usize,
     data_at: usize,
-    data_end: usize,
-    next_block_at: usize,
     accepted: u64,
     emitting: Emitting,
     closing: Closing,
@@ -107,8 +120,8 @@ impl Encoder {
     /// # Errors
     ///
     /// Returns `InvalidParameter` when a size is zero, when the block size is above what a
-    /// block header declares, or when the header declares an index this encoder does not
-    /// write.
+    /// block header declares or above what one parse may take, or when the header declares an
+    /// index this encoder does not write.
     pub fn with_layout(
         header: FrameHeader,
         region_bytes: usize,
@@ -118,16 +131,21 @@ impl Encoder {
             return Err(Error::InvalidParameter);
         }
         let layout = Layout::new(region_bytes, block_bytes)?;
+        // The layout is the one authority on how long a block is, so the emitter is sized from
+        // what it settled on rather than from the parameter beside it.
+        let emitter = Emitter::new(DecoderPolicy::CONSERVATIVE, layout.block_bytes())?;
+        let physical = usize::try_from(layout.physical_bytes(region_bytes)?)
+            .map_err(|_| Error::InvalidParameter)?;
         Ok(Self {
             header,
             layout,
+            emitter,
             staged: Vec::with_capacity(region_bytes),
+            blocks: Vec::with_capacity(physical),
             scratch: [0; SCRATCH_BYTES],
             scratch_len: 0,
             scratch_at: 0,
             data_at: 0,
-            data_end: 0,
-            next_block_at: 0,
             accepted: 0,
             emitting: Emitting::Start,
             closing: Closing::Open,
@@ -135,12 +153,32 @@ impl Encoder {
         })
     }
 
-    /// The bytes this encoder holds, beyond the buffers the caller passes it.
+    /// The bytes this encoder holds between calls, beyond the buffers the caller passes it.
     ///
-    /// The value is fixed at construction and does not move with the input.
+    /// One region of staged input, the blocks that region assembles to, the parse state, the
+    /// payload scratch, the tables in force at the ceiling that bounds them, and one header
+    /// scratch. The figure does not move with the input.
+    ///
+    /// **This is not the peak.** Assembling one block allocates a buffer per coded section and
+    /// per table it builds, in proportion to that block, and frees them before the call
+    /// returns. Those bytes are real peak memory and they are outside this figure. The peak is
+    /// measured rather than declared, because no mode declares a bound yet and a figure that
+    /// was not measured would not be one.
     #[must_use]
-    pub const fn memory_bytes(&self) -> usize {
-        self.staged.capacity().saturating_add(SCRATCH_BYTES)
+    pub fn steady_state_bytes(&self) -> usize {
+        self.staged
+            .capacity()
+            .saturating_add(self.blocks.capacity())
+            .saturating_add(self.emitter.steady_state_bytes())
+            .saturating_add(SCRATCH_BYTES)
+    }
+
+    /// What this encoder recorded about the blocks it emitted.
+    ///
+    /// Reading it changes no byte the encoder writes.
+    #[must_use]
+    pub const fn statistics(&self) -> Statistics {
+        self.emitter.statistics()
     }
 
     /// Takes input and writes whatever the stream is ready to emit.
@@ -269,7 +307,7 @@ impl Encoder {
     }
 
     const fn blocked(&self) -> bool {
-        if self.scratch_at < self.scratch_len || self.data_at < self.data_end {
+        if self.scratch_at < self.scratch_len || self.data_at < self.blocks.len() {
             return true;
         }
         self.staged.len() >= self.layout.region_bytes()
@@ -287,11 +325,21 @@ impl Encoder {
         }
     }
 
+    /// Moves what is queued into `out`, and advances the machine when nothing is queued.
+    ///
+    /// A full output buffer stops a copy and does not stop a state transition. The two are
+    /// separate because the last transition of a stream writes nothing: the terminator's bytes
+    /// are queued by one transition and the machine reaches `Done` on the next. A caller that
+    /// sized its output to the expansion bound hands over a buffer that is exactly full at
+    /// that moment, and a machine that refused to transition on a full buffer would report
+    /// `NeedsOutput` forever while producing nothing.
     fn pump(&mut self, out: &mut [u8]) -> Result<usize, Error> {
         let mut produced = 0_usize;
         loop {
             let room = out.get_mut(produced..).unwrap_or_default();
-            if room.is_empty() {
+            if room.is_empty()
+                && (self.scratch_at < self.scratch_len || self.data_at < self.blocks.len())
+            {
                 return Ok(produced);
             }
             if self.scratch_at < self.scratch_len {
@@ -310,11 +358,15 @@ impl Encoder {
                 produced = produced.saturating_add(take);
                 continue;
             }
-            if self.data_at < self.data_end {
-                let take = self.data_end.saturating_sub(self.data_at).min(room.len());
+            if self.data_at < self.blocks.len() {
+                let take = self
+                    .blocks
+                    .len()
+                    .saturating_sub(self.data_at)
+                    .min(room.len());
                 let end = self.data_at.saturating_add(take);
                 let source = self
-                    .staged
+                    .blocks
                     .get(self.data_at..end)
                     .ok_or(Error::InvalidParameter)?;
                 let target = room.get_mut(..take).ok_or(Error::InvalidParameter)?;
@@ -340,13 +392,15 @@ impl Encoder {
             Emitting::Open => {
                 let full = self.staged.len() >= self.layout.region_bytes();
                 if !self.staged.is_empty() && (full || self.closing != Closing::Open) {
-                    let region = self
-                        .layout
-                        .region(self.staged.len(), self.header.integrity)?;
+                    self.assemble()?;
+                    let physical =
+                        u64::try_from(self.blocks.len()).map_err(|_| Error::InvalidParameter)?;
+                    let region =
+                        self.layout
+                            .region(self.staged.len(), physical, self.header.integrity)?;
                     let encoded = Record::Region(region).encode();
                     self.queue(encoded.as_bytes());
-                    self.next_block_at = 0;
-                    self.emitting = Emitting::Blocks;
+                    self.emitting = Emitting::Region;
                     return Ok(true);
                 }
                 if self.staged.is_empty() && self.closing == Closing::Finish {
@@ -360,19 +414,11 @@ impl Encoder {
                 }
                 Ok(false)
             }
-            Emitting::Blocks => {
-                if self.next_block_at >= self.staged.len() {
-                    self.staged.clear();
-                    self.next_block_at = 0;
-                    self.emitting = Emitting::Open;
-                    return Ok(true);
-                }
-                let (block, end) = self.layout.block(self.next_block_at, self.staged.len())?;
-                let encoded = block.encode();
-                self.queue(encoded.as_bytes());
-                self.data_at = self.next_block_at;
-                self.data_end = end;
-                self.next_block_at = end;
+            Emitting::Region => {
+                self.staged.clear();
+                self.blocks.clear();
+                self.data_at = 0;
+                self.emitting = Emitting::Open;
                 Ok(true)
             }
             Emitting::Terminator => {
@@ -381,6 +427,34 @@ impl Encoder {
             }
             Emitting::Done => Ok(false),
         }
+    }
+
+    /// Turns everything staged into the blocks of one region.
+    ///
+    /// The blocks of a region are assembled together because the region header declares the
+    /// bytes they occupy. Both histories a region carries are discarded first, so a region
+    /// depends on nothing an earlier region left.
+    fn assemble(&mut self) -> Result<(), Error> {
+        let Self {
+            layout,
+            emitter,
+            staged,
+            blocks,
+            data_at,
+            ..
+        } = self;
+        emitter.reset();
+        blocks.clear();
+        *data_at = 0;
+        let len = staged.len();
+        let mut at = 0_usize;
+        while at < len {
+            let (end, last) = layout.block(at, len)?;
+            let input = staged.get(at..end).ok_or(Error::InvalidParameter)?;
+            let _kind = emitter.emit(input, last, at == 0, blocks)?;
+            at = end;
+        }
+        Ok(())
     }
 
     fn queue(&mut self, bytes: &[u8]) {
@@ -404,7 +478,21 @@ enum Reading {
     Frame,
     Record,
     Block,
-    Payload { last: bool, payload: Payload },
+    Payload {
+        last: bool,
+        payload: Payload,
+    },
+    /// A COMPRESSED block's stored body is arriving. `need` is the bytes it takes, as far as
+    /// the prologue read so far has declared them.
+    Stored {
+        last: bool,
+        size: u32,
+        need: usize,
+    },
+    /// A COMPRESSED block has been expanded and its content is being handed to the caller.
+    Expanded {
+        last: bool,
+    },
     Done,
 }
 
@@ -413,6 +501,12 @@ enum Reading {
 /// The decoder validates the frame header against its policy before it reads anything else,
 /// validates every later structure at the boundary that owns it, and writes decoded bytes
 /// only into the buffer the caller supplies.
+///
+/// A RAW or an RLE payload is never stored: it moves from the caller's input to the caller's
+/// output a step at a time. A COMPRESSED block cannot be read that way, because a match in it
+/// may name any byte its region has already produced, so the decoder holds its whole stored
+/// body, the content it decodes to, and one window of what the region produced before it.
+/// Those buffers are sized from the policy at construction and never grow.
 ///
 /// A decoder that has failed is poisoned: every later call returns the same error.
 pub struct Decoder {
@@ -424,14 +518,32 @@ pub struct Decoder {
     reading: Reading,
     region_logical: u64,
     region_physical: u64,
+    first_in_region: bool,
     produced: u64,
+    tables: block::Decoder,
+    /// The stored body of the COMPRESSED block being read.
+    stored: Vec<u8>,
+    /// The bytes this region produced, of which the last window is what a match may reach.
+    window: Vec<u8>,
+    /// Where in `window` the block being handed to the caller has got to.
+    window_at: usize,
     poison: Option<Error>,
 }
 
 impl Decoder {
     /// A decoder that admits a frame only when `policy` allows what the frame declares.
+    ///
+    /// The buffers one COMPRESSED block needs are allocated here, from the block size the
+    /// policy admits. A policy that admits no COMPRESSED block allocates none of them and
+    /// refuses every such block with `LimitExceeded`.
     #[must_use]
-    pub const fn new(policy: DecoderPolicy) -> Self {
+    pub fn new(policy: DecoderPolicy) -> Self {
+        let block_bytes = usize::try_from(policy.max_block_bytes()).unwrap_or(0);
+        let content = if block_bytes == 0 {
+            0
+        } else {
+            block_bytes.saturating_add(DECODER_WINDOW_SLACK)
+        };
         Self {
             policy,
             header: None,
@@ -441,23 +553,60 @@ impl Decoder {
             reading: Reading::Frame,
             region_logical: 0,
             region_physical: 0,
+            first_in_region: true,
             produced: 0,
+            tables: block::Decoder::at_region_start(),
+            stored: Vec::with_capacity(block_bytes),
+            window: Vec::with_capacity(content),
+            window_at: 0,
             poison: None,
         }
     }
 
-    /// The bytes this decoder holds, beyond the buffers the caller passes it.
+    /// The bytes this decoder holds between calls, beyond the buffers the caller passes it.
     ///
-    /// The value is a constant of the format, not of the stream.
+    /// The header scratch and the two content buffers are fixed at construction. The tables in
+    /// force are counted at the table memory the policy admits, which is the figure this
+    /// decoder refuses a block against and therefore what bounds them.
+    ///
+    /// **This is not the peak.** Reading one COMPRESSED block allocates a symbol vector per
+    /// stream and a copy of each suffix section, in proportion to that block, and frees them
+    /// before the call returns. Those bytes are real peak memory and they are outside this
+    /// figure. The peak is measured rather than declared, because no mode declares a bound yet
+    /// and a figure that was not measured would not be one.
     #[must_use]
-    pub const fn memory_bytes(&self) -> usize {
+    pub fn steady_state_bytes(&self) -> usize {
         SCRATCH_BYTES
+            .saturating_add(self.stored.capacity())
+            .saturating_add(self.window.capacity())
+            .saturating_add(usize::try_from(self.policy.max_table_bytes()).unwrap_or(0))
     }
 
     /// What the frame declared, once its header has arrived and policy has admitted it.
     #[must_use]
     pub const fn header(&self) -> Option<FrameHeader> {
         self.header
+    }
+
+    /// The decode tables this decoder has built, over every block of every region it has read.
+    ///
+    /// A count and not a time. It is what makes the position of a refusal measurable: a block
+    /// refused before the commitment point leaves it where it was.
+    #[must_use]
+    pub const fn tables_built(&self) -> u64 {
+        self.tables.tables_built()
+    }
+
+    /// The widest set of decode tables this decoder has held at once.
+    ///
+    /// The tables of one block are held while the block decodes, and the tables of the streams
+    /// a block does not code stay in force across it, so the figure is neither one block's
+    /// declaration nor the state a block settles at. It covers the transition from one block's
+    /// tables to the next one's, which is the point a decoder holds the most, and it never
+    /// rises above the table memory the policy admits.
+    #[must_use]
+    pub const fn peak_table_bytes(&self) -> u64 {
+        self.tables.peak_table_bytes()
     }
 
     /// Takes compressed input and writes decoded output.
@@ -468,8 +617,8 @@ impl Decoder {
     /// # Errors
     ///
     /// Returns the error that names the structure the stream violated, and `LimitExceeded`
-    /// when the frame declares more than policy allows. A stream that stops early is not an
-    /// error here: `finish` reports it.
+    /// when the frame or a block declares more than policy allows. A stream that stops early
+    /// is not an error here: `finish` reports it.
     pub fn decode(&mut self, input: &[u8], out: &mut [u8]) -> Result<Progress, Error> {
         if let Some(error) = self.poison {
             return Err(error);
@@ -485,7 +634,7 @@ impl Decoder {
                         state: StreamState::Finished,
                     });
                 }
-                Reading::Frame => {
+                Reading::Frame | Reading::Record | Reading::Block => {
                     let rest = input.get(consumed..).unwrap_or_default();
                     consumed = consumed.saturating_add(self.fill(rest));
                     if self.scratch_len < self.need {
@@ -495,39 +644,25 @@ impl Decoder {
                             state: StreamState::NeedsInput,
                         });
                     }
-                    self.read_frame()?;
-                }
-                Reading::Record => {
-                    let rest = input.get(consumed..).unwrap_or_default();
-                    consumed = consumed.saturating_add(self.fill(rest));
-                    if self.scratch_len < self.need {
-                        return Ok(Progress {
-                            consumed,
-                            produced,
-                            state: StreamState::NeedsInput,
-                        });
+                    match self.reading {
+                        Reading::Frame => self.read_frame()?,
+                        Reading::Record => self.read_record()?,
+                        _ => self.read_block()?,
                     }
-                    self.read_record()?;
-                }
-                Reading::Block => {
-                    let rest = input.get(consumed..).unwrap_or_default();
-                    consumed = consumed.saturating_add(self.fill(rest));
-                    if self.scratch_len < self.need {
-                        return Ok(Progress {
-                            consumed,
-                            produced,
-                            state: StreamState::NeedsInput,
-                        });
-                    }
-                    self.read_block()?;
                 }
                 Reading::Payload { last, mut payload } => {
                     let source = input.get(consumed..).unwrap_or_default();
+                    let empty = source.is_empty();
                     let target = out.get_mut(produced..).unwrap_or_default();
                     let moved = match payload.step(source, target) {
                         Ok(moved) => moved,
                         Err(error) => return Err(self.poisoned(error)),
                     };
+                    // A later block of this region may name any byte an earlier one produced,
+                    // whatever type carried it, so the window follows the content and not the
+                    // block type.
+                    let end = produced.saturating_add(moved.produced);
+                    self.remember(out.get(produced..end).unwrap_or_default());
                     consumed = consumed.saturating_add(moved.consumed);
                     produced = produced.saturating_add(moved.produced);
                     self.spend(moved.consumed, moved.produced)?;
@@ -537,7 +672,7 @@ impl Decoder {
                     }
                     self.reading = Reading::Payload { last, payload };
                     if moved.consumed == 0 && moved.produced == 0 {
-                        let state = if source.is_empty() {
+                        let state = if empty {
                             StreamState::NeedsInput
                         } else {
                             StreamState::NeedsOutput
@@ -548,6 +683,34 @@ impl Decoder {
                             state,
                         });
                     }
+                }
+                Reading::Stored { last, size, need } => {
+                    let rest = input.get(consumed..).unwrap_or_default();
+                    let take = need.saturating_sub(self.stored.len()).min(rest.len());
+                    self.stored
+                        .extend_from_slice(rest.get(..take).unwrap_or_default());
+                    consumed = consumed.saturating_add(take);
+                    if self.widen_block(last, size, need)?.is_none() {
+                        return Ok(Progress {
+                            consumed,
+                            produced,
+                            state: StreamState::NeedsInput,
+                        });
+                    }
+                }
+                Reading::Expanded { last } => {
+                    let take = self.hand_over(out.get_mut(produced..).unwrap_or_default())?;
+                    if take == 0 {
+                        if self.window_at < self.window.len() {
+                            return Ok(Progress {
+                                consumed,
+                                produced,
+                                state: StreamState::NeedsOutput,
+                            });
+                        }
+                        self.end_block(last)?;
+                    }
+                    produced = produced.saturating_add(take);
                 }
             }
         }
@@ -560,7 +723,8 @@ impl Decoder {
     /// # Errors
     ///
     /// Returns `TruncatedInput` with the bytes the pending structure still needs when the
-    /// stream stopped before its terminator, and the poisoned error when the decoder failed.
+    /// stream stopped before its terminator, `OutputTooSmall` when decoded content has not
+    /// been taken, and the poisoned error when the decoder failed.
     pub fn finish(&self) -> Result<(), Error> {
         if let Some(error) = self.poison {
             return Err(error);
@@ -569,6 +733,12 @@ impl Decoder {
             Reading::Done => Ok(()),
             Reading::Payload { payload, .. } => Err(Error::TruncatedInput {
                 needed: payload.stored_remaining().max(1),
+            }),
+            Reading::Stored { need, .. } => Err(Error::TruncatedInput {
+                needed: need.saturating_sub(self.stored.len()).max(1),
+            }),
+            Reading::Expanded { .. } => Err(Error::OutputTooSmall {
+                needed: self.window.len().saturating_sub(self.window_at).max(1),
             }),
             Reading::Frame | Reading::Record | Reading::Block => Err(Error::TruncatedInput {
                 needed: self.need.saturating_sub(self.scratch_len).max(1),
@@ -614,6 +784,12 @@ impl Decoder {
                 self.consume_scratch(used);
                 self.region_logical = region.logical_size;
                 self.region_physical = region.physical_size;
+                // A region start discards every dependency the region before it left: the
+                // tables in force, the offset cache, and the bytes a match may reach into.
+                self.tables.reset();
+                self.window.clear();
+                self.window_at = 0;
+                self.first_in_region = true;
                 self.need = BLOCK_HEADER_BYTES;
                 self.reading = Reading::Block;
                 Ok(())
@@ -625,31 +801,189 @@ impl Decoder {
 
     fn read_block(&mut self) -> Result<(), Error> {
         let held = self.scratch.get(..self.scratch_len).unwrap_or_default();
-        match BlockHeader::decode(held) {
-            Ok((block, used)) => {
-                self.consume_scratch(used);
-                let cost = u64::try_from(used).unwrap_or(u64::MAX);
-                let Some(physical) = self.region_physical.checked_sub(cost) else {
-                    return Err(self.poisoned(Error::CorruptData(Corruption::RegionMismatch)));
-                };
-                self.region_physical = physical;
-                if u64::from(block.stored_len()) > self.region_physical
-                    || u64::from(block.decoded_len()) > self.region_logical
-                {
-                    return Err(self.poisoned(Error::CorruptData(Corruption::RegionMismatch)));
-                }
-                self.reading = Reading::Payload {
-                    last: block.last,
-                    payload: Payload::new(block),
-                };
-                Ok(())
-            }
-            Err(Error::TruncatedInput { needed }) => self.widen(needed),
-            Err(error) => Err(self.poisoned(error)),
+        let (block, used) = match BlockHeader::decode(held) {
+            Ok(read) => read,
+            Err(Error::TruncatedInput { needed }) => return self.widen(needed),
+            Err(error) => return Err(self.poisoned(error)),
+        };
+        self.consume_scratch(used);
+        let cost = u64::try_from(used).unwrap_or(u64::MAX);
+        let Some(physical) = self.region_physical.checked_sub(cost) else {
+            return Err(self.poisoned(Error::CorruptData(Corruption::RegionMismatch)));
+        };
+        self.region_physical = physical;
+        if u64::from(block.decoded_len()) > self.region_logical {
+            return Err(self.poisoned(Error::CorruptData(Corruption::RegionMismatch)));
         }
+
+        if block.kind == BlockType::Compressed {
+            let size = match self.policy.admit_block_bytes(block.size) {
+                Ok(size) => size,
+                Err(error) => return Err(self.poisoned(error)),
+            };
+            self.stored.clear();
+            self.reading = Reading::Stored {
+                last: block.last,
+                size,
+                // One byte is what the model field takes, and reading it is what tells the
+                // decoder how many more the prologue needs.
+                need: 1,
+            };
+            return Ok(());
+        }
+
+        let payload = match Payload::new(block) {
+            Ok(payload) => payload,
+            Err(error) => return Err(self.poisoned(error)),
+        };
+        let stored = u64::try_from(payload.stored_remaining()).unwrap_or(u64::MAX);
+        if stored > self.region_physical {
+            return Err(self.poisoned(Error::CorruptData(Corruption::RegionMismatch)));
+        }
+        self.reading = Reading::Payload {
+            last: block.last,
+            payload,
+        };
+        Ok(())
+    }
+
+    /// Raises the stored bytes a COMPRESSED block needs, and expands it once they are here.
+    ///
+    /// The prologue declares the twelve extents the block's stored length is the sum of, so
+    /// the bytes a block takes are learned from the block and never assumed. A block that is
+    /// not below its own decoded size is refused here, before its body is read.
+    ///
+    /// Answers `None` when more input is needed.
+    fn widen_block(&mut self, last: bool, size: u32, need: usize) -> Result<Option<()>, Error> {
+        if self.stored.len() < need {
+            return Ok(None);
+        }
+        let decoded = usize::try_from(size).unwrap_or(usize::MAX);
+        let total =
+            match BlockPrologue::decode(&self.stored, size, self.first_in_region, &self.policy) {
+                Ok((prologue, used)) => {
+                    let body = prologue
+                        .body_bytes()
+                        .and_then(|bytes| usize::try_from(bytes).ok())
+                        .ok_or(Error::CorruptData(Corruption::BlockExtent))
+                        .map_err(|error| self.poisoned(error))?;
+                    used.checked_add(body)
+                        .ok_or(Error::CorruptData(Corruption::BlockExtent))
+                        .map_err(|error| self.poisoned(error))?
+                }
+                Err(Error::TruncatedInput { needed }) => {
+                    if needed <= self.stored.len() {
+                        return Err(self.poisoned(Error::CorruptData(Corruption::HeaderWidth)));
+                    }
+                    needed
+                }
+                Err(error) => return Err(self.poisoned(error)),
+            };
+        if total >= decoded {
+            return Err(self.poisoned(Error::CorruptData(Corruption::BlockExpansion)));
+        }
+        if u64::try_from(total).unwrap_or(u64::MAX) > self.region_physical {
+            return Err(self.poisoned(Error::CorruptData(Corruption::RegionMismatch)));
+        }
+        if self.stored.len() < total {
+            self.reading = Reading::Stored {
+                last,
+                size,
+                need: total,
+            };
+            return Ok(Some(()));
+        }
+        self.expand_block(last, decoded)?;
+        Ok(Some(()))
+    }
+
+    /// Expands one COMPRESSED block into the window, behind the bytes its region produced.
+    fn expand_block(&mut self, last: bool, decoded: usize) -> Result<(), Error> {
+        self.make_room(decoded);
+        let base = self.window.len();
+        self.window.resize(base.saturating_add(decoded), 0);
+        let Self {
+            policy,
+            region_physical,
+            first_in_region,
+            tables,
+            stored,
+            window,
+            ..
+        } = self;
+        let (before, out) = window.split_at_mut(base);
+        let history = before
+            .get(before.len().saturating_sub(WINDOW as usize)..)
+            .unwrap_or_default();
+        let read = tables.read(
+            &block::Block {
+                arrived: stored,
+                declared: *region_physical,
+                first_in_region: *first_in_region,
+                history,
+            },
+            policy,
+            out,
+        );
+        let spent = match read {
+            Ok(spent) => spent,
+            Err(error) => {
+                self.window.truncate(base);
+                return Err(self.poisoned(error));
+            }
+        };
+        if spent != self.stored.len() {
+            self.window.truncate(base);
+            return Err(self.poisoned(Error::CorruptData(Corruption::BlockExtent)));
+        }
+        self.spend(spent, 0)?;
+        self.stored.clear();
+        self.window_at = base;
+        self.reading = Reading::Expanded { last };
+        Ok(())
+    }
+
+    /// Keeps the last window of the bytes a RAW or an RLE payload produced.
+    ///
+    /// A match in a later block of the region may name any of them, so the window follows the
+    /// content and not the block type that carried it.
+    fn remember(&mut self, produced: &[u8]) {
+        if self.window.capacity() == 0 {
+            return;
+        }
+        let reach = WINDOW as usize;
+        let tail = produced.len().min(reach);
+        let source = produced
+            .get(produced.len().saturating_sub(tail)..)
+            .unwrap_or_default();
+        self.make_room(tail);
+        self.window.extend_from_slice(source);
+    }
+
+    /// Makes room for `need` more bytes, keeping the last window of what the region produced.
+    fn make_room(&mut self, need: usize) {
+        if self.window.len().saturating_add(need) <= self.window.capacity() {
+            return;
+        }
+        let keep = self.window.len().min(WINDOW as usize);
+        let from = self.window.len().saturating_sub(keep);
+        self.window.copy_within(from.., 0);
+        self.window.truncate(keep);
+    }
+
+    /// Hands the caller as much of the expanded block as its buffer takes.
+    fn hand_over(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+        let source = self.window.get(self.window_at..).unwrap_or_default();
+        let take = source.len().min(out.len());
+        let slot = out.get_mut(..take).ok_or(Error::InvalidParameter)?;
+        slot.copy_from_slice(source.get(..take).unwrap_or_default());
+        self.window_at = self.window_at.saturating_add(take);
+        self.spend(0, take)?;
+        Ok(take)
     }
 
     const fn end_block(&mut self, last: bool) -> Result<(), Error> {
+        self.first_in_region = false;
         if last {
             if self.region_logical != 0 || self.region_physical != 0 {
                 return Err(self.poisoned(Error::CorruptData(Corruption::RegionMismatch)));
@@ -729,10 +1063,13 @@ mod tests {
     use super::{
         DEFAULT_BLOCK_BYTES, DEFAULT_REGION_BYTES, Decoder, Encoder, Progress, StreamState,
     };
+    use crate::entropy;
     use crate::format::{
-        BlockHeader, Corruption, DecoderPolicy, Error, Feature, FrameHeader, IntegrityMode, Record,
-        RegionHeader, RegionIndependence, ResourceClass,
+        BLOCK_HEADER_BYTES, BlockHeader, Corruption, DEFAULT_MAX_BLOCK_BYTES, DecoderPolicy, Error,
+        Feature, FrameHeader, IntegrityMode, Record, RegionHeader, RegionIndependence,
+        ResourceClass,
     };
+    use crate::parser::Parser;
 
     /// The layout the malformed-structure fixtures are built on.
     ///
@@ -1215,9 +1552,12 @@ mod tests {
             &with_byte(&stream, 17, 65)?,
             Error::CorruptData(Corruption::RegionMismatch),
         )?;
+        // A RAW payload relabelled COMPRESSED is damaged rather than unimplemented: the
+        // decoder reads the prologue this build defines and the first field it holds against
+        // the block's own decoded size contradicts it.
         refuses(
             &with_byte(&stream, 33, 0x84)?,
-            Error::UnsupportedFeature(Feature::CompressedBlock),
+            Error::CorruptData(Corruption::BlockCount),
         )?;
         refuses(
             &with_byte(&stream, 33, 0x86)?,
@@ -1389,28 +1729,41 @@ mod tests {
     }
 
     #[test]
-    fn the_declared_memory_bound_holds_across_a_decade_of_input_sizes() -> Result<(), Error> {
+    fn the_steady_state_figure_holds_across_a_decade_of_input_sizes() -> Result<(), Error> {
         let header = FrameHeader::new(
             ResourceClass::Small,
             RegionIndependence::Independent,
             IntegrityMode::PerRegion,
         );
+        // The span is a decade and the volume is the memory proof's, not the correctness
+        // set's. It shortened when the encoder started compressing: the same span through a
+        // codec path costs what a copy did not.
         let mut bounds = Vec::new();
-        for megabytes in [1_usize, 8, 64] {
+        for megabytes in [1_usize, 4, 16] {
             let total = megabytes.saturating_mul(1_048_576);
             bounds.push(streamed(header, total)?);
         }
         let first = bounds.first().copied().ok_or(Error::InvalidParameter)?;
         for bound in &bounds {
-            assert_eq!(*bound, first, "the bound moved with the input size");
+            assert_eq!(*bound, first, "the steady state moved with the input size");
         }
-        assert_eq!(
-            first,
-            (
-                DEFAULT_REGION_BYTES.saturating_add(super::SCRATCH_BYTES),
-                super::SCRATCH_BYTES
-            )
-        );
+        let block_bytes = usize::try_from(DEFAULT_BLOCK_BYTES).unwrap_or(0);
+        let region_blocks = DEFAULT_REGION_BYTES
+            .div_ceil(block_bytes)
+            .saturating_mul(BLOCK_HEADER_BYTES);
+        let tables = usize::try_from(entropy::MAX_BLOCK_TABLE_BYTES).unwrap_or(0);
+        let encoder = DEFAULT_REGION_BYTES
+            .saturating_add(DEFAULT_REGION_BYTES.saturating_add(region_blocks))
+            .saturating_add(Parser::declared_bytes(block_bytes))
+            .saturating_add(block_bytes)
+            .saturating_add(tables)
+            .saturating_add(super::SCRATCH_BYTES);
+        let admitted = usize::try_from(DEFAULT_MAX_BLOCK_BYTES).unwrap_or(0);
+        let decoder = super::SCRATCH_BYTES
+            .saturating_add(admitted)
+            .saturating_add(admitted.saturating_add(super::DECODER_WINDOW_SLACK))
+            .saturating_add(tables);
+        assert_eq!(first, (encoder, decoder));
         Ok(())
     }
 
@@ -1423,7 +1776,7 @@ mod tests {
 
         let mut encoder = Encoder::new(header)?;
         let mut decoder = Decoder::new(permissive());
-        let bound = (encoder.memory_bytes(), decoder.memory_bytes());
+        let bound = (encoder.steady_state_bytes(), decoder.steady_state_bytes());
 
         let mut input = vec![0_u8; CHUNK];
         let mut coded = vec![0_u8; CHUNK];
@@ -1454,7 +1807,7 @@ mod tests {
                 )?;
             }
             fed = fed.saturating_add(span);
-            assert_eq!(encoder.memory_bytes(), bound.0, "the encoder grew");
+            assert_eq!(encoder.steady_state_bytes(), bound.0, "the encoder grew");
         }
         loop {
             let progress = encoder.finish(&mut coded)?;
@@ -1488,8 +1841,8 @@ mod tests {
             checked,
             u64::try_from(total).map_err(|_| Error::InvalidParameter)?
         );
-        assert_eq!(encoder.memory_bytes(), bound.0, "the encoder grew");
-        assert_eq!(decoder.memory_bytes(), bound.1, "the decoder grew");
+        assert_eq!(encoder.steady_state_bytes(), bound.0, "the encoder grew");
+        assert_eq!(decoder.steady_state_bytes(), bound.1, "the decoder grew");
         Ok(bound)
     }
 
@@ -1523,5 +1876,86 @@ mod tests {
                 return Ok(());
             }
         }
+    }
+
+    /// The bytes the declared expansion bound reserves for one frame of `content`.
+    fn bound(header: FrameHeader, content: usize) -> usize {
+        let logical = u64::try_from(content).unwrap_or(0);
+        let region = u64::try_from(DEFAULT_REGION_BYTES).unwrap_or(0);
+        header
+            .raw_frame_bytes(logical, region, DEFAULT_BLOCK_BYTES)
+            .ok()
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_caller_that_sized_its_output_to_the_expansion_bound_reaches_the_end() -> Result<(), Error>
+    {
+        // Incompressible content is what reaches the bound exactly: every block of it is
+        // stored, so the frame occupies every byte the bound reserves and the output buffer
+        // is full at the moment the machine still has one transition left to make. A machine
+        // that refused to transition on a full buffer reported NeedsOutput forever while
+        // producing nothing, and this caller never finished.
+        let header = FrameHeader::new(
+            ResourceClass::Small,
+            RegionIndependence::Independent,
+            IntegrityMode::Absent,
+        );
+        for length in [0_usize, 1, 256, 65_536, 200_000] {
+            let content: Vec<u8> = (0..length)
+                .map(|at| {
+                    let at = u64::try_from(at).unwrap_or(0);
+                    let mixed = at.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    let mixed =
+                        (mixed ^ mixed.wrapping_shr(30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    u8::try_from((mixed ^ mixed.wrapping_shr(27)) & 0xFF).unwrap_or(0)
+                })
+                .collect();
+            let room = bound(header, length);
+            assert!(room > 0, "the bound reserves nothing for {length} bytes");
+            let mut out = vec![0_u8; room];
+
+            let mut encoder = Encoder::new(header)?;
+            let mut at = 0_usize;
+            let mut fed = 0_usize;
+            while fed < content.len() {
+                let rest = content.get(fed..).ok_or(Error::InvalidParameter)?;
+                let target = out.get_mut(at..).ok_or(Error::InvalidParameter)?;
+                let progress = encoder.encode(rest, target)?;
+                assert!(
+                    progress.consumed > 0 || progress.produced > 0,
+                    "the encoder stalled at {length} bytes with {} of room left",
+                    room.saturating_sub(at)
+                );
+                fed = fed.saturating_add(progress.consumed);
+                at = at.saturating_add(progress.produced);
+            }
+            let mut turns = 0_u32;
+            loop {
+                let target = out.get_mut(at..).ok_or(Error::InvalidParameter)?;
+                let progress = encoder.finish(target)?;
+                at = at.saturating_add(progress.produced);
+                if progress.state == StreamState::Finished {
+                    break;
+                }
+                turns = turns.saturating_add(1);
+                assert!(
+                    turns < 8,
+                    "the encoder never finished at {length} bytes, with {} of room left",
+                    room.saturating_sub(at)
+                );
+            }
+            assert!(at <= room, "{at} bytes written against a bound of {room}");
+
+            let mut decoder = Decoder::new(permissive());
+            let mut plain = vec![0_u8; length.max(1)];
+            let source = out.get(..at).ok_or(Error::InvalidParameter)?;
+            let progress = decoder.decode(source, &mut plain)?;
+            decoder.finish()?;
+            assert_eq!(progress.produced, length);
+            assert_eq!(plain.get(..length), content.get(..length));
+        }
+        Ok(())
     }
 }

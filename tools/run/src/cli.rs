@@ -20,7 +20,9 @@ Usage:
   entroq-run resume --tier <tier> [--suite <suite>]  --runs <dir>
   entroq-run fuzz list
   entroq-run fuzz build --target <name>
+  entroq-run fuzz prepare
   entroq-run fuzz run     --target <name> --runs <dir>
+  entroq-run fuzz seed    --target <name> --from <dir> [--runs <dir>]
   entroq-run fuzz routine [--runs <dir>]
   entroq-run help
 
@@ -39,6 +41,11 @@ Suites:
                runs at a segmented tier only.
   bench        the benchmark: one segment per competitor, measured in-process through the
                library the laboratory built. A segmented tier splits by size class too.
+  skeleton     the format skeleton's closing gate: every heavy proof of the frame, the
+               region and the block the cheap tiers defer. Segmented, so it runs at a
+               segmented tier only.
+  compressed   the compressed block's closing gate: every heavy proof of the codec that
+               compresses. Segmented, so it runs at a segmented tier only.
 
 A tier says how a campaign is bounded, recorded, and resumed. A suite says which segments
 it runs.
@@ -64,8 +71,13 @@ invocation each, inside one segment, so a campaign that names fuzzing as a segme
 budget. The runner's own self-test target is not one of them. It writes no record of its own:
 the campaign that ran it is the record, and its corpus is the same one `fuzz run` extends.
 
+`fuzz seed` copies a directory of streams into one target's corpus, with the prefix that
+target's driver reads in front of each. It adds and never removes, and it leaves a file the
+corpus already holds under that name alone. Seeding is not fuzzing and writes no record.
+
 `fuzz build` compiles one driver, so the segment that follows spends its budget on fuzzing
-rather than on a compiler. `fuzz list` states every target and whether a driver exists for it.
+rather than on a compiler. `fuzz prepare` compiles every driver a routine advances, for the
+same reason. `fuzz list` states every target and whether a driver exists for it.
 
 Every segment of a recorded campaign is given ENTROQ_SEGMENT_DIR, the directory its raw
 output and any artifact it produces belong in. A benchmark segment writes its result document
@@ -97,8 +109,16 @@ pub enum Fuzz {
     List,
     /// Compile one driver.
     Build { target: String },
+    /// Compile every driver a routine advances.
+    Prepare,
     /// Advance one target by one bounded segment.
     Advance { target: String, runs: PathBuf },
+    /// Copy a directory of streams into one target's corpus.
+    Seed {
+        target: String,
+        from: PathBuf,
+        runs: Option<PathBuf>,
+    },
     /// Advance every runnable codec target by one shortened invocation, inside one segment.
     Routine { runs: Option<PathBuf> },
 }
@@ -140,17 +160,19 @@ pub fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
 fn fuzz(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
     let action = args.next().ok_or_else(|| {
         Error::Usage(String::from(
-            "fuzz needs an action: list, build, run, or routine",
+            "fuzz needs an action: list, build, prepare, run, seed, or routine",
         ))
     })?;
     let action = text(&action, "fuzz action")?;
 
     let mut target: Option<String> = None;
     let mut runs: Option<PathBuf> = None;
+    let mut from: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         match text(&arg, "argument")?.as_str() {
             "--target" => target = Some(text(&next(&mut args, "--target")?, "--target")?),
             "--runs" => runs = Some(PathBuf::from(next(&mut args, "--runs")?)),
+            "--from" => from = Some(PathBuf::from(next(&mut args, "--from")?)),
             other => {
                 return Err(Error::Usage(format!(
                     "unexpected argument `{other}`. Run `entroq-run help`."
@@ -165,12 +187,21 @@ fn fuzz(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
     };
     match action.as_str() {
         "list" => {
-            if target.is_some() || runs.is_some() {
+            if target.is_some() || runs.is_some() || from.is_some() {
                 return Err(Error::Usage(String::from(
                     "fuzz list takes no argument. Run `entroq-run help`.",
                 )));
             }
             Ok(Invocation::Fuzz(Fuzz::List))
+        }
+        "prepare" => {
+            if target.is_some() || runs.is_some() || from.is_some() {
+                return Err(Error::Usage(String::from(
+                    "fuzz prepare compiles every driver a routine advances, so it takes no \
+                     argument",
+                )));
+            }
+            Ok(Invocation::Fuzz(Fuzz::Prepare))
         }
         "build" => {
             if runs.is_some() {
@@ -188,6 +219,13 @@ fn fuzz(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
                 ))
             })?,
         })),
+        "seed" => Ok(Invocation::Fuzz(Fuzz::Seed {
+            target: named()?,
+            from: from.ok_or_else(|| {
+                Error::Usage(String::from("fuzz seed needs --from, the streams to copy"))
+            })?,
+            runs,
+        })),
         "routine" => {
             if target.is_some() {
                 return Err(Error::Usage(String::from(
@@ -198,7 +236,7 @@ fn fuzz(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
             Ok(Invocation::Fuzz(Fuzz::Routine { runs }))
         }
         other => Err(Error::Usage(format!(
-            "unknown fuzz action `{other}`. Use list, build, run, or routine."
+            "unknown fuzz action `{other}`. Use list, build, prepare, run, seed, or routine."
         ))),
     }
 }
@@ -399,6 +437,24 @@ mod tests {
     }
 
     #[test]
+    fn the_help_names_every_suite_a_caller_may_ask_for() {
+        for suite in [
+            Suite::Workspace,
+            Suite::Lab,
+            Suite::Corpus,
+            Suite::Bench,
+            Suite::Skeleton,
+            Suite::Compressed,
+        ] {
+            assert!(
+                super::HELP.contains(suite.name()),
+                "the help does not name the {} suite",
+                suite.name()
+            );
+        }
+    }
+
+    #[test]
     fn a_campaign_runs_the_workspace_suite_when_none_is_named() {
         assert_eq!(
             suite(&["run", "--tier", "smoke"]),
@@ -489,6 +545,43 @@ mod tests {
     fn every_fuzz_action_that_names_a_target_requires_one() {
         assert!(invoke(&["fuzz", "run", "--runs", "../runs"]).is_err());
         assert!(invoke(&["fuzz", "build"]).is_err());
+        assert!(invoke(&["fuzz", "seed", "--from", "../runs/byteorder/native"]).is_err());
+    }
+
+    #[test]
+    fn seeding_names_the_target_and_the_streams_it_copies() {
+        let seed = match fuzz(&[
+            "fuzz",
+            "seed",
+            "--target",
+            "frame-parser",
+            "--from",
+            "../runs/byteorder/native",
+        ]) {
+            Some(Fuzz::Seed { target, from, runs }) => {
+                Some((target, from.display().to_string(), runs.is_none()))
+            }
+            _ => None,
+        };
+        assert_eq!(
+            seed,
+            Some((
+                String::from("frame-parser"),
+                String::from("../runs/byteorder/native"),
+                true
+            ))
+        );
+    }
+
+    #[test]
+    fn seeding_needs_the_streams_it_copies() {
+        assert!(invoke(&["fuzz", "seed", "--target", "frame-parser"]).is_err());
+    }
+
+    #[test]
+    fn preparing_a_routine_names_no_target_because_the_routine_owns_the_list() {
+        assert!(matches!(fuzz(&["fuzz", "prepare"]), Some(Fuzz::Prepare)));
+        assert!(invoke(&["fuzz", "prepare", "--target", "mechanism"]).is_err());
     }
 
     #[test]
