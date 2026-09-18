@@ -89,6 +89,21 @@ pub struct Split {
     pub suffix: u64,
 }
 
+/// The interval one symbol owns, in the form the decoder reads it.
+///
+/// Both fields are the decomposition's own and neither is a second definition of it: `width`
+/// is what `Alphabet::suffix_width` computes for the symbol, and `low` is the coded value
+/// `Alphabet::reconstruct` returns for it at a suffix of zero. A decoder reads the pair from a
+/// table instead of computing it per symbol, and the tests hold every entry to those two
+/// methods.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Bucket {
+    /// The bits the symbol's raw suffix occupies.
+    pub(crate) width: u32,
+    /// The coded value the symbol names when its suffix is zero.
+    pub(crate) low: u32,
+}
+
 /// One of the four symbol classes a block codes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Alphabet {
@@ -113,21 +128,21 @@ impl Alphabet {
 
     /// The symbols the alphabet holds, every reserved symbol included.
     #[must_use]
-    pub fn size(self) -> u32 {
+    pub const fn size(self) -> u32 {
         if matches!(self, Self::LiteralByte) {
             return 256;
         }
         let lead = self.lead_symbols();
-        let buckets = symbols_for(self.coded_max().saturating_sub(u64::from(lead)));
-        lead.saturating_add(buckets)
-            .saturating_add(u32::from(self.carries_terminal()))
+        let buckets = symbols_for(self.coded_max().saturating_sub(lead as u64));
+        let terminal = if self.carries_terminal() { 1 } else { 0 };
+        lead.saturating_add(buckets).saturating_add(terminal)
     }
 
     /// The symbol that ends a block after a literal run no match follows.
     ///
     /// The last symbol of the match-length alphabet, and of no other.
     #[must_use]
-    pub fn terminal(self) -> Option<u16> {
+    pub const fn terminal(self) -> Option<u16> {
         if self.carries_terminal() {
             narrow_symbol(self.size().saturating_sub(1))
         } else {
@@ -184,14 +199,14 @@ impl Alphabet {
 
     /// The largest coded value the domain reaches.
     #[must_use]
-    pub fn coded_max(self) -> u64 {
+    pub const fn coded_max(self) -> u64 {
         match self {
             Self::LiteralByte => 255,
-            Self::LiteralRun => u64::from(MAX_LITERAL_RUN).saturating_add(1),
+            Self::LiteralRun => (MAX_LITERAL_RUN as u64).saturating_add(1),
             Self::MatchLength => {
-                u64::from(MAX_MATCH_LENGTH).saturating_sub(u64::from(MIN_MATCH).saturating_sub(1))
+                (MAX_MATCH_LENGTH as u64).saturating_sub((MIN_MATCH as u64).saturating_sub(1))
             }
-            Self::MatchDistance => u64::from(WINDOW).saturating_add(1),
+            Self::MatchDistance => (WINDOW as u64).saturating_add(1),
         }
     }
 
@@ -309,7 +324,70 @@ impl Alphabet {
         }
         Ok(coded)
     }
+
+    /// The symbols the alphabet names a coded value with.
+    ///
+    /// Its size, less the terminal it reserves, which names none.
+    pub(crate) const fn value_symbols(self) -> usize {
+        let terminal = if self.carries_terminal() { 1 } else { 0 };
+        self.size().saturating_sub(terminal) as usize
+    }
+
+    /// The interval one symbol owns.
+    ///
+    /// Total over every symbol of every alphabet, and the same arithmetic `suffix_width` and
+    /// `reconstruct` run: the lead symbols the alphabet reserves name one coded value each and
+    /// carry no suffix, and every other symbol names the bucket its index gives it.
+    const fn bucket(self, index: u32) -> Bucket {
+        if matches!(self, Self::LiteralByte) {
+            return Bucket {
+                width: 0,
+                low: index,
+            };
+        }
+        let lead = self.lead_symbols();
+        if index < lead {
+            return Bucket {
+                width: 0,
+                low: index.saturating_add(1),
+            };
+        }
+        let bucket = index.saturating_sub(lead);
+        Bucket {
+            width: bucket_width(bucket),
+            low: narrow_index(bucket_low(bucket).saturating_add(lead as u64)),
+        }
+    }
+
+    /// The interval of every symbol the alphabet names a value with, in symbol order.
+    const fn buckets<const N: usize>(self) -> [Bucket; N] {
+        let mut table = [Bucket { width: 0, low: 0 }; N];
+        let mut index = 0u32;
+        // The lint set refuses an indexed write and a const context has no iterator, so the
+        // table is filled one slot at a time through the slice it is.
+        let mut rest: &mut [Bucket] = table.as_mut_slice();
+        while let [slot, tail @ ..] = rest {
+            *slot = self.bucket(index);
+            index = index.saturating_add(1);
+            rest = tail;
+        }
+        table
+    }
 }
+
+/// The interval of every literal-run symbol, in symbol order.
+pub(crate) const LITERAL_RUN_BUCKETS: [Bucket; Alphabet::LiteralRun.value_symbols()] =
+    Alphabet::LiteralRun.buckets();
+
+/// The interval of every match-length symbol that names a length.
+///
+/// The terminal is the alphabet's last symbol and names none, so the table stops below it.
+pub(crate) const MATCH_LENGTH_BUCKETS: [Bucket; Alphabet::MatchLength.value_symbols()] =
+    Alphabet::MatchLength.buckets();
+
+/// The interval of every match-distance symbol, the repeat code's included.
+pub(crate) const MATCH_DISTANCE_BUCKETS: [Bucket; Alphabet::MatchDistance.value_symbols()] =
+    Alphabet::MatchDistance.buckets();
 
 /// One match: how far back it reaches and how many bytes it copies.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -491,37 +569,41 @@ const fn bucket_split(value: u64) -> (u32, u32, u64) {
 }
 
 /// The suffix width of a bucket index.
-fn bucket_width(index: u32) -> u32 {
+const fn bucket_width(index: u32) -> u32 {
     if index < DEGENERATE_SYMBOLS {
-        0
-    } else {
-        index
-            .saturating_sub(DEGENERATE_SYMBOLS)
-            .checked_div(OCTAVE_SYMBOLS)
-            .unwrap_or(0)
-            .saturating_add(1)
+        return 0;
+    }
+    match index
+        .saturating_sub(DEGENERATE_SYMBOLS)
+        .checked_div(OCTAVE_SYMBOLS)
+    {
+        Some(octaves) => octaves.saturating_add(1),
+        None => 1,
     }
 }
 
 /// The smallest value a bucket index owns.
-fn bucket_low(index: u32) -> u64 {
+const fn bucket_low(index: u32) -> u64 {
     if index < DEGENERATE_SYMBOLS {
-        return u64::from(index).saturating_add(1);
+        return (index as u64).saturating_add(1);
     }
     let width = bucket_width(index);
-    let inside = index
+    let inside = match index
         .saturating_sub(DEGENERATE_SYMBOLS)
         .checked_rem(OCTAVE_SYMBOLS)
-        .unwrap_or(0);
+    {
+        Some(inside) => inside,
+        None => 0,
+    };
     shift_left(1, width.saturating_add(MANTISSA_BITS))
-        .saturating_add(shift_left(u64::from(inside), width))
+        .saturating_add(shift_left(inside as u64, width))
 }
 
 // The widest alphabet holds 256 symbols, so every symbol either fits sixteen bits or is not a
 // symbol of any alphabet this format defines.
 #[allow(clippy::cast_possible_truncation)]
-fn narrow_symbol(value: u32) -> Option<u16> {
-    if value > u32::from(u16::MAX) {
+const fn narrow_symbol(value: u32) -> Option<u16> {
+    if value > u16::MAX as u32 {
         None
     } else {
         Some(value as u16)
@@ -546,11 +628,79 @@ const fn narrow_index(value: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Alphabet, MAX_LITERAL_RUN, MAX_MATCH_LENGTH, MIN_MATCH, Match, Sequences, Step, WINDOW,
-        bucket_low, bucket_width,
+        Alphabet, Bucket, LITERAL_RUN_BUCKETS, MATCH_DISTANCE_BUCKETS, MATCH_LENGTH_BUCKETS,
+        MAX_LITERAL_RUN, MAX_MATCH_LENGTH, MIN_MATCH, Match, Sequences, Step, WINDOW, bucket_low,
+        bucket_width, narrow_symbol,
     };
     use crate::entropy::{MAX_ALPHABET_SIZE, bits::mask};
     use crate::format::{Corruption, Error};
+
+    /// The pair the decoder reads from a table is the pair the general methods compute, for
+    /// every symbol of every alphabet.
+    ///
+    /// This is what keeps the table a form of the decomposition rather than a second
+    /// definition of it. The terminal names no value and is checked to be refused as one.
+    #[test]
+    fn every_bucket_is_what_the_general_methods_compute() -> Result<(), Error> {
+        for alphabet in Alphabet::ALL {
+            for index in 0..alphabet.size() {
+                let symbol = narrow_symbol(index).ok_or(Error::InvalidParameter)?;
+                if alphabet.terminal() == Some(symbol) {
+                    assert_eq!(
+                        alphabet.suffix_width(symbol),
+                        Err(Error::CorruptData(Corruption::TerminalSymbol)),
+                        "{alphabet:?} {symbol}"
+                    );
+                    continue;
+                }
+                let bucket = alphabet.bucket(index);
+                assert_eq!(
+                    bucket.width,
+                    alphabet.suffix_width(symbol)?,
+                    "{alphabet:?} {symbol} width"
+                );
+                assert_eq!(
+                    u64::from(bucket.low),
+                    alphabet.reconstruct(symbol, 0)?,
+                    "{alphabet:?} {symbol} low"
+                );
+                assert!(
+                    u64::from(bucket.low) >= alphabet.coded_min(),
+                    "{alphabet:?} {symbol} below the domain"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Each decode table holds one entry per symbol that names a value, in symbol order, and
+    /// its length is derived from the alphabet rather than written down.
+    #[test]
+    fn every_decode_table_covers_the_symbols_that_name_a_value() {
+        let tables: [(Alphabet, &[Bucket]); 3] = [
+            (Alphabet::LiteralRun, &LITERAL_RUN_BUCKETS),
+            (Alphabet::MatchLength, &MATCH_LENGTH_BUCKETS),
+            (Alphabet::MatchDistance, &MATCH_DISTANCE_BUCKETS),
+        ];
+        for (alphabet, table) in tables {
+            let reserved = u32::from(alphabet.carries_terminal());
+            assert_eq!(
+                u32::try_from(table.len()).unwrap_or(u32::MAX),
+                alphabet.size().saturating_sub(reserved),
+                "{alphabet:?} table length"
+            );
+            for (index, bucket) in table.iter().enumerate() {
+                let at = u32::try_from(index).unwrap_or(u32::MAX);
+                assert_eq!(*bucket, alphabet.bucket(at), "{alphabet:?} {index}");
+            }
+
+            // The terminal is the alphabet's last symbol, so the table stops exactly below it
+            // and a terminal symbol finds no entry.
+            if let Some(terminal) = alphabet.terminal() {
+                assert_eq!(usize::from(terminal), table.len(), "{alphabet:?} terminal");
+            }
+        }
+    }
 
     /// Reused storage holds every invariant a finished vector holds.
     #[test]

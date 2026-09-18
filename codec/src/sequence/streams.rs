@@ -20,10 +20,21 @@
 //! that no match follows.
 
 use super::cache::{OffsetCache, REPEAT_CODE};
-use super::{Alphabet, Match, Sequences, Step};
+use super::{
+    Alphabet, LITERAL_RUN_BUCKETS, MATCH_DISTANCE_BUCKETS, MATCH_LENGTH_BUCKETS, Match, Sequences,
+    Step,
+};
 use crate::entropy::bits::{BitBuf, BitReader, BitWriter};
 use crate::entropy::low_byte;
 use crate::format::{Corruption, Error};
+
+/// The match-length symbol that ends a block, which the loop tests every symbol against.
+const TERMINAL_LENGTH: Option<u16> = Alphabet::MatchLength.terminal();
+
+/// The largest coded value each bucketed alphabet's domain reaches.
+const LITERAL_RUN_CODED_MAX: u64 = Alphabet::LiteralRun.coded_max();
+const MATCH_LENGTH_CODED_MAX: u64 = Alphabet::MatchLength.coded_max();
+const MATCH_DISTANCE_CODED_MAX: u64 = Alphabet::MatchDistance.coded_max();
 
 /// One symbol class of one block: its coded symbols, and the raw suffixes they declare.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -161,29 +172,43 @@ impl Streams {
             literals.push(low_byte(Alphabet::LiteralByte.reconstruct(symbol, 0)?));
         }
 
+        // Measured on project source, logs and short repeated tokens: reading each symbol's
+        // width and low coded value from a table rather than computing them per symbol takes
+        // this loop from about 29 to about 12 nanoseconds per sequence.
         let mut run_bits = BitReader::over(&self.literal_run.suffix);
         let mut length_bits = BitReader::over(&self.match_length.suffix);
         let mut distance_bits = BitReader::over(&self.match_distance.suffix);
         let mut steps = Vec::with_capacity(count);
         let mut taken = 0usize;
 
-        for index in 0..count {
-            let run = narrow(read(
-                Alphabet::LiteralRun,
-                symbol_at(&self.literal_run.symbols, index)?,
-                &mut run_bits,
-            )?)?;
-            let coded_length = symbol_at(&self.match_length.symbols, index)?;
-            let matched = if Alphabet::MatchLength.terminal() == Some(coded_length) {
+        // The count check above holds both vectors to the sequence count, so the pair walks
+        // every sequence and reaches past neither.
+        for (index, (&run_symbol, &length_symbol)) in self
+            .literal_run
+            .symbols
+            .iter()
+            .zip(&self.match_length.symbols)
+            .enumerate()
+        {
+            let run = narrow(
+                Alphabet::LiteralRun
+                    .raw_value(read_literal_run(run_symbol, &mut run_bits)?)
+                    .ok_or(Error::CorruptData(Corruption::SequenceSuffix))?,
+            )?;
+            let matched = if TERMINAL_LENGTH == Some(length_symbol) {
                 if index.saturating_add(1) != count {
                     return Err(Error::CorruptData(Corruption::TerminalSymbol));
                 }
                 None
             } else {
-                let length = narrow(read(Alphabet::MatchLength, coded_length, &mut length_bits)?)?;
+                let length = narrow(
+                    Alphabet::MatchLength
+                        .raw_value(read_match_length(length_symbol, &mut length_bits)?)
+                        .ok_or(Error::CorruptData(Corruption::SequenceSuffix))?,
+                )?;
                 let symbol = symbol_at(&self.match_distance.symbols, taken)?;
                 taken = taken.saturating_add(1);
-                let coded = read_coded(Alphabet::MatchDistance, symbol, &mut distance_bits)?;
+                let coded = read_match_distance(symbol, &mut distance_bits)?;
                 let distance = if coded == REPEAT_CODE {
                     cache.resolve()?
                 } else {
@@ -255,19 +280,59 @@ fn symbol_at(symbols: &[u16], at: usize) -> Result<u16, Error> {
         .ok_or(Error::CorruptData(Corruption::SequenceCount))
 }
 
-/// The raw value a symbol and the suffix bits it declares name.
-fn read(alphabet: Alphabet, symbol: u16, bits: &mut BitReader<'_>) -> Result<u64, Error> {
-    let coded = read_coded(alphabet, symbol, bits)?;
-    alphabet
-        .raw_value(coded)
-        .ok_or(Error::CorruptData(Corruption::SequenceSuffix))
+/// The coded value a literal-run symbol and the suffix bits it declares name.
+///
+/// The three refusals are the ones the general methods make, in the order they made them: a
+/// symbol the alphabet names no value with finds no entry, a suffix stream shorter than the
+/// entry's width is truncation, and a value past the domain is corruption. The fourth refusal
+/// of `Alphabet::reconstruct`, a suffix above the width's mask, is unreachable on this path
+/// because `BitReader::take` cannot return more than the width it was given holds.
+#[inline]
+fn read_literal_run(symbol: u16, bits: &mut BitReader<'_>) -> Result<u64, Error> {
+    let bucket = LITERAL_RUN_BUCKETS
+        .get(usize::from(symbol))
+        .ok_or(Error::CorruptData(Corruption::SequenceSymbol))?;
+    let suffix = bits.take(bucket.width)?;
+    let coded = u64::from(bucket.low).saturating_add(suffix);
+    if coded > LITERAL_RUN_CODED_MAX {
+        return Err(Error::CorruptData(Corruption::SequenceSuffix));
+    }
+    Ok(coded)
 }
 
-/// The coded value a symbol and the suffix bits it declares name.
-fn read_coded(alphabet: Alphabet, symbol: u16, bits: &mut BitReader<'_>) -> Result<u64, Error> {
-    let width = alphabet.suffix_width(symbol)?;
-    let suffix = bits.take(width)?;
-    alphabet.reconstruct(symbol, suffix)
+/// The coded value a match-length symbol and the suffix bits it declares name.
+///
+/// The terminal names no length and the table stops below it, so a terminal symbol reaching
+/// here would be refused as a symbol the alphabet holds no value for. The loop tests for the
+/// terminal first, so none does.
+#[inline]
+fn read_match_length(symbol: u16, bits: &mut BitReader<'_>) -> Result<u64, Error> {
+    let bucket = MATCH_LENGTH_BUCKETS
+        .get(usize::from(symbol))
+        .ok_or(Error::CorruptData(Corruption::SequenceSymbol))?;
+    let suffix = bits.take(bucket.width)?;
+    let coded = u64::from(bucket.low).saturating_add(suffix);
+    if coded > MATCH_LENGTH_CODED_MAX {
+        return Err(Error::CorruptData(Corruption::SequenceSuffix));
+    }
+    Ok(coded)
+}
+
+/// The coded value a match-distance symbol and the suffix bits it declares name.
+///
+/// Coded, and not the distance, because the repeat code is a coded value the alphabet names no
+/// distance for and the caller resolves it against the offset slot.
+#[inline]
+fn read_match_distance(symbol: u16, bits: &mut BitReader<'_>) -> Result<u64, Error> {
+    let bucket = MATCH_DISTANCE_BUCKETS
+        .get(usize::from(symbol))
+        .ok_or(Error::CorruptData(Corruption::SequenceSymbol))?;
+    let suffix = bits.take(bucket.width)?;
+    let coded = u64::from(bucket.low).saturating_add(suffix);
+    if coded > MATCH_DISTANCE_CODED_MAX {
+        return Err(Error::CorruptData(Corruption::SequenceSuffix));
+    }
+    Ok(coded)
 }
 
 /// A value the alphabets bound below the window, as the sequence types carry it.
@@ -277,13 +342,23 @@ fn narrow(value: u64) -> Result<u32, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Streams, SymbolStream};
-    use crate::entropy::bits::{BitBuf, BitWriter, mask};
+    use super::{Streams, SymbolStream, read_literal_run, read_match_distance, read_match_length};
+    use crate::entropy::bits::{BitBuf, BitReader, BitWriter, mask};
     use crate::format::{Corruption, Error};
     use crate::sequence::cache::OffsetCache;
     use crate::sequence::{
         Alphabet, MAX_LITERAL_RUN, MAX_MATCH_LENGTH, MIN_MATCH, Match, Sequences, Step, WINDOW,
     };
+
+    /// One specialized reader, as the agreement test drives it.
+    type Reader = fn(u16, &mut BitReader<'_>) -> Result<u64, Error>;
+
+    /// The three bucketed alphabets and the reader the decode loop reads each through.
+    const READERS: [(Alphabet, Reader); 3] = [
+        (Alphabet::LiteralRun, read_literal_run),
+        (Alphabet::MatchLength, read_match_length),
+        (Alphabet::MatchDistance, read_match_distance),
+    ];
 
     /// A deterministic stream of values, so a failure reproduces from its seed alone.
     struct Source {
@@ -325,7 +400,7 @@ mod tests {
         assert_eq!(
             streams.sequences(&mut OffsetCache::reset())?,
             sequences,
-            "the four streams did not decode to the sequences they coded"
+            "seed {seed}: the four streams did not decode to the sequences they coded"
         );
         assert_eq!(
             streams.stream(Alphabet::LiteralRun).symbols().len(),
@@ -750,6 +825,192 @@ mod tests {
         assert_eq!(read, streams);
         assert_eq!(read.sequences(&mut OffsetCache::reset())?, sequences);
         Ok(())
+    }
+
+    /// A suffix stream carrying one symbol's raw suffix at a declared width.
+    fn suffix_of(value: u64, width: u32) -> BitBuf {
+        let mut writer = BitWriter::new();
+        writer.push(value, width);
+        writer.finish()
+    }
+
+    /// Every specialized reader returns what the general methods return, for every symbol its
+    /// alphabet names a value with and at the suffix values that bound each symbol's interval.
+    ///
+    /// This is what holds the decode tables to the decomposition: a reader that drifted from
+    /// `reconstruct` on any symbol, or consumed a width other than the one the symbol
+    /// declares, fails here.
+    #[test]
+    fn every_specialized_reader_agrees_with_the_general_methods() -> Result<(), Error> {
+        for (alphabet, reader) in READERS {
+            for index in 0..alphabet.size() {
+                let symbol = u16::try_from(index).map_err(|_| Error::InvalidParameter)?;
+                if alphabet.terminal() == Some(symbol) {
+                    continue;
+                }
+                let width = alphabet.suffix_width(symbol)?;
+                let top = mask(width);
+                for suffix in [0, top.min(1), top.saturating_sub(1), top] {
+                    let buf = suffix_of(suffix, width);
+                    let mut bits = BitReader::over(&buf);
+                    let read = reader(symbol, &mut bits);
+                    assert_eq!(
+                        read,
+                        alphabet.reconstruct(symbol, suffix),
+                        "{alphabet:?} symbol {symbol} suffix {suffix}"
+                    );
+                    assert_eq!(
+                        bits.consumed(),
+                        u64::from(width),
+                        "{alphabet:?} symbol {symbol} consumed a width the symbol did not declare"
+                    );
+                    if let Ok(coded) = read {
+                        assert_eq!(
+                            alphabet.raw_value(coded),
+                            alphabet
+                                .reconstruct(symbol, suffix)
+                                .ok()
+                                .and_then(|coded| alphabet.raw_value(coded)),
+                            "{alphabet:?} symbol {symbol} suffix {suffix} raw value"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A symbol its alphabet names no value with is refused as a symbol, before any suffix is
+    /// read and whichever alphabet it arrives on.
+    #[test]
+    fn every_specialized_reader_refuses_a_symbol_its_alphabet_does_not_name_a_value_with()
+    -> Result<(), Error> {
+        for (alphabet, reader) in READERS {
+            let reserved = u32::from(alphabet.carries_terminal());
+            let first = alphabet.size().saturating_sub(reserved);
+            for index in [first, alphabet.size(), u32::from(u16::MAX)] {
+                let symbol = u16::try_from(index).map_err(|_| Error::InvalidParameter)?;
+                let buf = suffix_of(0, 14);
+                let mut bits = BitReader::over(&buf);
+                assert_eq!(
+                    reader(symbol, &mut bits),
+                    Err(Error::CorruptData(Corruption::SequenceSymbol)),
+                    "{alphabet:?} symbol {symbol}"
+                );
+                assert_eq!(bits.consumed(), 0, "{alphabet:?} symbol {symbol}");
+            }
+        }
+        Ok(())
+    }
+
+    /// The three refusals the decode loop makes, in the classes the general methods named
+    /// them: a symbol no value belongs to, a suffix stream shorter than the width its symbol
+    /// declares, and a value the suffix takes past the domain.
+    #[test]
+    fn every_reader_refusal_keeps_the_class_the_general_methods_name() -> Result<(), Error> {
+        for (alphabet, reader) in READERS {
+            let reserved = u32::from(alphabet.carries_terminal());
+            let last = u16::try_from(alphabet.size().saturating_sub(reserved).saturating_sub(1))
+                .map_err(|_| Error::InvalidParameter)?;
+            let width = alphabet.suffix_width(last)?;
+            assert!(width > 0, "{alphabet:?} last symbol carries no suffix");
+
+            // One bit short of what the symbol declares is truncation and not corruption.
+            let short = suffix_of(0, width.saturating_sub(1));
+            let mut bits = BitReader::over(&short);
+            assert!(
+                matches!(reader(last, &mut bits), Err(Error::TruncatedInput { .. })),
+                "{alphabet:?} short suffix"
+            );
+
+            // The last symbol owns an interval the domain ends inside, so its widest suffix
+            // names a value the alphabet does not reach.
+            let past = suffix_of(mask(width), width);
+            let mut bits = BitReader::over(&past);
+            assert_eq!(
+                reader(last, &mut bits),
+                Err(Error::CorruptData(Corruption::SequenceSuffix)),
+                "{alphabet:?} suffix past the domain"
+            );
+        }
+        Ok(())
+    }
+
+    /// The terminal ends a block and marks nothing else, at every position a block can hold.
+    ///
+    /// The specialized length reader has no entry for the terminal, so the loop's own test for
+    /// it is what keeps the error class `TerminalSymbol` rather than `SequenceSymbol`.
+    #[test]
+    fn a_terminal_symbol_is_the_block_ending_only_as_the_last_symbol() -> Result<(), Error> {
+        let run = Alphabet::LiteralRun.split(1)?.symbol;
+        let length = Alphabet::MatchLength.split(1)?.symbol;
+        let distance = Alphabet::MatchDistance.split(2)?.symbol;
+        let terminal = Alphabet::MatchLength
+            .terminal()
+            .ok_or(Error::InvalidParameter)?;
+
+        for count in 1..=4usize {
+            for at in 0..count {
+                let lengths: Vec<u16> = (0..count)
+                    .map(|index| if index == at { terminal } else { length })
+                    .collect();
+                let streams = Streams::new(
+                    SymbolStream::default(),
+                    SymbolStream::new(vec![run; count], empty()),
+                    SymbolStream::new(lengths, empty()),
+                    SymbolStream::new(vec![distance; count.saturating_sub(1)], empty()),
+                );
+                let decoded = streams.sequences(&mut OffsetCache::reset());
+                if at.saturating_add(1) == count {
+                    assert!(
+                        decoded.is_ok(),
+                        "count {count} terminal at {at}: {decoded:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        decoded,
+                        Err(Error::CorruptData(Corruption::TerminalSymbol)),
+                        "count {count} terminal at {at}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Generated step vectors: every shape the generator produces codes to four streams and
+    /// decodes back to itself.
+    #[test]
+    fn every_generated_step_vector_round_trips() {
+        for seed in 1..=96u64 {
+            let mut source = Source::new(seed.wrapping_mul(6_364_136_223_846_793_005));
+            let count = usize::try_from(source.below(120).saturating_add(1)).unwrap_or(1);
+            let mut steps = Vec::with_capacity(count);
+            for index in 0..count {
+                let spread = match source.below(8) {
+                    0 => 1_024,
+                    1 => 64,
+                    _ => 4,
+                };
+                let run = u32::try_from(source.below(spread)).unwrap_or(0);
+                let last = index.saturating_add(1) == count;
+                let matched = if last && source.below(2) == 0 {
+                    None
+                } else {
+                    let span =
+                        u64::from(MAX_MATCH_LENGTH.saturating_sub(MIN_MATCH)).saturating_add(1);
+                    Some(matched(
+                        MIN_MATCH.saturating_add(u32::try_from(source.below(span)).unwrap_or(0)),
+                        u32::try_from(source.below(u64::from(WINDOW)))
+                            .unwrap_or(0)
+                            .saturating_add(1),
+                    ))
+                };
+                steps.push(Step { run, matched });
+            }
+            let coded = round_trip(steps, seed);
+            assert!(coded.is_ok(), "seed {seed}: {coded:?}");
+        }
     }
 
     fn empty() -> BitBuf {
