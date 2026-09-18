@@ -239,7 +239,7 @@ fn log2_fixed(value: u32) -> u32 {
     floor.saturating_mul(256).saturating_add(u32::from(frac))
 }
 
-/// The Shannon lower bound of `literals`, scaled by 2_048.
+/// The Shannon lower bound of `literals`, scaled by `2_048`.
 ///
 /// The bound is `sum f * log2(n / f) / 8` in bytes with `n` the literal count; the scale
 /// folds the division by eight and the logarithm scale out of the comparison.
@@ -259,7 +259,7 @@ fn shannon_scaled(literals: &[u8]) -> u64 {
     }
     let log_total = log2_fixed(total);
     let mut scaled = 0_u64;
-    for &freq in histogram.iter() {
+    for &freq in &histogram {
         if freq == 0 {
             continue;
         }
@@ -950,12 +950,15 @@ mod tests {
         }
     }
 
+    /// The two emitted blocks under test, and the type each emitter chose for them.
+    type Emitted = (Vec<u8>, Vec<u8>, BlockType, BlockType);
+
     fn emit_both(
         input: &[u8],
         last: bool,
         first_in_region: bool,
         policy: DecoderPolicy,
-    ) -> Result<(Vec<u8>, Vec<u8>, BlockType, BlockType), Error> {
+    ) -> Result<Emitted, Error> {
         let mut emitter = Emitter::new(policy, u32::try_from(input.len()).unwrap_or(u32::MAX))?;
         let mut fast = Vec::new();
         let fast_kind = emitter.emit(input, last, first_in_region, &mut fast)?;
@@ -989,7 +992,7 @@ mod tests {
             Class::Text.content(16_384),
         ];
         let mut at = 0_usize;
-        for content in blocks.iter() {
+        for content in &blocks {
             let last = at.saturating_add(1) == blocks.len();
             let first_in_region = at == 0;
             let mut fast = Vec::new();
@@ -1030,6 +1033,31 @@ mod tests {
         assert_eq!(fast_kind, BlockType::Rle);
         assert_eq!(slow_kind, BlockType::Rle);
         assert_eq!(fast, slow, "RLE bytes differ under a narrow policy");
+        Ok(())
+    }
+
+    #[test]
+    fn an_exact_repeat_at_maximum_distance_stays_compressed() -> Result<(), Error> {
+        // Two 64 KiB blocks where the second repeats the first exactly. The FAST table
+        // prefers near candidates, so the second block fragments; it still earns
+        // COMPRESSED, which is what the investigation measured for this input.
+        let mut first = vec![0_u8; 65_536];
+        for (at, slot) in first.iter_mut().enumerate() {
+            *slot = mix(u64::try_from(at).unwrap_or(0));
+        }
+        let mut emitter = Emitter::new(DecoderPolicy::CONSERVATIVE, 65_536)?;
+        let mut out = Vec::new();
+        let first_kind = emitter.emit(&first, false, true, &mut out)?;
+        assert_eq!(first_kind, BlockType::Raw);
+        let mut second_out = Vec::new();
+        let second_kind = emitter.emit(&first, true, false, &mut second_out)?;
+        assert_eq!(
+            second_kind,
+            BlockType::Compressed,
+            "the far repeat stored {} bytes against {} raw",
+            second_out.len(),
+            first.len()
+        );
         Ok(())
     }
 

@@ -178,9 +178,10 @@ const MIB: u64 = 1_048_576;
 
 /// The allocations one parser makes, whatever the input is.
 ///
-/// The head table, the link array, the window buffer, the literal storage and the step
-/// storage: five, all at setup, and none per block.
-const SETUP_ALLOCATIONS: u64 = 5;
+/// The single table, the window buffer, the literal storage and the step storage: four,
+/// all at setup, and none per block. The FAST matcher dropped the chain's link array, which
+/// is the one allocation this figure lost.
+const SETUP_ALLOCATIONS: u64 = 4;
 
 #[test]
 fn the_parse_holds_no_more_than_it_declared_and_does_not_grow_with_the_input() -> Result<(), Error>

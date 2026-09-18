@@ -3,13 +3,14 @@
 //!
 //! This module does not own match search or entropy coding. It decides what to emit.
 //!
-//! One strategy: greedy. The parser searches at the position it stands on, takes the match the
-//! finder reports when it reaches the minimum, and never revisits the decision. One candidate
-//! source, one commit per position, and no cost model: the choice between two candidates is
-//! the finder's tie-break and the choice between a match and a literal is the minimum match
-//! length. At search depth 8 this pair spends the least encoder time of the five measured pairs
-//! whose commit horizon is bounded under every cost model they were priced against. What it
-//! gives up against an exact optimal parse is 19.86 per cent of the representation cost.
+//! One strategy: greedy over a single-entry table with an adaptive skip. The parser searches
+//! at the position it stands on, takes the match the table reports when it reaches the
+//! minimum, and never revisits the decision. Consecutive searched misses advance the search
+//! by `1 + (streak >> 6)`, so barren input costs few searches; a taken match and each block
+//! start reset the streak. Skipped positions are never searched nor inserted, and the choice
+//! between a match and a literal is the minimum match length. The reference chain at search
+//! depth 8 stays available behind a constructor, and the FAST trade it lost is measured
+//! elsewhere: shorter mean match length for an order of magnitude less search work.
 //!
 //! # What the parser holds
 //!
@@ -18,7 +19,7 @@
 //! window of history behind it, whatever block length the caller feeds.
 //!
 //! ```text
-//! head table and link array    327 680 bytes    the finder's
+//! single table                 65 536 bytes     the finder's
 //! window buffer                196 608 bytes    three windows
 //! literal bytes                the block        the block's worst case, every byte a literal
 //! steps                        the block / 4    the block's worst case, one step per match
@@ -42,12 +43,12 @@
 //!
 //! # Determinism
 //!
-//! The same input, cut into the same blocks, produces the same sequences. The finder's
-//! tie-break reads a reported length and distance and nothing else, the walk order is the
-//! chain's and not a hash table's iteration order, and no branch here reads an address.
+//! The same input, cut into the same blocks, produces the same sequences. The tag gate reads
+//! the bytes the positions name and nothing else, the skip schedule reads the miss count and
+//! nothing else, and no branch here reads an address.
 
 use crate::format::Error;
-use crate::matchfinder::BoundedHashChain;
+use crate::matchfinder::{BoundedHashChain, SingleHash};
 use crate::sequence::{MIN_MATCH, Sequences, Step, WINDOW};
 use crate::simd::Kernel;
 
@@ -68,13 +69,34 @@ const CAPACITY: usize = MAX_PARSE_BYTES.saturating_mul(3);
 /// The bytes the strategy reads ahead of the position it decides at.
 pub const LOOKAHEAD_BYTES: usize = crate::sequence::MAX_MATCH_LENGTH as usize;
 
-/// A greedy parse over a bounded hash chain.
+/// Which search structure a parse runs on.
+///
+/// FAST is the shipped path. The chain is the reference the FAST trade was measured against,
+/// kept for comparison and never as a byte oracle for FAST output.
+enum Matcher {
+    Fast(SingleHash),
+    Chain(BoundedHashChain),
+}
+
+/// The shift the skip schedule ramps on: 64 searches per step.
+const SKIP_SHIFT: u32 = 6;
+
+/// The positions a miss streak skips over.
+///
+/// One for the first 64 consecutive searched misses, two for the next 64, and so on. The
+/// schedule reads the streak and nothing else, which is what keeps the parse deterministic.
+fn skip_jump(streak: u32) -> usize {
+    1_usize.saturating_add(usize::try_from(streak >> SKIP_SHIFT).unwrap_or(usize::MAX))
+}
+
+/// A greedy parse over a single-entry table with an adaptive skip.
 pub struct Parser {
-    finder: BoundedHashChain,
+    matcher: Matcher,
     window: Box<[u8]>,
     /// The bytes of `window` that hold input.
     filled: usize,
-    /// The first position of `window` the finder has not been given.
+    /// The first position of `window` the chain has not been given. The FAST path inserts
+    /// inline and leaves this alone.
     inserted: usize,
     /// The sequences of the block last parsed. Emptied and refilled, never reallocated.
     sequences: Sequences,
@@ -87,27 +109,52 @@ impl Default for Parser {
 }
 
 impl Parser {
-    /// A parser with no history, on the kernel this build selected.
+    /// A FAST parser with no history, on the kernel this build selected.
     #[must_use]
     pub fn new() -> Self {
-        Self::of(BoundedHashChain::new())
+        Self::of(Matcher::Fast(SingleHash::new()))
     }
 
-    /// A parser with no history, on a named kernel.
+    /// A FAST parser with no history, on a named kernel.
     #[must_use]
     pub fn with_kernel(kernel: Kernel) -> Self {
-        Self::of(BoundedHashChain::with_kernel(kernel))
+        Self::of(Matcher::Fast(SingleHash::with_kernel(kernel)))
     }
 
-    /// The kernel the finder compares candidates with.
+    /// A chain-driven parser with no history, on the kernel this build selected.
+    ///
+    /// The reference the FAST trade was measured against. It round-trips every input the
+    /// FAST path does, and its bytes are not the FAST bytes: the skip changes the history a
+    /// later search reads, by design.
+    #[must_use]
+    pub fn chain() -> Self {
+        Self::of(Matcher::Chain(BoundedHashChain::new()))
+    }
+
+    /// A chain-driven parser with no history, on a named kernel.
+    #[must_use]
+    pub fn chain_with_kernel(kernel: Kernel) -> Self {
+        Self::of(Matcher::Chain(BoundedHashChain::with_kernel(kernel)))
+    }
+
+    /// The kernel the matcher compares candidates with.
     #[must_use]
     pub const fn kernel(&self) -> Kernel {
-        self.finder.kernel()
+        match &self.matcher {
+            Matcher::Fast(matcher) => matcher.kernel(),
+            Matcher::Chain(matcher) => matcher.kernel(),
+        }
     }
 
     /// The bytes the parser holds between calls, whatever the input is.
     #[must_use]
     pub const fn state_bytes() -> usize {
+        SingleHash::state_bytes().saturating_add(CAPACITY)
+    }
+
+    /// The bytes a chain-driven parser holds between calls, whatever the input is.
+    #[must_use]
+    pub const fn chain_state_bytes() -> usize {
         BoundedHashChain::state_bytes().saturating_add(CAPACITY)
     }
 
@@ -147,7 +194,10 @@ impl Parser {
     /// an earlier one produced, and the offset cache a block carries is discarded on the same
     /// boundary.
     pub fn reset(&mut self) {
-        self.finder.reset();
+        match &mut self.matcher {
+            Matcher::Fast(matcher) => matcher.reset(),
+            Matcher::Chain(matcher) => matcher.reset(),
+        }
         self.filled = 0;
         self.inserted = 0;
     }
@@ -178,7 +228,7 @@ impl Parser {
         self.filled = end;
 
         let Self {
-            finder,
+            matcher,
             window,
             inserted,
             sequences,
@@ -188,41 +238,23 @@ impl Parser {
             return Err(Error::InvalidParameter);
         };
 
-        sequences.clear();
-        let mut run_start = start;
-        let mut at = start;
-        while at < end {
-            // Searching at a position requires every position before it to be in the chain,
-            // which the positions a taken match covered are not yet.
-            while *inserted < at {
-                finder.insert(data, *inserted);
-                *inserted = inserted.saturating_add(1);
+        match matcher {
+            Matcher::Fast(matcher) => parse_fast(matcher, data, start, end, sequences)?,
+            Matcher::Chain(matcher) => {
+                parse_chain(matcher, data, start, end, inserted, sequences)?;
             }
-            let found = finder.step(data, at);
-            *inserted = at.saturating_add(1);
-            let Some(matched) = found.matched else {
-                at = at.saturating_add(1);
-                continue;
-            };
-            let run = data.get(run_start..at).ok_or(Error::InvalidParameter)?;
-            sequences.push(run, Some(matched))?;
-            at = at.saturating_add(matched.length as usize);
-            run_start = at;
         }
-        if run_start < end {
-            let run = data.get(run_start..end).ok_or(Error::InvalidParameter)?;
-            sequences.push(run, None)?;
-        }
-        // The last positions of the block were offered to a chain that could not hash them,
-        // because the bytes its hash reads were not there yet. The next call holds them, so
-        // they are offered again rather than left out of the chain for good.
-        *inserted = (*inserted).min(BoundedHashChain::insertable_end(end));
         Ok(sequences)
     }
 
-    fn of(finder: BoundedHashChain) -> Self {
+    /// Makes room for `len` more bytes, sliding by exactly one window when the buffer is full.
+    ///
+    /// The shift is one window, so every stored position keeps its link slot and the finder
+    /// moves with one pass over its own entries. A slide keeps at least one window less `len`
+    /// bytes of history, and keeps the whole window when the caller feeds full blocks.
+    fn of(matcher: Matcher) -> Self {
         Self {
-            finder,
+            matcher,
             window: vec![0u8; CAPACITY].into_boxed_slice(),
             filled: 0,
             inserted: 0,
@@ -232,7 +264,7 @@ impl Parser {
 
     /// Makes room for `len` more bytes, sliding by exactly one window when the buffer is full.
     ///
-    /// The shift is one window, so every stored position keeps its link slot and the finder
+    /// The shift is one window, so every stored position keeps its slot and the matcher
     /// moves with one pass over its own entries. A slide keeps at least one window less `len`
     /// bytes of history, and keeps the whole window when the caller feeds full blocks.
     fn make_room(&mut self, len: usize) {
@@ -243,8 +275,97 @@ impl Parser {
         self.window.copy_within(window..self.filled, 0);
         self.filled = self.filled.saturating_sub(window);
         self.inserted = self.inserted.saturating_sub(window);
-        self.finder.slide();
+        match &mut self.matcher {
+            Matcher::Fast(matcher) => matcher.slide(),
+            Matcher::Chain(matcher) => matcher.slide(),
+        }
     }
+}
+
+/// The sequences of the FAST parse of the bytes the caller staged at `start..end`.
+///
+/// The skip schedule resets at each block start: a streak never crosses a block boundary,
+/// which is what keeps two blocks of one input parsing the same in any order the stream
+/// cuts them.
+fn parse_fast(
+    table: &mut SingleHash,
+    data: &[u8],
+    start: usize,
+    end: usize,
+    sequences: &mut Sequences,
+) -> Result<(), Error> {
+    sequences.clear();
+    let mut run_start = start;
+    let mut at = start;
+    let mut streak = 0_u32;
+    while at < end {
+        let Some(matched) = table.search(data, at) else {
+            streak = streak.saturating_add(1);
+            at = at.saturating_add(skip_jump(streak));
+            continue;
+        };
+        streak = 0;
+        let run = data.get(run_start..at).ok_or(Error::InvalidParameter)?;
+        sequences.push(run, Some(matched))?;
+        let from = at.saturating_add(1);
+        at = at
+            .saturating_add(usize::try_from(matched.length).unwrap_or(usize::MAX))
+            .min(end);
+        run_start = at;
+        // The searched position entered the table in the search; the covered ones enter
+        // here, as the chain's catch-up would have placed them. Skipped positions stay out.
+        let mut covered = from;
+        while covered < at {
+            table.insert(data, covered);
+            covered = covered.saturating_add(1);
+        }
+    }
+    if run_start < end {
+        let run = data.get(run_start..end).ok_or(Error::InvalidParameter)?;
+        sequences.push(run, None)?;
+    }
+    Ok(())
+}
+
+/// The sequences of the reference chain parse of the bytes at `start..end`.
+fn parse_chain(
+    chain: &mut BoundedHashChain,
+    data: &[u8],
+    start: usize,
+    end: usize,
+    inserted: &mut usize,
+    sequences: &mut Sequences,
+) -> Result<(), Error> {
+    sequences.clear();
+    let mut run_start = start;
+    let mut at = start;
+    while at < end {
+        // Searching at a position requires every position before it to be in the chain,
+        // which the positions a taken match covered are not yet.
+        while *inserted < at {
+            chain.insert(data, *inserted);
+            *inserted = inserted.saturating_add(1);
+        }
+        let found = chain.step(data, at);
+        *inserted = at.saturating_add(1);
+        let Some(matched) = found.matched else {
+            at = at.saturating_add(1);
+            continue;
+        };
+        let run = data.get(run_start..at).ok_or(Error::InvalidParameter)?;
+        sequences.push(run, Some(matched))?;
+        at = at.saturating_add(matched.length as usize);
+        run_start = at;
+    }
+    if run_start < end {
+        let run = data.get(run_start..end).ok_or(Error::InvalidParameter)?;
+        sequences.push(run, None)?;
+    }
+    // The last positions of the block were offered to a chain that could not hash them,
+    // because the bytes its hash reads were not there yet. The next call holds them, so
+    // they are offered again rather than left out of the chain for good.
+    *inserted = (*inserted).min(BoundedHashChain::insertable_end(end));
+    Ok(())
 }
 
 /// The steps a block of `block_bytes` can hold.
@@ -261,10 +382,10 @@ const fn step_capacity(block_bytes: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{CAPACITY, LOOKAHEAD_BYTES, MAX_PARSE_BYTES, Parser};
+    use super::{CAPACITY, LOOKAHEAD_BYTES, MAX_PARSE_BYTES, Parser, skip_jump};
     use crate::block::expand;
     use crate::format::Error;
-    use crate::matchfinder::BoundedHashChain;
+    use crate::matchfinder::{BoundedHashChain, SingleHash};
     use crate::sequence::{MAX_MATCH_LENGTH, MIN_MATCH, Sequences, WINDOW};
     use crate::simd::ALL;
 
@@ -518,23 +639,43 @@ mod tests {
 
     #[test]
     fn the_declared_bound_states_what_the_parse_holds() {
+        // The FAST matcher moved the parser from the chain's five bytes per window byte to
+        // one: the single table holds 65 536 bytes where the head table and link array held
+        // 327 680.
         assert_eq!(CAPACITY, 196_608);
-        assert_eq!(Parser::state_bytes(), 524_288);
+        assert_eq!(Parser::state_bytes(), 262_144);
         assert_eq!(
             Parser::state_bytes(),
-            BoundedHashChain::state_bytes().saturating_add(CAPACITY)
+            SingleHash::state_bytes().saturating_add(CAPACITY)
         );
         assert_eq!(
             Parser::declared_bytes(0),
             Parser::state_bytes().saturating_add(16)
         );
-        assert_eq!(Parser::declared_bytes(MAX_PARSE_BYTES), 851_984);
+        assert_eq!(Parser::declared_bytes(MAX_PARSE_BYTES), 589_840);
+        assert_eq!(Parser::chain_state_bytes(), 524_288);
         assert_eq!(LOOKAHEAD_BYTES, MAX_MATCH_LENGTH as usize);
     }
 
     #[test]
+    fn the_skip_schedule_ramps_one_step_per_sixty_four_misses() {
+        for streak in [0_u32, 1, 63] {
+            assert_eq!(skip_jump(streak), 1, "streak {streak}");
+        }
+        for streak in [64_u32, 65, 127] {
+            assert_eq!(skip_jump(streak), 2, "streak {streak}");
+        }
+        assert_eq!(skip_jump(128), 3);
+        // The largest jump the investigation measured on incompressible input.
+        assert_eq!(skip_jump(2_816), 45);
+        assert_eq!(skip_jump(u32::MAX), 67_108_864);
+    }
+
+    #[test]
     fn a_block_boundary_leaves_no_position_out_of_the_chain() -> Result<(), Error> {
-        let mut parser = Parser::new();
+        // The counter lives on the chain path only; the FAST path inserts inline and keeps
+        // no bookkeeping for a boundary to rewind.
+        let mut parser = Parser::chain();
         for size in [4_096usize, 1, 3, 65_536, 700] {
             let _ = parser.parse(&noise(size, SEED ^ 0x51))?;
             assert!(
@@ -605,5 +746,133 @@ mod tests {
             out.push(parser.parse(chunk)?.clone());
         }
         Ok(out)
+    }
+
+    #[test]
+    fn the_chain_path_round_trips_and_is_deterministic() -> Result<(), Error> {
+        // The reference stays available and tested, but its bytes are not FAST bytes: the
+        // skip changes the history a later search reads, so this asserts the reference
+        // against itself and against the decoded content, never against the FAST path.
+        for shape in SHAPES {
+            let data = shape.content(100_000);
+            let mut parser = Parser::chain();
+            let out = round_trip(&mut parser, &data, MAX_PARSE_BYTES)?;
+            assert_eq!(out, data, "chain round trip on {}", shape.name());
+            let first = parse_all_chain(&data)?;
+            let second = parse_all_chain(&data)?;
+            assert_eq!(first, second, "chain determinism on {}", shape.name());
+        }
+        Ok(())
+    }
+
+    fn parse_all_chain(data: &[u8]) -> Result<Vec<Sequences>, Error> {
+        let mut parser = Parser::chain();
+        let mut out = Vec::new();
+        for chunk in data.chunks(MAX_PARSE_BYTES) {
+            out.push(parser.parse(chunk)?.clone());
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn an_exact_repeat_at_the_window_edge_stays_valid() -> Result<(), Error> {
+        let window = WINDOW as usize;
+        let head = noise(32_768, SEED ^ 0x61);
+        let mut first = head.clone();
+        first.extend_from_slice(&noise(window.saturating_sub(head.len()), SEED ^ 0x62));
+        assert_eq!(first.len(), window);
+        let mut parser = Parser::new();
+        let _ = parser.parse(&first)?.clone();
+        // The second block repeats the first exactly at the farthest distance the window
+        // admits. The FAST table prefers near candidates, so the match structure fragments;
+        // what is pinned here is validity, not coverage.
+        let second = parser.parse(&first)?.clone();
+        for step in second.steps() {
+            if let Some(found) = step.matched {
+                assert!(found.distance >= 1, "a match reported itself");
+                assert!(found.distance <= WINDOW, "a match reached past the window");
+            }
+        }
+        assert_eq!(
+            second.decoded_len(),
+            u64::try_from(window).unwrap_or(0),
+            "the far repeat decoded short"
+        );
+        let mut out = vec![0_u8; window];
+        expand(&second, &first, &mut out)?;
+        assert_eq!(out, first, "the far repeat did not expand to its content");
+        Ok(())
+    }
+
+    #[test]
+    fn tiny_and_rle_blocks_parse_to_their_content() -> Result<(), Error> {
+        for len in [1_usize, 2, 3, 4, 7, 63, 64] {
+            for byte in [0_u8, 0xA5] {
+                let content = vec![byte; len];
+                let mut parser = Parser::new();
+                let sequences = parser.parse(&content)?.clone();
+                assert_eq!(
+                    sequences.decoded_len(),
+                    u64::try_from(len).unwrap_or(0),
+                    "decoded length at {len}"
+                );
+                let mut out = vec![0_u8; len];
+                expand(&sequences, &[], &mut out)?;
+                assert_eq!(out, content, "tiny RLE content at {len}");
+            }
+            let mixed: Vec<u8> = (0_usize..len)
+                .map(|at| {
+                    u8::try_from(at.saturating_mul(31).checked_rem(251).unwrap_or(0)).unwrap_or(0)
+                })
+                .collect();
+            let mut parser = Parser::new();
+            let sequences = parser.parse(&mixed)?.clone();
+            let mut out = vec![0_u8; len];
+            expand(&sequences, &[], &mut out)?;
+            assert_eq!(out, mixed, "tiny mixed content at {len}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fast_parse_round_trips_encoder_workload_classes() -> Result<(), Error> {
+        // The shapes the FAST ratio trade was measured over, in the parser's own terms:
+        // structured text at several entropies, sparse content, and short tokens.
+        let phrase = b"the quick brown fox jumps over the lazy dog. ";
+        let text: Vec<u8> = (0_usize..65_536_usize)
+            .map(|at| {
+                phrase
+                    .get(at.checked_rem(phrase.len()).unwrap_or(0))
+                    .copied()
+                    .unwrap_or(b' ')
+            })
+            .collect();
+        let json: Vec<u8> = (0_usize..65_536_usize)
+            .map(|at| {
+                b"{\"key\": 0123456789, \"v\": true} "
+                    .get(at.checked_rem(32).unwrap_or(0))
+                    .copied()
+                    .unwrap_or(b' ')
+            })
+            .collect();
+        let sparse: Vec<u8> = (0_usize..65_536_usize)
+            .map(|at| {
+                if at.checked_rem(64) == Some(0) {
+                    let mixed = (u64::try_from(at).unwrap_or(0))
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .rotate_left(29)
+                        .wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    crate::entropy::low_byte(mixed >> 33)
+                } else {
+                    0
+                }
+            })
+            .collect();
+        for (name, data) in [("text", text), ("json", json), ("sparse", sparse)] {
+            let mut parser = Parser::new();
+            let out = round_trip(&mut parser, &data, MAX_PARSE_BYTES)?;
+            assert_eq!(out, data, "{name}");
+        }
+        Ok(())
     }
 }
