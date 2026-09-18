@@ -3,22 +3,25 @@
 //!
 //! This module does not own which proposed match the encoder takes. The parser owns that.
 //!
-//! One structure: a bounded hash chain at search depth 8. A head table maps the hash of four
-//! bytes to the most recent position that produced it, and a link array, one entry per window
-//! byte, joins each position to the previous position with the same hash. A search walks that
-//! chain from the head, bounded by the depth, by the window, and by the link array's own
-//! aliasing.
+//! Two structures. The FAST parse runs on the single-entry table: a 16 384-entry table maps
+//! the hash of four bytes to the most recent position that produced it, and a search compares
+//! that one candidate behind a tag gate. The bounded hash chain at search depth 8 stays as the
+//! reference the FAST trade was measured against: a head table maps the hash of four bytes to
+//! the most recent position that produced it, and a link array, one entry per window byte,
+//! joins each position to the previous position with the same hash. A search walks that chain
+//! from the head, bounded by the depth, by the window, and by the link array's own aliasing.
 //!
 //! ```text
+//! single table  16 384 entries of 4 bytes      one entry per four window bytes
 //! head table    16 384 entries of 4 bytes      one entry per four window bytes
 //! link array    65 536 entries of 4 bytes      one entry per window byte
-//! total                                        5 bytes of state per window byte
 //! ```
 //!
-//! The family, the load factor and the depth are a measured operating point. The link array is
+//! The chain's family, load factor and depth are a measured operating point. The link array is
 //! one link per window byte and does not move, so the structure cannot cost less than four
 //! bytes per window byte whatever its head table does, and the head table only chooses how much
-//! sits on that floor.
+//! sits on that floor. The single table keeps the production head function and drops the links,
+//! which is what makes it one byte of state per window byte.
 //!
 //! # Positions
 //!
@@ -52,6 +55,12 @@ pub const LINK_ENTRIES: usize = WINDOW as usize;
 /// The bytes the structure holds, whatever the input is.
 pub const STATE_BYTES: usize = (HEAD_ENTRIES + LINK_ENTRIES) * 4;
 
+/// The single-entry table slots, one per hash value.
+pub const SINGLE_ENTRIES: usize = 16_384;
+
+/// The bytes the single-entry table holds, whatever the input is.
+pub const SINGLE_STATE_BYTES: usize = SINGLE_ENTRIES * 4;
+
 /// The bytes the hash reads at a position.
 const HASH_BYTES: usize = 4;
 
@@ -63,6 +72,15 @@ const MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// The entry value that names no position.
 const EMPTY: u32 = u32::MAX;
+
+/// The head-table slot of four bytes, shared by both structures.
+///
+/// The multiplier and the bit count are the production head function. Both tables map the
+/// same bytes to the same slot; only what the slot holds differs.
+fn head_slot(bytes: [u8; HASH_BYTES]) -> usize {
+    let product = u64::from(u32::from_le_bytes(bytes)).wrapping_mul(MULTIPLIER);
+    narrow_index(product >> (u64::BITS.saturating_sub(HEAD_BITS)))
+}
 
 /// What one search reported, and what it spent reporting it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -236,8 +254,7 @@ impl BoundedHashChain {
         if u32::try_from(at).is_err() {
             return None;
         }
-        let product = u64::from(u32::from_le_bytes(bytes)).wrapping_mul(MULTIPLIER);
-        let index = narrow_index(product >> (u64::BITS.saturating_sub(HEAD_BITS)));
+        let index = head_slot(bytes);
         (index < self.head.len()).then_some(index)
     }
 
@@ -279,9 +296,149 @@ const fn narrow_index(shifted: u64) -> usize {
     shifted as usize
 }
 
+/// A single-entry hash table over a window of 65 536 bytes.
+///
+/// The table maps the production head hash to the most recent position that produced it. A
+/// search compares that one candidate behind a four-byte tag gate and reports it only when
+/// the prefix it names reaches the minimum match length. The structure holds positions,
+/// never bytes; the caller owns the buffer and passes it to every call.
+pub struct SingleHash {
+    table: Box<[u32]>,
+    kernel: Kernel,
+}
+
+impl Default for SingleHash {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SingleHash {
+    /// An empty table, on the kernel this build selected.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_kernel(simd::SELECTED)
+    }
+
+    /// An empty table, on a named kernel.
+    ///
+    /// The kernel changes speed and never the match a search reports. A caller names one to
+    /// compare two of them or to reproduce a result on the scalar path.
+    #[must_use]
+    pub fn with_kernel(kernel: Kernel) -> Self {
+        Self {
+            table: vec![EMPTY; SINGLE_ENTRIES].into_boxed_slice(),
+            kernel,
+        }
+    }
+
+    /// The kernel this table compares candidates with.
+    #[must_use]
+    pub const fn kernel(&self) -> Kernel {
+        self.kernel
+    }
+
+    /// Discards every position the structure holds.
+    ///
+    /// A region boundary is what calls this: nothing a later region emits may name a position
+    /// an earlier one produced.
+    pub fn reset(&mut self) {
+        self.table.fill(EMPTY);
+    }
+
+    /// Moves every stored position back by one window, discarding what falls out.
+    ///
+    /// The shift is the window exactly, so the caller that slides its buffer by the window
+    /// keeps every stored position aligned with the bytes it names.
+    pub fn slide(&mut self) {
+        let window = WINDOW;
+        for entry in &mut self.table {
+            *entry = if *entry == EMPTY || *entry < window {
+                EMPTY
+            } else {
+                entry.saturating_sub(window)
+            };
+        }
+    }
+
+    /// Searches at `at`, then inserts it.
+    ///
+    /// A match is reported only when the single candidate passes the tag gate and its prefix
+    /// reaches the minimum match length, capped by the maximum the representation expresses
+    /// and by the bytes `data` holds after `at`. Its distance is at least one and at most the
+    /// window. The slot takes `at` whether the search hit or missed, so a searched position
+    /// is never offered twice.
+    pub fn search(&mut self, data: &[u8], at: usize) -> Option<Match> {
+        let slot = self.slot(data, at)?;
+        let previous = self.table.get(slot).copied().unwrap_or(EMPTY);
+        if let Ok(position) = u32::try_from(at)
+            && let Some(entry) = self.table.get_mut(slot)
+        {
+            *entry = position;
+        }
+        if previous == EMPTY {
+            return None;
+        }
+        let candidate = usize::try_from(previous).unwrap_or(usize::MAX);
+        if candidate >= at || at.saturating_sub(candidate) > WINDOW as usize {
+            return None;
+        }
+        let end = at.checked_add(HASH_BYTES)?;
+        let want: [u8; HASH_BYTES] = data.get(at..end)?.try_into().ok()?;
+        let other = candidate.checked_add(HASH_BYTES)?;
+        let have: [u8; HASH_BYTES] = data.get(candidate..other)?.try_into().ok()?;
+        if want != have {
+            return None;
+        }
+        let cap = (MAX_MATCH_LENGTH as usize).min(data.len().saturating_sub(at));
+        let length = length_of(simd::common_prefix(self.kernel, data, candidate, at, cap));
+        if length < MIN_MATCH {
+            return None;
+        }
+        Some(Match {
+            length,
+            distance: distance_of(at.saturating_sub(candidate)),
+        })
+    }
+
+    /// Inserts `at` without searching.
+    ///
+    /// This is what a parser does at the positions a taken match covers. Skipped positions
+    /// are never inserted, which is what keeps them out of the history a later search reads.
+    pub fn insert(&mut self, data: &[u8], at: usize) {
+        if let Some(slot) = self.slot(data, at)
+            && let Ok(position) = u32::try_from(at)
+            && let Some(entry) = self.table.get_mut(slot)
+        {
+            *entry = position;
+        }
+    }
+
+    /// The bytes this structure holds. It does not move with the input.
+    #[must_use]
+    pub const fn state_bytes() -> usize {
+        SINGLE_STATE_BYTES
+    }
+
+    /// The table slot of the bytes at `at`, or `None` when `data` does not hold the bytes
+    /// the hash reads or the position does not fit an entry.
+    fn slot(&self, data: &[u8], at: usize) -> Option<usize> {
+        let end = at.checked_add(HASH_BYTES)?;
+        let bytes: [u8; HASH_BYTES] = data.get(at..end)?.try_into().ok()?;
+        if u32::try_from(at).is_err() {
+            return None;
+        }
+        let index = head_slot(bytes);
+        (index < self.table.len()).then_some(index)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BoundedHashChain, EMPTY, HEAD_ENTRIES, LINK_ENTRIES, SEARCH_DEPTH, STATE_BYTES};
+    use super::{
+        BoundedHashChain, EMPTY, HEAD_ENTRIES, LINK_ENTRIES, SEARCH_DEPTH, SINGLE_ENTRIES,
+        SINGLE_STATE_BYTES, STATE_BYTES, SingleHash,
+    };
     use crate::sequence::{MAX_MATCH_LENGTH, MIN_MATCH, Match, WINDOW};
     use crate::simd::{ALL, Kernel};
 
@@ -548,5 +705,150 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_single_search_names_bytes_inside_every_domain() {
+        let mut shapes = adversarial(8_192);
+        shapes.push(("noise", noise(8_192, SEED)));
+        for (name, data) in shapes {
+            let mut table = SingleHash::new();
+            for at in 0..data.len() {
+                let Some(matched) = table.search(&data, at) else {
+                    continue;
+                };
+                assert!(matched.length >= MIN_MATCH, "{name} at {at}");
+                assert!(matched.length <= MAX_MATCH_LENGTH, "{name} at {at}");
+                assert!(matched.distance >= 1, "{name} at {at}");
+                assert!(matched.distance <= WINDOW, "{name} at {at}");
+                assert!(matched.distance as usize <= at, "{name} at {at}");
+                let end = at.saturating_add(matched.length as usize);
+                assert!(end <= data.len(), "{name} at {at}");
+                assert_eq!(
+                    copied(&data, at, matched),
+                    data.get(at..end).unwrap_or_default(),
+                    "{name} at {at}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_table_reaches_one_window_and_no_further() {
+        let window = WINDOW as usize;
+        for extra in [0_usize, 1] {
+            let later = window.saturating_add(extra);
+            let mut data = noise(later.saturating_add(64), SEED ^ extra as u64);
+            for offset in 0..16_usize {
+                let byte = data.get(offset).copied().unwrap_or(0);
+                if let Some(slot) = data.get_mut(later.saturating_add(offset)) {
+                    *slot = byte;
+                }
+            }
+            let mut table = SingleHash::new();
+            table.insert(&data, 0);
+            let found = table.search(&data, later);
+            if extra == 0 {
+                assert_eq!(
+                    found.map(|matched| matched.distance),
+                    Some(WINDOW),
+                    "a candidate exactly one window back is reachable"
+                );
+            } else {
+                assert_eq!(found, None, "a candidate past the window is not reachable");
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_slide_moves_every_position_by_one_window() {
+        let window = WINDOW as usize;
+        let mut data = noise(window.saturating_mul(2), SEED ^ 0x11);
+        for offset in 0..16_usize {
+            let byte = data
+                .get(window.saturating_add(offset))
+                .copied()
+                .unwrap_or(0);
+            if let Some(slot) = data.get_mut(window.saturating_add(100).saturating_add(offset)) {
+                *slot = byte;
+            }
+        }
+        let mut table = SingleHash::new();
+        table.insert(&data, window);
+        table.slide();
+        let slid = data.get(window..).unwrap_or_default();
+        let found = table.search(slid, 100);
+        assert_eq!(
+            found.map(|matched| matched.distance),
+            Some(100),
+            "the position the slide moved is found at its new index"
+        );
+    }
+
+    #[test]
+    fn a_single_reset_discards_every_position() {
+        let data = vec![3_u8; 1_024];
+        let mut table = SingleHash::new();
+        for at in 0..64_usize {
+            let _ = table.search(&data, at);
+        }
+        assert!(table.search(&data, 64).is_some());
+        table.reset();
+        assert!(table.table.iter().all(|entry| *entry == EMPTY));
+        assert_eq!(table.search(&data, 64), None);
+    }
+
+    #[test]
+    fn the_single_state_is_one_byte_per_window_byte() {
+        assert_eq!(SINGLE_STATE_BYTES, 65_536);
+        assert_eq!(SINGLE_ENTRIES.saturating_mul(4), 65_536);
+        let table = SingleHash::with_kernel(Kernel::Scalar);
+        assert_eq!(table.kernel(), Kernel::Scalar);
+        assert_eq!(
+            table.table.len().saturating_mul(4),
+            SingleHash::state_bytes()
+        );
+    }
+
+    #[test]
+    fn every_kernel_reports_the_same_single_matches() {
+        let mut shapes = adversarial(4_096);
+        shapes.push(("noise", noise(4_096, SEED ^ 0x22)));
+        for (name, data) in shapes {
+            let mut tables: Vec<SingleHash> =
+                ALL.iter().map(|&k| SingleHash::with_kernel(k)).collect();
+            for at in 0..data.len() {
+                let mut expected = None;
+                for (index, table) in tables.iter_mut().enumerate() {
+                    let found = table.search(&data, at);
+                    if index == 0 {
+                        expected = Some(found);
+                    } else {
+                        assert_eq!(Some(found), expected, "{name} at {at}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_search_inserts_where_it_looked_and_never_reports_itself() {
+        let data = vec![3_u8; 1_024];
+        let mut table = SingleHash::new();
+        assert_eq!(
+            table.search(&data, 0),
+            None,
+            "an empty table reports no match"
+        );
+        assert_eq!(
+            table.search(&data, 1).map(|matched| matched.distance),
+            Some(1),
+            "the second search reads what the first one inserted"
+        );
+        assert_eq!(
+            table.search(&data, 1),
+            None,
+            "a search never reports itself"
+        );
     }
 }
