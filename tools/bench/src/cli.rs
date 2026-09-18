@@ -13,6 +13,7 @@ use crate::catalog::{self, Codec};
 use crate::error::{Error, Result};
 use crate::plan::{Points, Request, Tier};
 use crate::registry::{self, Group, Selection, SizeClass};
+use crate::subject::{self, Subject};
 
 pub const HELP: &str = "\
 entroq-bench: the Entroq benchmark tool.
@@ -62,9 +63,11 @@ cache.
 
 No corpus byte is committed. The registry and the method of obtaining it are.
 
-`measure` measures one competitor in-process, through the library the laboratory built and
-this binary linked. It emits one machine-readable result on standard output, and writes the
-same document into the directory the runner names for the segment's evidence. Every metric is
+`measure` measures one codec in-process. A competitor goes through the library the laboratory
+built and this binary linked; `entroq` goes through the crate of this workspace, so both sides
+of a comparison cross one call and one process and neither is charged for a boundary the other
+does not pay. It emits one machine-readable result on standard output, and writes the same
+document into the directory the runner names for the segment's evidence. Every metric is
 reported as measured, with the call that produced it, or as unavailable, with the reason. No
 metric is reported as a zero.
 
@@ -80,8 +83,13 @@ one class and one group per segment so each segment fits its budget. The cost of
 spans three orders of magnitude inside one project, so a slow point is grouped with points of
 its own cost rather than with the cheap ones it would push over the budget.
 
-Every result states an empty Entroq column and why it is empty: this harness links no Entroq
-codec at this revision.
+Every result states whether it measured Entroq. A segment that did says so; a segment that
+measured a competitor says that the Entroq row belongs to the segment that measures it, and no
+zero and no placeholder stands in for a number it did not produce.
+
+A measurement needs the laboratory linked, whichever codec it names. A comparison is what the
+harness exists for, and a binary that could measure only one side of one would produce a number
+nobody could place.
 
 `report parse` reads every recorded result under the paths given and reports what it read.
 A result is read whole or rejected: a document carrying a field the parser does not declare,
@@ -443,10 +451,10 @@ fn measure(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
     })?;
     let codec_name =
         codec_name.ok_or_else(|| Error::Usage(String::from("measure: --codec is required")))?;
-    let codec = catalog::find(&codec_name).ok_or_else(|| {
+    let subject = Subject::parse(&codec_name).ok_or_else(|| {
         Error::Usage(format!(
-            "`{codec_name}` is not a pinned competitor. The laboratory holds {}.",
-            catalog::names()
+            "`{codec_name}` is not a codec this harness measures. It measures {}.",
+            subject::names()
         ))
     })?;
     let class = match class_name {
@@ -475,14 +483,14 @@ fn measure(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
                     "the {} tier measures the point {} defaults to, so it covers no \
                      operating point group",
                     tier.name(),
-                    codec.display
+                    subject.display()
                 )));
             }
-            Some(codec.group(&name).ok_or_else(|| {
+            Some(subject.group(&name).ok_or_else(|| {
                 Error::Usage(format!(
                     "`{name}` is not an operating point group of {}. It groups its points as {}.",
-                    codec.display,
-                    codec.group_names()
+                    subject.display(),
+                    subject.group_names()
                 ))
             })?)
         }
@@ -490,7 +498,7 @@ fn measure(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
     };
 
     let segment = segment.unwrap_or_else(|| {
-        let mut id = format!("bench-{}", codec.name);
+        let mut id = format!("bench-{}", subject.name());
         if let Some(group) = points {
             id.push('-');
             id.push_str(group.name);
@@ -503,7 +511,7 @@ fn measure(mut args: impl Iterator<Item = OsString>) -> Result<Invocation> {
     });
     Ok(Invocation::Measure(Box::new(Request {
         tier,
-        codec,
+        subject,
         class,
         points,
         segment,
@@ -715,7 +723,7 @@ mod tests {
     fn a_measurement_names_its_tier_and_its_competitor() {
         let request = measured(&["measure", "--tier", "dev", "--codec", "zstd"]);
         assert_eq!(
-            request.map(|r| (r.tier.name(), r.codec.name, r.segment)),
+            request.map(|r| (r.tier.name(), r.subject.name(), r.segment)),
             Some(("dev", "zstd", String::from("bench-zstd")))
         );
     }
@@ -948,8 +956,9 @@ mod tests {
     }
 
     #[test]
-    fn the_help_states_the_segment_directory_and_the_empty_entroq_column() {
+    fn the_help_states_the_segment_directory_and_how_each_side_is_driven() {
         assert!(HELP.contains("ENTROQ_SEGMENT_DIR"));
-        assert!(HELP.contains("empty Entroq column"));
+        assert!(HELP.contains("crate of this workspace"));
+        assert!(HELP.contains("whether it measured Entroq"));
     }
 }

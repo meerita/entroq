@@ -54,6 +54,7 @@ dependencies = [
 name = "entroq-bench"
 version = "0.0.0"
 dependencies = [
+ "codec",
  "libc",
  "serde_json",
  "sha2",

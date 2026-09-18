@@ -15,11 +15,12 @@
 //! second campaign reproduced the numbers of a first one. It links no competitor, so a host
 //! that never built the laboratory still reads what one that did recorded.
 //!
-//! The measurement: it drives each competitor in-process, through the library the laboratory
-//! built and the build script linked, and emits one machine-readable result per segment.
+//! The measurement: it drives each codec in-process and emits one machine-readable result per
+//! segment. A competitor goes through the library the laboratory built and the build script
+//! linked; Entroq goes through the crate of this workspace. Both cross one call and one
+//! process, so neither side of a comparison is charged for a boundary the other does not pay.
 //! Every metric is reported as measured, with the call that produced it, or as unavailable,
-//! with the reason. This tool links no Entroq codec at this revision, so every result states
-//! an empty Entroq column and says why.
+//! with the reason.
 //!
 //! A host that has not built the laboratory compiles this tool, builds the laboratory with
 //! it, and links on the next build. Until then a measurement fails and says so; it never
@@ -38,13 +39,13 @@ mod catalog;
 mod cli;
 mod clock;
 mod compare;
-// The competitor boundary and the measurement that drives it link the laboratory. A host
-// that has not built it compiles everything else, and the tool says what it cannot measure.
-#[cfg(lab_linked)]
-mod competitor;
 mod corpus;
 mod counters;
 mod digest;
+// The driving boundary and the measurement that runs on it link the laboratory. A host that
+// has not built it compiles everything else, and the tool says what it cannot measure.
+#[cfg(lab_linked)]
+mod driver;
 mod environment;
 mod error;
 mod exec;
@@ -63,6 +64,7 @@ mod reproduce;
 #[cfg(lab_linked)]
 mod result;
 mod shape;
+mod subject;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

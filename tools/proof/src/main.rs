@@ -57,8 +57,8 @@ fn run() -> error::Result<ExitCode> {
         Invocation::Curve { sizes } => {
             let program = std::env::current_exe()
                 .map_err(|e| error::Error::at("find", Path::new("this program"), e))?;
-            let (points, verdict) = curve::run(&program, &sizes)?;
-            let table = curve::table(&points, &verdict);
+            let (points, refusal, verdict) = curve::run(&program, &sizes)?;
+            let table = curve::table(&points, &refusal, &verdict);
             print!("{table}");
             emit("curve.md", &table)?;
             Ok(outcome(verdict.flat))

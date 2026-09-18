@@ -12,6 +12,13 @@
 //! pair already holds. The streaming pair is the only thing that drives it, and the statistics
 //! a caller reads about it are on the streaming pair.
 
+/// The version of this codec, which is the encoder version a measurement records.
+///
+/// The format version a stream declares is the frame header's and is not this. Two encoder
+/// versions write different bytes for the same content and both stay decodable by every
+/// decoder of the format version they declare.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 mod block;
 mod checksum;
 mod decode;

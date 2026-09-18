@@ -41,6 +41,11 @@ Suites:
                runs at a segmented tier only.
   bench        the benchmark: one segment per competitor, measured in-process through the
                library the laboratory built. A segmented tier splits by size class too.
+  skeleton     the format skeleton's closing gate: every heavy proof of the frame, the
+               region and the block the cheap tiers defer. Segmented, so it runs at a
+               segmented tier only.
+  compressed   the compressed block's closing gate: every heavy proof of the codec that
+               compresses. Segmented, so it runs at a segmented tier only.
 
 A tier says how a campaign is bounded, recorded, and resumed. A suite says which segments
 it runs.
@@ -429,6 +434,24 @@ mod tests {
         );
         assert!(invoke(&["resume", "--tier", "dev", "--runs", "../runs"]).is_err());
         assert!(invoke(&["resume", "--tier", "smoke"]).is_err());
+    }
+
+    #[test]
+    fn the_help_names_every_suite_a_caller_may_ask_for() {
+        for suite in [
+            Suite::Workspace,
+            Suite::Lab,
+            Suite::Corpus,
+            Suite::Bench,
+            Suite::Skeleton,
+            Suite::Compressed,
+        ] {
+            assert!(
+                super::HELP.contains(suite.name()),
+                "the help does not name the {} suite",
+                suite.name()
+            );
+        }
     }
 
     #[test]

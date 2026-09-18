@@ -13,8 +13,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::catalog::{Codec, PointGroup};
+use crate::catalog::PointGroup;
 use crate::registry::{Entry, SizeClass};
+use crate::subject::Subject;
 
 /// The chunk one streamed measurement feeds at a time.
 ///
@@ -34,7 +35,7 @@ pub enum Tier {
 /// Which operating points a tier measures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Points {
-    /// The point the competitor's own project selects when a caller states no level.
+    /// The point the subject selects when a caller states no level.
     Default,
     /// Every point the catalog pins, which is what a frontier needs.
     Every,
@@ -183,7 +184,7 @@ impl Tier {
 /// What one segment was asked to measure.
 pub struct Request {
     pub tier: Tier,
-    pub codec: &'static Codec,
+    pub subject: Subject,
     /// The one size class this segment covers, or every class the tier names.
     pub class: Option<SizeClass>,
     /// The one operating point group this segment covers, or every point the tier names.
@@ -197,15 +198,15 @@ pub struct Request {
 /// The operating points one segment measures.
 ///
 /// A named group is what the segment covers. Without one, the tier decides: a cheap tier
-/// measures the point the competitor's own project defaults to, and a tier that describes a
-/// frontier measures every point the catalog pins.
+/// measures the point the subject defaults to, and a tier that describes a frontier measures
+/// every point the subject declares.
 pub fn points(request: &Request) -> Vec<&'static str> {
     if let Some(group) = request.points {
         return group.points.to_vec();
     }
     match request.tier.points() {
-        Points::Default => vec![request.codec.default_point],
-        Points::Every => request.codec.operating_points(),
+        Points::Default => vec![request.subject.default_point()],
+        Points::Every => request.subject.operating_points(),
     }
 }
 
@@ -254,25 +255,25 @@ pub fn select(tier: Tier, classes: &[SizeClass], entries: &'static [Entry]) -> S
 #[cfg(test)]
 mod tests {
     use super::{Points, Request, Selection, Tier, points, select};
-    use crate::catalog::{self, Codec};
     use crate::registry::{ENTRIES, SizeClass};
+    use crate::subject::Subject;
 
-    fn request(tier: Tier, codec: &'static Codec, group: Option<&str>) -> Request {
+    fn request(tier: Tier, subject: Subject, group: Option<&str>) -> Request {
         Request {
             tier,
-            codec,
+            subject,
             class: None,
-            points: group.and_then(|name| codec.group(name)),
+            points: group.and_then(|name| subject.group(name)),
             segment: String::from("a test"),
             lab: None,
             corpus: None,
         }
     }
 
-    /// The competitor a test names, which the catalog pins.
-    fn codec(name: &str) -> &'static Codec {
-        let Some(found) = catalog::find(name) else {
-            unreachable!("{name} is pinned in the catalog")
+    /// The subject a test names, which this workspace declares.
+    fn codec(name: &str) -> Subject {
+        let Some(found) = Subject::parse(name) else {
+            unreachable!("{name} is a subject this workspace declares")
         };
         found
     }
@@ -356,17 +357,36 @@ mod tests {
     }
 
     #[test]
-    fn the_groups_of_one_competitor_cover_every_point_its_gate_campaign_measures() {
-        for entry in catalog::CODECS {
-            let mut every = points(&request(Tier::Gate, entry, None));
-            let mut grouped: Vec<&str> = entry
-                .point_groups
+    fn the_groups_of_one_subject_cover_every_point_its_gate_campaign_measures() {
+        let mut subjects = vec![Subject::Entroq];
+        subjects.extend(crate::catalog::CODECS.iter().map(Subject::Competitor));
+        for subject in subjects {
+            let mut every = points(&request(Tier::Gate, subject, None));
+            let mut grouped: Vec<&str> = subject
+                .point_groups()
                 .iter()
-                .flat_map(|group| points(&request(Tier::Gate, entry, Some(group.name))))
+                .flat_map(|group| points(&request(Tier::Gate, subject, Some(group.name))))
                 .collect();
             grouped.sort_unstable();
             every.sort_unstable();
-            assert_eq!(grouped, every, "{} leaves a point unmeasured", entry.name);
+            assert_eq!(
+                grouped,
+                every,
+                "{} leaves a point unmeasured",
+                subject.name()
+            );
+        }
+    }
+
+    #[test]
+    fn the_codec_measures_its_one_point_at_every_tier() {
+        for tier in TIERS {
+            assert_eq!(
+                points(&request(tier, Subject::Entroq, None)),
+                vec!["default"],
+                "{}",
+                tier.name()
+            );
         }
     }
 

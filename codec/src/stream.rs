@@ -325,11 +325,21 @@ impl Encoder {
         }
     }
 
+    /// Moves what is queued into `out`, and advances the machine when nothing is queued.
+    ///
+    /// A full output buffer stops a copy and does not stop a state transition. The two are
+    /// separate because the last transition of a stream writes nothing: the terminator's bytes
+    /// are queued by one transition and the machine reaches `Done` on the next. A caller that
+    /// sized its output to the expansion bound hands over a buffer that is exactly full at
+    /// that moment, and a machine that refused to transition on a full buffer would report
+    /// `NeedsOutput` forever while producing nothing.
     fn pump(&mut self, out: &mut [u8]) -> Result<usize, Error> {
         let mut produced = 0_usize;
         loop {
             let room = out.get_mut(produced..).unwrap_or_default();
-            if room.is_empty() {
+            if room.is_empty()
+                && (self.scratch_at < self.scratch_len || self.data_at < self.blocks.len())
+            {
                 return Ok(produced);
             }
             if self.scratch_at < self.scratch_len {
@@ -1866,5 +1876,86 @@ mod tests {
                 return Ok(());
             }
         }
+    }
+
+    /// The bytes the declared expansion bound reserves for one frame of `content`.
+    fn bound(header: FrameHeader, content: usize) -> usize {
+        let logical = u64::try_from(content).unwrap_or(0);
+        let region = u64::try_from(DEFAULT_REGION_BYTES).unwrap_or(0);
+        header
+            .raw_frame_bytes(logical, region, DEFAULT_BLOCK_BYTES)
+            .ok()
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_caller_that_sized_its_output_to_the_expansion_bound_reaches_the_end() -> Result<(), Error>
+    {
+        // Incompressible content is what reaches the bound exactly: every block of it is
+        // stored, so the frame occupies every byte the bound reserves and the output buffer
+        // is full at the moment the machine still has one transition left to make. A machine
+        // that refused to transition on a full buffer reported NeedsOutput forever while
+        // producing nothing, and this caller never finished.
+        let header = FrameHeader::new(
+            ResourceClass::Small,
+            RegionIndependence::Independent,
+            IntegrityMode::Absent,
+        );
+        for length in [0_usize, 1, 256, 65_536, 200_000] {
+            let content: Vec<u8> = (0..length)
+                .map(|at| {
+                    let at = u64::try_from(at).unwrap_or(0);
+                    let mixed = at.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    let mixed =
+                        (mixed ^ mixed.wrapping_shr(30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    u8::try_from((mixed ^ mixed.wrapping_shr(27)) & 0xFF).unwrap_or(0)
+                })
+                .collect();
+            let room = bound(header, length);
+            assert!(room > 0, "the bound reserves nothing for {length} bytes");
+            let mut out = vec![0_u8; room];
+
+            let mut encoder = Encoder::new(header)?;
+            let mut at = 0_usize;
+            let mut fed = 0_usize;
+            while fed < content.len() {
+                let rest = content.get(fed..).ok_or(Error::InvalidParameter)?;
+                let target = out.get_mut(at..).ok_or(Error::InvalidParameter)?;
+                let progress = encoder.encode(rest, target)?;
+                assert!(
+                    progress.consumed > 0 || progress.produced > 0,
+                    "the encoder stalled at {length} bytes with {} of room left",
+                    room.saturating_sub(at)
+                );
+                fed = fed.saturating_add(progress.consumed);
+                at = at.saturating_add(progress.produced);
+            }
+            let mut turns = 0_u32;
+            loop {
+                let target = out.get_mut(at..).ok_or(Error::InvalidParameter)?;
+                let progress = encoder.finish(target)?;
+                at = at.saturating_add(progress.produced);
+                if progress.state == StreamState::Finished {
+                    break;
+                }
+                turns = turns.saturating_add(1);
+                assert!(
+                    turns < 8,
+                    "the encoder never finished at {length} bytes, with {} of room left",
+                    room.saturating_sub(at)
+                );
+            }
+            assert!(at <= room, "{at} bytes written against a bound of {room}");
+
+            let mut decoder = Decoder::new(permissive());
+            let mut plain = vec![0_u8; length.max(1)];
+            let source = out.get(..at).ok_or(Error::InvalidParameter)?;
+            let progress = decoder.decode(source, &mut plain)?;
+            decoder.finish()?;
+            assert_eq!(progress.produced, length);
+            assert_eq!(plain.get(..length), content.get(..length));
+        }
+        Ok(())
     }
 }

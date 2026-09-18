@@ -183,8 +183,11 @@ A number leaves the repository only from a sealed publication-tier record. A dev
 never appears in a document, a release note, or a comparison claim.
 
 Every metric is reported as measured, with the call that produced it, or as unavailable, with
-the reason. No metric is reported as a zero. The harness links no Entroq codec, so every
-result carries an empty Entroq column and says why.
+the reason. No metric is reported as a zero. The harness drives Entroq through the crate of
+this workspace and each competitor through the library the laboratory built, so both cross one
+call and one process. A result states whether it measured Entroq; one that measured a
+competitor says the Entroq row belongs to the segment that measures it, and carries no
+placeholder for it.
 
 Two reports read what a campaign recorded. Both take a run record directory and read every
 result under it.

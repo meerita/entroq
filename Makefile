@@ -41,7 +41,7 @@
 #           fetched public corpora that a measurement reads. `corpus`
 #           produces it. It is outside the repository on purpose: the
 #           registry is code, and the bytes it describes are not.
-#           Scope:    corpus, corpus-resume, bench.
+#           Scope:    corpus, corpus-resume, bench, compressed.
 #           Required: no.
 #           Default:  ../corpus
 #
@@ -67,7 +67,7 @@
 #   RUNS    The run record root. Recorded tiers write their manifest,
 #           journal, and raw segment output here. It is outside the
 #           repository on purpose: the repository carries code, not evidence.
-#           Scope:    test, gate, gate-resume, fuzz, bench.
+#           Scope:    test, gate, gate-resume, skeleton, compressed, fuzz, bench.
 #           Required: no.
 #           Default:  ../runs
 #
@@ -75,7 +75,8 @@
 #           vectors into. `skeleton` reads it, and `fuzz-seed` writes one more
 #           set under it to seed from. It is outside the repository on purpose:
 #           the repository carries code, not evidence.
-#           Scope:    skeleton, skeleton-prepare, skeleton-resume, fuzz-seed.
+#           Scope:    skeleton, compressed, their prepare and resume targets,
+#                     and fuzz-seed.
 #           Required: no.
 #           Default:  $(RUNS)/byteorder
 #
@@ -93,8 +94,8 @@
 #           The platform an integration lane runs on: linux/amd64 or
 #           linux/arm64.
 #           Scope:    ci, ci-validate, and the cross-architecture lane of
-#                     skeleton, where it names the other architecture and must
-#                     differ from the host's.
+#                     skeleton and compressed, where it names the other
+#                     architecture and must differ from the host's.
 #           Required: no.
 #           Default:  the platform of the host. A platform the host must
 #                     emulate still runs, and the lane reports it as
@@ -113,7 +114,7 @@ PLATFORM ?=
 # Repository tooling, versioned with the code whose gates it runs.
 RUNNER = $(CARGO) run --quiet --release --package entroq-run --
 
-.PHONY: help build check fmt fmt-check lint smoke test gate gate-resume skeleton-prepare skeleton skeleton-resume lab lab-resume corpus corpus-resume fuzz-list fuzz-driver fuzz fuzz-seed bench-harness bench bench-resume report compare validate ci ci-validate clean
+.PHONY: help build check fmt fmt-check lint smoke test-prepare test gate gate-resume skeleton-prepare skeleton skeleton-resume compressed-prepare compressed compressed-resume lab lab-resume corpus corpus-resume fuzz-list fuzz-driver fuzz fuzz-seed bench-harness bench bench-resume report compare validate ci ci-validate clean
 
 help:
 	@echo "build      compile the workspace"
@@ -127,6 +128,8 @@ help:
 	@echo "gate-resume  continue the current gate campaign where it stopped"
 	@echo "skeleton   gate tier: every heavy proof of the format skeleton"
 	@echo "skeleton-resume  continue the current skeleton campaign where it stopped"
+	@echo "compressed  gate tier: every heavy proof of the compressed block"
+	@echo "compressed-resume  continue the current compressed campaign where it stopped"
 	@echo "lab        build the pinned competitors into LAB, one segment per codec"
 	@echo "lab-resume   continue the current lab campaign where it stopped"
 	@echo "corpus     materialize the corpus into CORPUS, one segment per group"
@@ -164,7 +167,16 @@ lint:
 smoke:
 	$(RUNNER) run --tier smoke
 
-test:
+# `test-prepare` compiles what the dev segment then runs: the lint artifacts and
+# every test binary of the workspace. Compilation is not validation, so no budget
+# covers it, and a compile inside the one segment the dev tier has would spend
+# that segment's whole budget on the compiler.
+
+test-prepare:
+	$(CARGO) clippy --workspace --all-targets
+	$(CARGO) test --workspace --no-run
+
+test: test-prepare
 	$(RUNNER) run --tier dev --runs $(RUNS)
 
 gate:
@@ -199,6 +211,35 @@ skeleton: skeleton-prepare
 skeleton-resume: skeleton-prepare
 	RUNS=$(RUNS) VECTORS=$(VECTORS) PLATFORM=$(PLATFORM) \
 	    $(RUNNER) resume --suite skeleton --tier gate --runs $(RUNS)
+
+# The compressed block's closing gate. Every proof the cheap tiers defer, one
+# per segment, so one proof holds one budget and a resumed campaign re-runs only
+# the proof that did not hold.
+#
+# `compressed-prepare` compiles what the campaign then measures. It is the
+# skeleton's preparation plus the compressed test binary: the two closing gates
+# share the proof tool, the fuzz drivers, and both architecture lanes, and they
+# do not share a test binary.
+#
+# The corpus segment reads CORPUS and fails when the cache is not there. A gate
+# is a claim, and a segment that measured nothing is not one. Run `corpus`
+# first on a host that does not hold it.
+#
+# CORPUS is resolved to an absolute path here. A segment runs a test binary,
+# whose working directory is its own package rather than the repository root,
+# so a relative path would name a directory that does not exist and the segment
+# would report an absent corpus on a host that holds one.
+
+compressed-prepare: skeleton-prepare
+	$(CARGO) test --release --quiet --package codec --test compressed --no-run
+
+compressed: compressed-prepare
+	RUNS=$(RUNS) VECTORS=$(VECTORS) PLATFORM=$(PLATFORM) CORPUS=$(abspath $(CORPUS)) \
+	    $(RUNNER) run --suite compressed --tier gate --runs $(RUNS)
+
+compressed-resume: compressed-prepare
+	RUNS=$(RUNS) VECTORS=$(VECTORS) PLATFORM=$(PLATFORM) CORPUS=$(abspath $(CORPUS)) \
+	    $(RUNNER) resume --suite compressed --tier gate --runs $(RUNS)
 
 # The competitor laboratory. One segment per codec, so one build fits the
 # segment budget and a resumed campaign rebuilds only what did not pass.
@@ -281,10 +322,12 @@ fuzz-seed:
 # orders of magnitude inside one project, so the points of a competitor are
 # grouped by cost rather than measured together.
 #
-# Each segment measures its competitor in-process, through the library built into
-# $(LAB), and writes one machine-readable result into the segment's evidence
-# directory. The harness links no Entroq codec, so every result carries an
-# empty Entroq column and states why.
+# Each segment measures one codec in-process and writes one machine-readable
+# result into the segment's evidence directory. A competitor goes through the
+# library built into $(LAB); Entroq goes through the crate of this workspace. A
+# measurement needs the laboratory either way, because the harness exists to
+# compare and a binary that could measure one side alone would produce a number
+# nobody could place.
 #
 # The smoke tier is not recorded, so it takes no run root.
 #

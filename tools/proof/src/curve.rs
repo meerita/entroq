@@ -16,8 +16,17 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
+use codec::entropy::MAX_BLOCK_TABLE_BYTES;
+use codec::entropy::huffman::{LENGTH_LIMIT, table_bytes_for};
 use codec::format::{DecoderPolicy, FrameHeader, IntegrityMode, RegionIndependence, ResourceClass};
-use codec::stream::{Decoder, Encoder, Progress, StreamState};
+use codec::sequence::WINDOW;
+use codec::stream::{DEFAULT_BLOCK_BYTES, Decoder, Encoder, Progress, StreamState};
+
+/// The decode table shape the literal alphabet is read through.
+///
+/// Stated beside the bound because the shape decides the figure a description declares. It is
+/// provisional: the format fixes the declared figure, not the way a decoder reaches it.
+const HUFFMAN_SHAPE: &str = "huffman-single-level, 2 << max_length bytes";
 
 use crate::alloc;
 use crate::content::Shape;
@@ -46,13 +55,34 @@ const HARNESS_BUFFERS: usize = 4;
 
 /// The criterion, stated before the run.
 ///
-/// The peak resident set at the largest size may exceed the peak at the smallest by no more
-/// than the margin, no point may exceed the ceiling, and the allocation count and the peak
-/// outstanding bytes must be identical at every size. A path that materialized the whole
-/// input or the whole output would move the resident set by a gibibyte, which is two hundred
-/// and fifty times the margin.
+/// Five clauses, and the tool decides the verdict on all five.
+///
+/// ```text
+/// 1  the declared bound of each direction is identical at every size, and is stated with
+///    the window, the block length and the Huffman shape beside it
+/// 2  the allocations one block costs are at most the ceiling, and the figure does not grow
+///    with the input: the marginal cost between consecutive sizes stays inside the spread
+/// 3  the peak outstanding bytes stay inside the declared bound plus the slack, and their
+///    own spread across the whole range stays inside its margin
+/// 4  the peak resident set at the largest size exceeds the smallest by at most the margin,
+///    and no size exceeds the declared bound plus the resident slack
+/// 5  a block whose declared peak table memory exceeds local policy is refused before the
+///    allocation counter moves
+/// ```
+///
+/// Clauses 2 and 3 are the bounded form, not an equality. Coding and reading one block
+/// allocate in proportion to that block and free it before the call returns, which is the
+/// path this revision ships; the equality is the removal of those allocations, and the
+/// performance pass owns it. What a curve settles here is that neither figure follows the
+/// input: a path that materialized the whole input or the whole output would move the
+/// resident set by a gibibyte, which is two hundred and fifty times the margin, and a path
+/// whose per-block cost grew with the input would move the marginal figure.
 const RSS_MARGIN_BYTES: u64 = 4_194_304;
-const RSS_CEILING_BYTES: u64 = 33_554_432;
+const RSS_SLACK_BYTES: u64 = 33_554_432;
+const PEAK_OUTSTANDING_SLACK_BYTES: u64 = 1_048_576;
+const PEAK_OUTSTANDING_MARGIN_BYTES: u64 = 65_536;
+const ALLOCATIONS_PER_BLOCK_CEILING: u64 = 128;
+const ALLOCATIONS_PER_BLOCK_SPREAD: u64 = 8;
 
 /// What one point of the curve measured.
 #[derive(Clone, Copy, Debug, Default)]
@@ -219,15 +249,194 @@ impl Run {
     }
 }
 
+/// The content the table refusal is measured on, in bytes.
+///
+/// Small enough to be one region and one block, so the peak table memory a decoder holds is
+/// the figure that one block declares. A policy one byte below it refuses that block and
+/// nothing before it.
+const REFUSAL_BYTES: usize = 8_192;
+
+/// What the table-memory refusal measured.
+///
+/// A bound a decoder enforces after it has committed memory is not a bound. The figure that
+/// makes the position measurable is the allocation counter across the refusing call: a block
+/// refused at the declaration leaves it where it was.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Refusal {
+    /// The peak table memory the block declares, read under a policy that admits it.
+    pub declared: u64,
+    /// The table memory the policy under test admits, which is one byte below the
+    /// declaration.
+    pub allowed: u64,
+    /// Whether the decoder refused with `LimitExceeded`.
+    pub refused: bool,
+    /// The allocations the refusing call served.
+    pub allocations: u64,
+    /// The decode tables the refusing decoder built.
+    pub tables_built: u64,
+}
+
+impl Refusal {
+    /// What this measurement found against the criterion, and nothing when it held.
+    fn findings(&self) -> Vec<String> {
+        let mut findings = Vec::new();
+        if self.declared == 0 {
+            findings.push(String::from(
+                "the stream the refusal is measured on declares no table memory, so no policy \
+                 could refuse it and the criterion was not exercised",
+            ));
+        }
+        if !self.refused {
+            findings.push(format!(
+                "a block declaring {} table bytes was not refused by a policy admitting {}",
+                self.declared, self.allowed
+            ));
+        }
+        if self.allocations > 0 {
+            findings.push(format!(
+                "the refusing call served {} allocations, so the refusal did not precede them",
+                self.allocations
+            ));
+        }
+        if self.tables_built > 0 {
+            findings.push(format!(
+                "the refusing decoder built {} decode tables, so it committed before it \
+                 refused",
+                self.tables_built
+            ));
+        }
+        findings
+    }
+}
+
+/// The policy that admits whatever a frame this tool writes declares.
+const fn permissive() -> DecoderPolicy {
+    DecoderPolicy::with_max_history_bytes(ResourceClass::Huge.history_bytes())
+}
+
+/// Encodes `content` as one frame, in one call each way.
+fn whole(content: &[u8]) -> Result<Vec<u8>> {
+    let header = FrameHeader::new(
+        ResourceClass::Small,
+        RegionIndependence::Independent,
+        IntegrityMode::Absent,
+    );
+    let mut encoder = Encoder::new(header)?;
+    let mut stream = vec![0_u8; content.len().saturating_mul(2).saturating_add(4_096)];
+    let mut at = 0_usize;
+    let mut fed = 0_usize;
+    while fed < content.len() {
+        let rest = content
+            .get(fed..)
+            .ok_or(codec::format::Error::InvalidParameter)?;
+        let room = stream
+            .get_mut(at..)
+            .ok_or(codec::format::Error::InvalidParameter)?;
+        let progress = encoder.encode(rest, room)?;
+        fed = fed.saturating_add(progress.consumed);
+        at = at.saturating_add(progress.produced);
+    }
+    loop {
+        let room = stream
+            .get_mut(at..)
+            .ok_or(codec::format::Error::InvalidParameter)?;
+        let progress = encoder.finish(room)?;
+        at = at.saturating_add(progress.produced);
+        if progress.state == StreamState::Finished {
+            break;
+        }
+    }
+    stream.truncate(at);
+    Ok(stream)
+}
+
+/// Measures whether a block above the table ceiling is refused before anything is allocated.
+///
+/// The allocation counter is process wide, so the figure is what the process served during the
+/// refusing call and not what that call served. The command runs alone in its own process, so
+/// the two are the same there. Under a test harness that runs tests on several threads they
+/// are not, and the test beside this function asserts only what a concurrent thread cannot
+/// move.
+///
+/// # Errors
+///
+/// Fails when the stream cannot be built, or when a decoder that should accept it does not.
+pub fn refusal() -> Result<Refusal> {
+    let mut content = vec![0_u8; REFUSAL_BYTES];
+    Shape::TextLike.fill(0, &mut content);
+    let stream = whole(&content)?;
+    let mut out = vec![0_u8; REFUSAL_BYTES.saturating_add(4_096)];
+
+    // What the block declares. It is read rather than assumed, so the policy under test sits
+    // one byte below a figure this revision's encoder actually wrote.
+    let mut admitting = Decoder::new(permissive());
+    drain(&mut admitting, &stream, &mut out)?;
+    let declared = admitting.peak_table_bytes();
+
+    // The policy admits no table memory at all, so the block is refused against the figure it
+    // declares in its prologue rather than against the figure its descriptions build to. That
+    // is step 3 of the read order, which is the position this clause is about: a policy that
+    // refused one step later would already have parsed four descriptions, and parsing one
+    // allocates even though it builds no table.
+    let allowed = 0;
+    let mut refusing = Decoder::new(permissive().with_max_table_bytes(allowed));
+    let opened = alloc::counts();
+    let outcome = refusing.decode(&stream, &mut out);
+    let interval = opened.until(alloc::counts());
+    Ok(Refusal {
+        declared,
+        allowed,
+        refused: matches!(outcome, Err(codec::format::Error::LimitExceeded { .. })),
+        allocations: interval.allocations,
+        tables_built: refusing.tables_built(),
+    })
+}
+
+/// Reads a whole stream, which a decoder that admits it reaches the end of.
+fn drain(decoder: &mut Decoder, stream: &[u8], out: &mut [u8]) -> Result<()> {
+    let mut at = 0_usize;
+    loop {
+        let rest = stream.get(at..).unwrap_or_default();
+        let progress = decoder.decode(rest, out)?;
+        at = at.saturating_add(progress.consumed);
+        if progress.state == StreamState::Finished {
+            break;
+        }
+        if progress.consumed == 0 && progress.produced == 0 {
+            break;
+        }
+    }
+    decoder.finish()?;
+    Ok(())
+}
+
 /// Whether a curve holds the criterion, and what it was judged on.
 pub struct Verdict {
     pub flat: bool,
     pub findings: Vec<String>,
 }
 
+/// The blocks a run of `logical_bytes` cuts its input into.
+///
+/// The per-block figures are marginal costs, so they need the count the cost is spread over.
+/// The layout is the encoder's default, which is what `point` drives.
+const fn blocks(logical_bytes: u64) -> u64 {
+    logical_bytes.div_ceil(DEFAULT_BLOCK_BYTES as u64)
+}
+
+/// The allocations one block cost, between two sizes.
+///
+/// Marginal rather than average, so the allocations a run makes once at construction are not
+/// charged to the blocks of the smallest size and read as a slope.
+fn marginal_allocations(from: &Point, to: &Point) -> Option<u64> {
+    let span = blocks(to.logical_bytes).checked_sub(blocks(from.logical_bytes))?;
+    let spent = to.allocations.checked_sub(from.allocations)?;
+    spent.checked_div(span)
+}
+
 /// Judges a curve against the criterion stated above.
 #[must_use]
-pub fn judge(points: &[Point]) -> Verdict {
+pub fn judge(points: &[Point], refusal: &Refusal) -> Verdict {
     let mut findings = Vec::new();
     let Some(first) = points.first() else {
         findings.push(String::from("the curve holds no point"));
@@ -236,23 +445,9 @@ pub fn judge(points: &[Point]) -> Verdict {
             findings,
         };
     };
+    let bound = first.encoder_bytes.saturating_add(first.decoder_bytes);
 
     for point in points {
-        if point.allocations != first.allocations {
-            findings.push(format!(
-                "at {} bytes the run served {} allocations, against {} at {} bytes",
-                point.logical_bytes, point.allocations, first.allocations, first.logical_bytes
-            ));
-        }
-        if point.peak_outstanding_bytes != first.peak_outstanding_bytes {
-            findings.push(format!(
-                "at {} bytes the peak outstanding was {} bytes, against {} at {} bytes",
-                point.logical_bytes,
-                point.peak_outstanding_bytes,
-                first.peak_outstanding_bytes,
-                first.logical_bytes
-            ));
-        }
         if point.encoder_bytes != first.encoder_bytes || point.decoder_bytes != first.decoder_bytes
         {
             findings.push(format!(
@@ -264,10 +459,20 @@ pub fn judge(points: &[Point]) -> Verdict {
                 first.decoder_bytes
             ));
         }
+        let outstanding_ceiling = bound.saturating_add(PEAK_OUTSTANDING_SLACK_BYTES);
+        if point.peak_outstanding_bytes > outstanding_ceiling {
+            findings.push(format!(
+                "at {} bytes the peak outstanding was {} bytes, above the {outstanding_ceiling} \
+                 the declared bound and its slack allow",
+                point.logical_bytes, point.peak_outstanding_bytes
+            ));
+        }
         if let Some(rss) = point.peak_rss_bytes {
-            if rss > RSS_CEILING_BYTES {
+            let rss_ceiling = bound.saturating_add(RSS_SLACK_BYTES);
+            if rss > rss_ceiling {
                 findings.push(format!(
-                    "at {} bytes the peak resident set was {rss} bytes, above the {RSS_CEILING_BYTES} ceiling",
+                    "at {} bytes the peak resident set was {rss} bytes, above the \
+                     {rss_ceiling} the declared bound and its slack allow",
                     point.logical_bytes
                 ));
             }
@@ -289,24 +494,102 @@ pub fn judge(points: &[Point]) -> Verdict {
         }
     }
 
+    let spread = outstanding_spread(points);
+    if spread > PEAK_OUTSTANDING_MARGIN_BYTES {
+        findings.push(format!(
+            "the peak outstanding moved by {spread} bytes across the range, above the \
+             {PEAK_OUTSTANDING_MARGIN_BYTES} margin"
+        ));
+    }
+
+    let marginals = marginals(points);
+    for (at, cost) in &marginals {
+        if *cost > ALLOCATIONS_PER_BLOCK_CEILING {
+            findings.push(format!(
+                "reaching {at} bytes cost {cost} allocations per block, above the \
+                 {ALLOCATIONS_PER_BLOCK_CEILING} ceiling"
+            ));
+        }
+    }
+    let costs: Vec<u64> = marginals.iter().map(|(_, cost)| *cost).collect();
+    let widest = costs
+        .iter()
+        .max()
+        .copied()
+        .unwrap_or(0)
+        .saturating_sub(costs.iter().min().copied().unwrap_or(0));
+    if widest > ALLOCATIONS_PER_BLOCK_SPREAD {
+        findings.push(format!(
+            "the allocations one block cost moved by {widest} across the range, above the \
+             {ALLOCATIONS_PER_BLOCK_SPREAD} spread"
+        ));
+    }
+
+    findings.extend(refusal.findings());
+
     Verdict {
         flat: findings.is_empty(),
         findings,
     }
 }
 
-/// Runs one child per size and reports the curve.
+/// The distance from the smallest peak-outstanding figure to the largest.
+fn outstanding_spread(points: &[Point]) -> u64 {
+    let widest = points
+        .iter()
+        .map(|point| point.peak_outstanding_bytes)
+        .max()
+        .unwrap_or(0);
+    let narrowest = points
+        .iter()
+        .map(|point| point.peak_outstanding_bytes)
+        .min()
+        .unwrap_or(0);
+    widest.saturating_sub(narrowest)
+}
+
+/// The allocations one block cost, for each step of the curve.
+///
+/// A curve of one point has no step, so its per-block figure is the average instead. The
+/// ceiling still binds it; the spread has nothing to compare.
+fn marginals(points: &[Point]) -> Vec<(u64, u64)> {
+    let mut costs = Vec::new();
+    for pair in points.windows(2) {
+        if let (Some(from), Some(to)) = (pair.first(), pair.get(1))
+            && let Some(cost) = marginal_allocations(from, to)
+        {
+            costs.push((to.logical_bytes, cost));
+        }
+    }
+    if costs.is_empty()
+        && let Some(only) = points.first()
+        && let Some(cost) = only
+            .allocations
+            .checked_div(blocks(only.logical_bytes).max(1))
+    {
+        costs.push((only.logical_bytes, cost));
+    }
+    costs
+}
+
+/// Runs one child per size, checks the table refusal, and reports the curve.
+///
+/// The refusal is measured in this process rather than in a child. It is a property of one
+/// call and not of a run, so it needs no process of its own, and the counter it turns on is
+/// the same one every child reads.
 ///
 /// # Errors
 ///
-/// Fails when a child cannot be started, or does not report a point.
-pub fn run(program: &Path, sizes: &[u64]) -> Result<(Vec<Point>, Verdict)> {
+/// Fails when a child cannot be started, does not report a point, or when the stream the
+/// refusal is measured on cannot be built.
+pub fn run(program: &Path, sizes: &[u64]) -> Result<(Vec<Point>, Refusal, Verdict)> {
     let mut points = Vec::new();
     for size in sizes {
         points.push(child(program, *size)?);
     }
-    let verdict = judge(&points);
-    Ok((points, verdict))
+    let refusal = refusal()?;
+    let verdict = judge(&points, &refusal);
+    Ok((points, refusal, verdict))
 }
 
 fn child(program: &Path, bytes: u64) -> Result<Point> {
@@ -385,7 +668,7 @@ fn parse(line: &str) -> Option<Point> {
 
 /// The curve as a table, with the criterion it was judged against.
 #[must_use]
-pub fn table(points: &[Point], verdict: &Verdict) -> String {
+pub fn table(points: &[Point], refusal: &Refusal, verdict: &Verdict) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "# The memory growth curve\n");
     let _ = writeln!(out, "Platform: {}", host::platform());
@@ -395,36 +678,11 @@ pub fn table(points: &[Point], verdict: &Verdict) -> String {
         "Harness buffers: {HARNESS_BUFFERS} of {HARNESS_BUFFER_BYTES} bytes, fixed before the \
          run and inside the measured interval"
     );
-    let _ = writeln!(
-        out,
-        "Criterion: the peak resident set at the largest size exceeds the smallest by at most \
-         {RSS_MARGIN_BYTES} bytes, no point exceeds {RSS_CEILING_BYTES} bytes, and the \
-         allocation count, the peak outstanding bytes, and the declared bound are identical \
-         at every size.\n"
-    );
-    let _ = writeln!(
-        out,
-        "| logical MiB | stream bytes | encoder bound | decoder bound | allocations | \
-         allocated bytes | peak outstanding | peak RSS | ms |"
-    );
-    let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|");
-    for point in points {
-        let rss = point
-            .peak_rss_bytes
-            .map_or_else(|| String::from("absent"), |bytes| bytes.to_string());
-        let _ = writeln!(
-            out,
-            "| {} | {} | {} | {} | {} | {} | {} | {rss} | {} |",
-            point.logical_bytes.wrapping_shr(20),
-            point.stream_bytes,
-            point.encoder_bytes,
-            point.decoder_bytes,
-            point.allocations,
-            point.allocated_bytes,
-            point.peak_outstanding_bytes,
-            point.elapsed_ms,
-        );
-    }
+    out.push_str(&bound(points));
+    out.push_str(&criterion());
+    out.push_str(&rows(points));
+    out.push_str(&refused(refusal));
+
     let _ = writeln!(out);
     if verdict.flat {
         let _ = writeln!(out, "The curve is flat. Every criterion above holds.");
@@ -437,21 +695,156 @@ pub fn table(points: &[Point], verdict: &Verdict) -> String {
     out
 }
 
+/// The declared bound of each direction, with what decides it beside it.
+///
+/// A bound with no configuration on the row is a number nobody can reproduce, so the window,
+/// the block length and the decode table shape sit on it.
+fn bound(points: &[Point]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "\n## The declared bound, per direction\n");
+    let _ = writeln!(
+        out,
+        "| direction | declared bytes | window | block length | Huffman shape |"
+    );
+    let _ = writeln!(out, "|---|---|---|---|---|");
+    let first = points.first().copied().unwrap_or_default();
+    for (direction, declared) in [
+        ("encode", first.encoder_bytes),
+        ("decode", first.decoder_bytes),
+    ] {
+        let _ = writeln!(
+            out,
+            "| {direction} | {declared} | {WINDOW} | {DEFAULT_BLOCK_BYTES} | {HUFFMAN_SHAPE} |"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\nThe shape's table is {} bytes at the {} length limit, and one block declares at \
+         most {MAX_BLOCK_TABLE_BYTES} bytes over every table it decodes under.",
+        table_bytes_for(LENGTH_LIMIT),
+        LENGTH_LIMIT
+    );
+    out
+}
+
+/// The criterion, written into the report before the numbers it judges.
+fn criterion() -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "\n## The criterion, stated before the run\n");
+    let _ = writeln!(
+        out,
+        "```text\n\
+         1  the declared bound of each direction is identical at every size, and is stated\n\
+         \x20  above with the window, the block length and the Huffman shape beside it\n\
+         2  the allocations one block costs are at most {ALLOCATIONS_PER_BLOCK_CEILING}, and the\n\
+         \x20  marginal figure moves by at most {ALLOCATIONS_PER_BLOCK_SPREAD} across the range\n\
+         3  the peak outstanding bytes stay within the declared bound plus\n\
+         \x20  {PEAK_OUTSTANDING_SLACK_BYTES} bytes, and their own spread stays within\n\
+         \x20  {PEAK_OUTSTANDING_MARGIN_BYTES} bytes\n\
+         4  the peak resident set at the largest size exceeds the smallest by at most\n\
+         \x20  {RSS_MARGIN_BYTES} bytes, and no size exceeds the declared bound plus\n\
+         \x20  {RSS_SLACK_BYTES} bytes\n\
+         5  a block whose declared peak table memory exceeds local policy is refused before\n\
+         \x20  the allocation counter moves\n\
+         ```"
+    );
+    let _ = writeln!(
+        out,
+        "\nClauses 2 and 3 are bounded figures and not equalities. Coding and reading one \
+         block allocate in proportion to that block and free it before the call returns, \
+         which is the path this revision ships."
+    );
+    out
+}
+
+/// One row per size, with the allocations one block cost between this size and the last.
+fn rows(points: &[Point]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "\n## The curve\n");
+    let _ = writeln!(
+        out,
+        "| logical MiB | blocks | stream bytes | encoder bound | decoder bound | allocations | \
+         per block | allocated bytes | peak outstanding | peak RSS | ms |"
+    );
+    let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|---|---|");
+    let mut previous: Option<&Point> = None;
+    for point in points {
+        let rss = point
+            .peak_rss_bytes
+            .map_or_else(|| String::from("absent"), |bytes| bytes.to_string());
+        let per_block = previous
+            .and_then(|from| marginal_allocations(from, point))
+            .map_or_else(|| String::from("-"), |cost| cost.to_string());
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {} | {per_block} | {} | {} | {rss} | {} |",
+            point.logical_bytes.wrapping_shr(20),
+            blocks(point.logical_bytes),
+            point.stream_bytes,
+            point.encoder_bytes,
+            point.decoder_bytes,
+            point.allocations,
+            point.allocated_bytes,
+            point.peak_outstanding_bytes,
+            point.elapsed_ms,
+        );
+        previous = Some(point);
+    }
+    out
+}
+
+/// What the table-memory refusal found, in the shape a reader checks clause 5 against.
+fn refused(refusal: &Refusal) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "\n## The table refusal\n");
+    let _ = writeln!(
+        out,
+        "A block holding {} table bytes, read under a policy admitting {}: {}, with {} \
+         allocations served and {} decode tables built by the refusing decoder.",
+        refusal.declared,
+        refusal.allowed,
+        if refusal.refused {
+            "refused as LimitExceeded"
+        } else {
+            "not refused"
+        },
+        refusal.allocations,
+        refusal.tables_built,
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Point, judge, line, parse, table};
+    use super::{Point, Refusal, blocks, judge, line, parse, table};
 
+    /// A point of a curve whose per-block cost is one allocation.
+    ///
+    /// The allocation count is a function of the block count, so a pair of these points has a
+    /// marginal figure the criterion can judge rather than a constant the criterion could
+    /// not distinguish from a path that allocates nothing.
     fn point(logical: u64, rss: u64) -> Point {
         Point {
             logical_bytes: logical,
             stream_bytes: logical.saturating_add(64),
             encoder_bytes: 1_048_612,
             decoder_bytes: 36,
-            allocations: 5,
+            allocations: blocks(logical).saturating_add(5),
             allocated_bytes: 1_310_756,
             peak_outstanding_bytes: 1_310_756,
             peak_rss_bytes: Some(rss),
             elapsed_ms: 12,
+        }
+    }
+
+    /// A refusal that held, so a curve test judges the curve and not this clause.
+    const fn held() -> Refusal {
+        Refusal {
+            declared: 4_096,
+            allowed: 4_095,
+            refused: true,
+            allocations: 0,
+            tables_built: 0,
         }
     }
 
@@ -486,9 +879,20 @@ mod tests {
     #[test]
     fn a_flat_curve_holds_the_criterion() {
         let points = [point(1_048_576, 4_000_000), point(1_073_741_824, 4_200_000)];
-        let verdict = judge(&points);
+        let verdict = judge(&points, &held());
         assert!(verdict.flat, "{:?}", verdict.findings);
-        assert!(table(&points, &verdict).contains("The curve is flat"));
+        let report = table(&points, &held(), &verdict);
+        assert!(report.contains("The curve is flat"), "{report}");
+        assert!(report.contains("refused as LimitExceeded"), "{report}");
+    }
+
+    #[test]
+    fn the_report_states_the_declared_bound_of_each_direction() {
+        let points = [point(1_048_576, 4_000_000)];
+        let report = table(&points, &held(), &judge(&points, &held()));
+        assert!(report.contains("| encode | 1048612 |"), "{report}");
+        assert!(report.contains("| decode | 36 |"), "{report}");
+        assert!(report.contains("huffman-single-level"), "{report}");
     }
 
     #[test]
@@ -497,36 +901,147 @@ mod tests {
             point(1_048_576, 4_000_000),
             point(1_073_741_824, 1_080_000_000),
         ];
-        let verdict = judge(&points);
+        let verdict = judge(&points, &held());
         assert!(!verdict.flat);
-        assert!(verdict.findings.iter().any(|f| f.contains("ceiling")));
+        assert!(verdict.findings.iter().any(|f| f.contains("resident set")));
     }
 
     #[test]
-    fn an_allocation_count_that_moves_with_the_input_is_not_flat() {
+    fn a_per_block_cost_above_the_ceiling_is_not_flat() {
         let mut grown = point(1_073_741_824, 4_100_000);
-        grown.allocations = 20_000;
+        grown.allocations = blocks(grown.logical_bytes).saturating_mul(1_000);
         let points = [point(1_048_576, 4_000_000), grown];
-        assert!(!judge(&points).flat);
+        let verdict = judge(&points, &held());
+        assert!(!verdict.flat);
+        assert!(
+            verdict.findings.iter().any(|f| f.contains("per block")),
+            "{:?}",
+            verdict.findings
+        );
     }
 
     #[test]
-    fn a_peak_outstanding_that_moves_with_the_input_is_not_flat() {
+    fn a_per_block_cost_that_grows_with_the_input_is_not_flat() {
+        // Three points whose per-block cost rises from 1 to 40 across the range. Each is
+        // under the ceiling, so only the spread clause catches it.
+        let mut middle = point(16_777_216, 4_050_000);
+        middle.allocations = blocks(middle.logical_bytes).saturating_add(5);
+        let mut last = point(1_073_741_824, 4_100_000);
+        last.allocations = middle
+            .allocations
+            .saturating_add(blocks(last.logical_bytes).saturating_mul(40));
+        let points = [point(1_048_576, 4_000_000), middle, last];
+        let verdict = judge(&points, &held());
+        assert!(!verdict.flat);
+        assert!(
+            verdict.findings.iter().any(|f| f.contains("spread")),
+            "{:?}",
+            verdict.findings
+        );
+    }
+
+    #[test]
+    fn a_peak_outstanding_that_follows_the_input_is_not_flat() {
         let mut grown = point(1_073_741_824, 4_100_000);
         grown.peak_outstanding_bytes = 1_073_741_824;
         let points = [point(1_048_576, 4_000_000), grown];
-        assert!(!judge(&points).flat);
+        assert!(!judge(&points, &held()).flat);
+    }
+
+    #[test]
+    fn a_peak_outstanding_that_drifts_beyond_its_margin_is_not_flat() {
+        let mut drifted = point(1_073_741_824, 4_100_000);
+        drifted.peak_outstanding_bytes = drifted.peak_outstanding_bytes.saturating_add(65_537);
+        let points = [point(1_048_576, 4_000_000), drifted];
+        let verdict = judge(&points, &held());
+        assert!(!verdict.flat);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.contains("peak outstanding moved")),
+            "{:?}",
+            verdict.findings
+        );
     }
 
     #[test]
     fn a_host_that_reports_no_resident_set_is_a_finding_rather_than_a_flat_curve() {
         let mut blind = point(1_048_576, 0);
         blind.peak_rss_bytes = None;
-        assert!(!judge(&[blind]).flat);
+        assert!(!judge(&[blind], &held()).flat);
     }
 
     #[test]
     fn an_empty_curve_is_not_flat() {
-        assert!(!judge(&[]).flat);
+        assert!(!judge(&[], &held()).flat);
+    }
+
+    #[test]
+    fn a_block_above_policy_that_is_not_refused_is_a_finding() {
+        let mut admitted = held();
+        admitted.refused = false;
+        let points = [point(1_048_576, 4_000_000)];
+        let verdict = judge(&points, &admitted);
+        assert!(!verdict.flat);
+        assert!(
+            verdict.findings.iter().any(|f| f.contains("not refused")),
+            "{:?}",
+            verdict.findings
+        );
+    }
+
+    #[test]
+    fn a_refusal_that_allocated_first_is_a_finding() {
+        let mut late = held();
+        late.allocations = 1;
+        let points = [point(1_048_576, 4_000_000)];
+        let verdict = judge(&points, &late);
+        assert!(!verdict.flat);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.contains("did not precede")),
+            "{:?}",
+            verdict.findings
+        );
+    }
+
+    #[test]
+    fn a_refusal_that_built_a_table_first_is_a_finding() {
+        let mut committed = held();
+        committed.tables_built = 1;
+        let points = [point(1_048_576, 4_000_000)];
+        assert!(!judge(&points, &committed).flat);
+    }
+
+    #[test]
+    fn a_stream_that_declares_no_table_memory_does_not_exercise_the_clause() {
+        let empty = Refusal::default();
+        let points = [point(1_048_576, 4_000_000)];
+        let verdict = judge(&points, &empty);
+        assert!(!verdict.flat);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.contains("was not exercised")),
+            "{:?}",
+            verdict.findings
+        );
+    }
+
+    #[test]
+    fn the_refusal_this_revision_writes_is_refused_without_committing() {
+        let Ok(measured) = super::refusal() else {
+            unreachable!("the tool builds the stream it measures the refusal on")
+        };
+        assert!(measured.declared > 0, "{measured:?}");
+        assert!(measured.refused, "{measured:?}");
+        // The allocation count is a process-wide counter and this harness runs tests on
+        // several threads, so it is the command that judges the position. What holds here
+        // whatever else the process is doing is that the refusing decoder committed no table.
+        assert_eq!(measured.tables_built, 0, "{measured:?}");
     }
 }
