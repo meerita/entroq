@@ -186,6 +186,12 @@ impl<'a> BitReader<'a> {
         Self::new(buf.bytes(), buf.bits())
     }
 
+    /// The bytes the stream occupies, final padding included.
+    #[must_use]
+    pub const fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
     /// The bits the stream declared.
     #[must_use]
     pub const fn bits(&self) -> u64 {
