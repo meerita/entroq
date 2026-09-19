@@ -780,10 +780,14 @@ impl Encoder {
                     repeats: true,
                 }
             } else if terms.repeat.is_some() {
-                Self::fresh(coder, alphabet, symbols, share)?
+                let (fresh, counts) = Self::fresh(coder, alphabet, symbols, share)?;
+                drop(counts);
+                fresh
             } else {
-                let fresh = Self::fresh(coder, alphabet, symbols, share)?;
-                Self::cheaper(fresh, in_force, symbols)?
+                let (fresh, counts) = Self::fresh(coder, alphabet, symbols, share)?;
+                let chosen = Self::cheaper(fresh, in_force, symbols)?;
+                drop(counts);
+                chosen
             };
 
             if written.repeats {
@@ -810,21 +814,27 @@ impl Encoder {
     }
 
     /// One stream coded under a table built for it, with the description that rebuilds it.
+    ///
+    /// Returns the histogram the table was built over alongside the coded stream, so the reuse
+    /// decision that follows reads the same counts without a second pass.
     fn fresh(
         coder: Coder,
         alphabet: Alphabet,
         symbols: &[u16],
         share: u64,
-    ) -> Result<Coded, Error> {
-        let built = build(coder, alphabet, symbols, share)?;
+    ) -> Result<(Coded, Vec<u64>), Error> {
+        let (built, counts) = build(coder, alphabet, symbols, share)?;
         let description = built.describe();
         let payload = built.write(symbols)?;
-        Ok(Coded {
-            description,
-            payload,
-            built,
-            repeats: false,
-        })
+        Ok((
+            Coded {
+                description,
+                payload,
+                built,
+                repeats: false,
+            },
+            counts,
+        ))
     }
 
     /// The cheaper of coding a stream fresh and coding it under the table in force.
@@ -922,14 +932,25 @@ struct Assembled {
 }
 
 /// Builds the table one stream codes under, inside the share its class may spend.
-fn build(coder: Coder, alphabet: Alphabet, symbols: &[u16], share: u64) -> Result<Built, Error> {
+///
+/// Returns the histogram the table was built over alongside the table. The caller holds the one
+/// pass per stream through the reuse decision, then drops it with the block.
+fn build(
+    coder: Coder,
+    alphabet: Alphabet,
+    symbols: &[u16],
+    share: u64,
+) -> Result<(Built, Vec<u64>), Error> {
     let frequencies = frequencies(symbols, alphabet)?;
     match coder {
-        Coder::Huffman => Ok(Built::Huffman(huffman::Code::build_within(
-            &frequencies,
-            alphabet.size(),
-            share,
-        )?)),
+        Coder::Huffman => Ok((
+            Built::Huffman(huffman::Code::build_within(
+                &frequencies,
+                alphabet.size(),
+                share,
+            )?),
+            frequencies,
+        )),
         Coder::Rans { states } => {
             let table = rans::Table::normalize(&frequencies, alphabet.size())?;
             if table.table_bytes() > share {
@@ -938,7 +959,7 @@ fn build(coder: Coder, alphabet: Alphabet, symbols: &[u16], share: u64) -> Resul
                     allowed: share,
                 });
             }
-            Ok(Built::Rans(table, states))
+            Ok((Built::Rans(table, states), frequencies))
         }
     }
 }
