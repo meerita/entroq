@@ -36,8 +36,10 @@ const CONTENT_BYTES: usize = 382_720;
 /// The FAST operating point moved it from 42 603: the single-entry matcher with adaptive
 /// skip finds nearer, shorter matches than the depth-8 chain, so structured entries spend
 /// more bytes (source most, then json, logs, sparse) while high-entropy and RLE entries
-/// spend what they spent. The per-entry deltas match the measured FAST trade.
-const RECORDED_FRAME_BYTES: usize = 49_256;
+/// spend what they spent. The per-entry deltas match the measured FAST trade. The FAST
+/// table-log preference moved it from 49 256 to 49 179: capped tables spend fewer
+/// description bytes on the structured entries.
+const RECORDED_FRAME_BYTES: usize = 49_179;
 
 /// The earlier figure at this rung: the frame bytes it spent and the content it spent them
 /// over. Both are recorded figures, and neither is a target this codec is held to.

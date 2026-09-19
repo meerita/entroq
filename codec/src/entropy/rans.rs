@@ -23,7 +23,10 @@
 //!
 //! The table log is a declared rule and not a per-stream search. An encoder that searched for
 //! the log that minimized its own bits would be tuning one arm of a comparison that was made
-//! with the rule below fixed.
+//! with the rule below fixed. The FAST encoder prefers at most 1024 slots: payload stays
+//! stationary past 9-10 while the description and the decode table double with every further
+//! bit. The preference is revisable when new distributions or block lengths move the measured
+//! knee. A description may still declare 5..=12, and the decoder admits the whole range.
 
 use super::bits::{BitReader, BitWriter};
 use super::{ceil_log2, low_byte, shift_left, shift_right, width_for};
@@ -36,6 +39,13 @@ pub const TABLE_LOG_MIN: u32 = 5;
 /// The widest. It is the precision the published implementations settle near, and where a slot
 /// table stops fitting comfortably beside the stream it decodes.
 pub const TABLE_LOG_MAX: u32 = 12;
+
+/// The widest table the FAST encoder prefers.
+///
+/// An encoder preference, not a format limit: parse, validation and the decode table still
+/// admit up to `TABLE_LOG_MAX`. Revisable when new distributions or block lengths move the
+/// measured knee.
+pub const FAST_TABLE_LOG_MAX: u32 = 10;
 
 /// The lower end of the state interval.
 ///
@@ -88,7 +98,9 @@ impl Table {
     /// The declared table log for a stream of `symbols` symbols over `distinct` of them.
     ///
     /// Wide enough to hold the support, no wider than the stream can justify, and clamped to
-    /// the declared range.
+    /// the FAST preference: at most `FAST_TABLE_LOG_MAX` slots of resolution, while the floor
+    /// still wins below it. The decoder admits the full declared range independently of this
+    /// preference.
     ///
     /// # Errors
     ///
@@ -105,8 +117,8 @@ impl Table {
         let chosen = ceil_log2(symbols);
         if chosen < needed {
             Ok(needed)
-        } else if chosen > TABLE_LOG_MAX {
-            Ok(TABLE_LOG_MAX)
+        } else if chosen > FAST_TABLE_LOG_MAX {
+            Ok(FAST_TABLE_LOG_MAX)
         } else {
             Ok(chosen)
         }
@@ -820,8 +832,8 @@ const fn entry_cumulative(value: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Declared, DecodeTable, TABLE_LOG_MAX, TABLE_LOG_MIN, Table, entry, entry_cumulative,
-        entry_frequency, entry_symbol, table_bytes_for,
+        Declared, DecodeTable, FAST_TABLE_LOG_MAX, TABLE_LOG_MAX, TABLE_LOG_MIN, Table, entry,
+        entry_cumulative, entry_frequency, entry_symbol, table_bytes_for,
     };
     use crate::entropy::bits::{BitReader, BitWriter};
     use crate::entropy::shift_right;
@@ -850,8 +862,74 @@ mod tests {
     fn the_table_log_rule_holds_its_declared_range() -> Result<(), Error> {
         assert_eq!(Table::log_for(1, 1)?, TABLE_LOG_MIN);
         assert_eq!(Table::log_for(40, 8)?, 6);
-        assert_eq!(Table::log_for(65_536, 200)?, TABLE_LOG_MAX);
+        assert_eq!(Table::log_for(65_536, 200)?, FAST_TABLE_LOG_MAX);
         assert_eq!(Table::log_for(8, 200)?, 8);
+        assert_eq!(Table::log_for(1_024, 2)?, FAST_TABLE_LOG_MAX);
+        assert_eq!(Table::log_for(2_048, 2)?, FAST_TABLE_LOG_MAX);
+        assert_eq!(Table::log_for(100, 4)?, 7);
+        assert_eq!(Table::log_for(1 << 20, 5_000), Err(Error::InvalidParameter));
+        Ok(())
+    }
+
+    #[test]
+    fn a_decoder_still_admits_logs_above_the_fast_preference() -> Result<(), Error> {
+        for (log, freq) in [
+            (11u32, vec![512u32, 512, 512, 512]),
+            (12u32, vec![1_024u32, 1_024, 1_024, 1_024]),
+        ] {
+            let table = Table {
+                log,
+                freq,
+                alphabet_size: 4,
+            };
+            let mut writer = BitWriter::new();
+            table.describe(&mut writer);
+            let description = writer.finish();
+            let admitted = Declared::parse(&mut BitReader::over(&description), 4)?.validate()?;
+            assert_eq!(admitted.table(), &table);
+            assert_eq!(admitted.table_bytes(), table_bytes_for(log));
+            let built = admitted.build()?;
+            assert_eq!(built.allocated_bytes(), 4u64 << log);
+            let symbols = vec![0u16, 1, 2, 3, 3, 2, 1, 0];
+            for &states in &[1usize, 2, 4] {
+                let payload = admitted.table().encoder()?.write(&symbols, states)?;
+                let mut out = vec![0u16; symbols.len()];
+                let consumed = built.decode(&payload, &mut out, states)?;
+                assert_eq!(consumed, payload.len());
+                assert_eq!(out, symbols);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn capped_tables_hold_at_most_4096_bytes_on_structured_shapes() -> Result<(), Error> {
+        let wide = counts_from(&[1_000, 1_000, 1_000, 1_000, 500, 250, 125, 125]);
+        let even = vec![328u64; 200];
+        let skewed = counts_of(&skewed_stream(64, 20_000, 7), 64);
+        for (shape, alphabet) in [(&wide, 8u32), (&even, 200u32), (&skewed, 64u32)] {
+            let table = Table::normalize(shape, alphabet)?;
+            assert!(
+                table.log() <= FAST_TABLE_LOG_MAX,
+                "a structured shape selected log {} above the preference",
+                table.log()
+            );
+            assert!(
+                table.table_bytes() <= table_bytes_for(FAST_TABLE_LOG_MAX),
+                "a capped table holds {} bytes",
+                table.table_bytes()
+            );
+            let mut writer = BitWriter::new();
+            table.describe(&mut writer);
+            let description = writer.finish();
+            let admitted =
+                Declared::parse(&mut BitReader::over(&description), alphabet)?.validate()?;
+            assert_eq!(admitted.table_bytes(), table.table_bytes());
+            assert!(
+                admitted.build()?.allocated_bytes() <= table_bytes_for(FAST_TABLE_LOG_MAX),
+                "an admitted capped table allocates above the preference"
+            );
+        }
         Ok(())
     }
 
@@ -1071,7 +1149,7 @@ mod tests {
         let wide_counts = counts_from(&[1_000, 1_000, 1_000, 1_000, 500, 250, 125, 125]);
         let wide_symbols = skewed_stream(8, 4_500, 9);
         let (wide, _) = table_and_payload(&wide_counts, 8, &wide_symbols, 1)?;
-        assert_eq!(wide.log, TABLE_LOG_MAX);
+        assert_eq!(wide.log, FAST_TABLE_LOG_MAX);
         for &states in &[1usize, 2, 4] {
             let (table, payload) = table_and_payload(&wide_counts, 8, &wide_symbols, states)?;
             let (result, out) = check_paths(&table, &payload, wide_symbols.len(), states);
