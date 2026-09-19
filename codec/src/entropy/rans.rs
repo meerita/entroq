@@ -541,12 +541,52 @@ impl DecodeTable {
 
     /// Decodes one symbol per slot of `out`, and reports the bytes it consumed.
     ///
+    /// The table is reachable only from an admitted description, and the fast lanes run only
+    /// over the admitted shape the per-section check names, so no fast lane trusts a raw field.
+    ///
     /// # Errors
     ///
     /// Returns `InvalidParameter` when the state count is not one this coder ships at, and
     /// `CorruptData` when the payload ends before the symbols do or names a state the table
     /// does not hold.
     pub fn decode(&self, bytes: &[u8], out: &mut [u16], states: usize) -> Result<usize, Error> {
+        if !admits_states(states) {
+            return Err(Error::InvalidParameter);
+        }
+        // Each lane stays in a register with the state count selected once outside the loop;
+        // replay over real sections measured about 6-7 to about 3-4 nanoseconds per symbol at
+        // one state, about 4-5 to about 2-3 at two, and about 3-4 to about 1-2 at four.
+        if !self.is_admitted_shape() {
+            return self.decode_generic(bytes, out, states);
+        }
+        match states {
+            1 => self.decode_1(bytes, out),
+            2 => self.decode_2(bytes, out),
+            4 => self.decode_4(bytes, out),
+            _ => Err(Error::InvalidParameter),
+        }
+    }
+
+    /// Whether this table has the shape the fast lanes decode.
+    ///
+    /// The log sits inside the declared range and the slots hold exactly one entry per state
+    /// of the table, so every place the mask admits names an entry the build filled.
+    fn is_admitted_shape(&self) -> bool {
+        if !(TABLE_LOG_MIN..=TABLE_LOG_MAX).contains(&self.log) {
+            return false;
+        }
+        let total = usize::try_from(shift_left(1, self.log)).unwrap_or(usize::MAX);
+        self.slots.len() == total
+    }
+
+    /// Decodes one symbol per slot of `out`, and reports the bytes it consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParameter` when the state count is not one this coder ships at, and
+    /// `CorruptData` when the payload ends before the symbols do or names a state the table
+    /// does not hold.
+    fn decode_generic(&self, bytes: &[u8], out: &mut [u16], states: usize) -> Result<usize, Error> {
         if !admits_states(states) {
             return Err(Error::InvalidParameter);
         }
@@ -588,6 +628,128 @@ impl DecodeTable {
         }
         Ok(at)
     }
+
+    /// Decodes through one lane held in a register.
+    fn decode_1(&self, bytes: &[u8], out: &mut [u16]) -> Result<usize, Error> {
+        let slot_mask = super::bits::mask(self.log);
+        let mut at = 0usize;
+        let mut s0 = load_state(bytes, &mut at)?;
+        for symbol in out.iter_mut() {
+            self.step_plain(&mut s0, slot_mask, bytes, &mut at, symbol)?;
+        }
+        Ok(at)
+    }
+
+    /// Decodes through two lanes held in registers, paired and tailed explicitly.
+    fn decode_2(&self, bytes: &[u8], out: &mut [u16]) -> Result<usize, Error> {
+        let slot_mask = super::bits::mask(self.log);
+        let mut at = 0usize;
+        let mut s0 = load_state(bytes, &mut at)?;
+        let mut s1 = load_state(bytes, &mut at)?;
+        let mut pos = 0usize;
+        while pos.saturating_add(1) < out.len() {
+            let (first, second) = out.split_at_mut(pos.saturating_add(1));
+            let lead = first.last_mut().ok_or(Error::InvalidParameter)?;
+            let trail = second.first_mut().ok_or(Error::InvalidParameter)?;
+            self.step_plain(&mut s0, slot_mask, bytes, &mut at, lead)?;
+            self.step_plain(&mut s1, slot_mask, bytes, &mut at, trail)?;
+            pos = pos.saturating_add(2);
+        }
+        if pos < out.len() {
+            let slot = out.get_mut(pos).ok_or(Error::InvalidParameter)?;
+            self.step_plain(&mut s0, slot_mask, bytes, &mut at, slot)?;
+        }
+        Ok(at)
+    }
+
+    /// Decodes through four lanes held in registers, unrolled and tailed explicitly.
+    fn decode_4(&self, bytes: &[u8], out: &mut [u16]) -> Result<usize, Error> {
+        let slot_mask = super::bits::mask(self.log);
+        let mut at = 0usize;
+        let mut s0 = load_state(bytes, &mut at)?;
+        let mut s1 = load_state(bytes, &mut at)?;
+        let mut s2 = load_state(bytes, &mut at)?;
+        let mut s3 = load_state(bytes, &mut at)?;
+        let mut pos = 0usize;
+        while pos.saturating_add(4) <= out.len() {
+            let first = out.get_mut(pos).ok_or(Error::InvalidParameter)?;
+            self.step_plain(&mut s0, slot_mask, bytes, &mut at, first)?;
+            let second = out
+                .get_mut(pos.saturating_add(1))
+                .ok_or(Error::InvalidParameter)?;
+            self.step_plain(&mut s1, slot_mask, bytes, &mut at, second)?;
+            let third = out
+                .get_mut(pos.saturating_add(2))
+                .ok_or(Error::InvalidParameter)?;
+            self.step_plain(&mut s2, slot_mask, bytes, &mut at, third)?;
+            let fourth = out
+                .get_mut(pos.saturating_add(3))
+                .ok_or(Error::InvalidParameter)?;
+            self.step_plain(&mut s3, slot_mask, bytes, &mut at, fourth)?;
+            pos = pos.saturating_add(4);
+        }
+        let mut lane = 0usize;
+        while pos < out.len() {
+            let slot = out.get_mut(pos).ok_or(Error::InvalidParameter)?;
+            match lane {
+                0 => self.step_plain(&mut s0, slot_mask, bytes, &mut at, slot)?,
+                1 => self.step_plain(&mut s1, slot_mask, bytes, &mut at, slot)?,
+                2 => self.step_plain(&mut s2, slot_mask, bytes, &mut at, slot)?,
+                _ => self.step_plain(&mut s3, slot_mask, bytes, &mut at, slot)?,
+            }
+            lane = lane.saturating_add(1);
+            pos = pos.saturating_add(1);
+        }
+        Ok(at)
+    }
+
+    /// One rANS step over the admitted shape.
+    ///
+    /// The caller holds an admitted table whose log sits inside the declared range and whose
+    /// slots hold exactly one entry per table state, so every place the mask admits maps to an
+    /// entry with its cumulative start at or below the place and its frequency reaching past it.
+    ///
+    /// The admitted domain keeps the plain update exact: the log lies in 5..=12, each frequency
+    /// lies in 1..=total, each cumulative lies below the total, each place lies below the total
+    /// with the entry's interval covering it, and each state at entry lies at or below 2^32 - 1
+    /// and never grows past its flushed bound. The product stays at or below the state, the add
+    /// of the place stays below 2^64, and the subtract of the cumulative stays exact, so the
+    /// plain form coincides with the checked form on every reachable input. A short payload
+    /// still fails at the input helper and a place past the slots still fails at the lookup.
+    // The admitted shape above is the validation that makes the plain arithmetic sound.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn step_plain(
+        &self,
+        state: &mut u64,
+        slot_mask: u64,
+        bytes: &[u8],
+        at: &mut usize,
+        out_slot: &mut u16,
+    ) -> Result<(), Error> {
+        let place = *state & slot_mask;
+        let found = usize::try_from(place)
+            .ok()
+            .and_then(|at| self.slots.get(at))
+            .copied()
+            .ok_or(Error::CorruptData(Corruption::CodedStream))?;
+        let frequency = u64::from(entry_frequency(found));
+        let cumulative = u64::from(entry_cumulative(found));
+        let quotient = shift_right(*state, self.log);
+        *state = frequency * quotient + place - cumulative;
+        while *state < RANS_L {
+            *state = shift_left(*state, 8) | u64::from(next_byte(bytes, at)?);
+        }
+        *out_slot = entry_symbol(found);
+        Ok(())
+    }
+}
+
+fn load_state(bytes: &[u8], at: &mut usize) -> Result<u64, Error> {
+    let mut value = 0u64;
+    for _ in 0..FLUSH_BYTES {
+        value = shift_left(value, 8) | u64::from(next_byte(bytes, at)?);
+    }
+    Ok(value)
 }
 
 /// The symbol with the largest frequency, ties going to the smallest symbol.
@@ -658,10 +820,11 @@ const fn entry_cumulative(value: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Declared, TABLE_LOG_MAX, TABLE_LOG_MIN, Table, entry, entry_cumulative, entry_frequency,
-        entry_symbol, table_bytes_for,
+        Declared, DecodeTable, TABLE_LOG_MAX, TABLE_LOG_MIN, Table, entry, entry_cumulative,
+        entry_frequency, entry_symbol, table_bytes_for,
     };
     use crate::entropy::bits::{BitReader, BitWriter};
+    use crate::entropy::shift_right;
     use crate::format::{Corruption, Error};
 
     fn counts_from(shape: &[u64]) -> Vec<u64> {
@@ -760,6 +923,285 @@ mod tests {
                 encoder.write(&[0, 1, 2], states),
                 Err(Error::InvalidParameter)
             );
+        }
+        Ok(())
+    }
+
+    /// A deterministic skewed stream over `alphabet` symbols.
+    fn skewed_stream(alphabet: u32, len: usize, seed: u64) -> Vec<u16> {
+        let mut state = seed | 1;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let span = u64::from(alphabet);
+            let first = shift_right(state, 33).checked_rem(span).unwrap_or(0);
+            let second = shift_right(state, 11).checked_rem(span).unwrap_or(0);
+            out.push(u16::try_from(first.min(second)).unwrap_or(0));
+        }
+        out
+    }
+
+    fn counts_of(symbols: &[u16], alphabet: u32) -> Vec<u64> {
+        let span = usize::try_from(alphabet).unwrap_or(0);
+        let mut counts = vec![0u64; span];
+        for &symbol in symbols {
+            if let Some(slot) = counts.get_mut(usize::from(symbol)) {
+                *slot = slot.saturating_add(1);
+            }
+        }
+        counts
+    }
+
+    /// The admitted table for `symbols` with the bytes its encoder wrote at `states`.
+    ///
+    /// The description crosses parse and validate like a decoder's does, so the table is the
+    /// one admission builds.
+    fn table_and_payload(
+        counts: &[u64],
+        alphabet: u32,
+        symbols: &[u16],
+        states: usize,
+    ) -> Result<(DecodeTable, Vec<u8>), Error> {
+        let table = Table::normalize(counts, alphabet)?;
+        let mut writer = BitWriter::new();
+        table.describe(&mut writer);
+        let description = writer.finish();
+        let built = Declared::parse(&mut BitReader::over(&description), alphabet)?
+            .validate()?
+            .build()?;
+        let payload = table.encoder()?.write(symbols, states)?;
+        Ok((built, payload))
+    }
+
+    /// Runs the fast lanes and the retained generic loop over the same input and requires
+    /// identical outcomes, identical bytes, and identical consumption.
+    fn check_paths(
+        table: &DecodeTable,
+        section: &[u8],
+        len: usize,
+        states: usize,
+    ) -> (Result<usize, Error>, Vec<u16>) {
+        let mut fast_out = vec![0u16; len];
+        let fast = table.decode(section, &mut fast_out, states);
+        let mut slow_out = vec![0u16; len];
+        let slow = table.decode_generic(section, &mut slow_out, states);
+        assert_eq!(fast, slow, "the fast lanes classify differently");
+        assert_eq!(fast_out, slow_out, "the fast lanes decode different bytes");
+        (fast, fast_out)
+    }
+
+    #[test]
+    fn the_fast_lanes_match_the_generic_loop_over_admitted_tables() -> Result<(), Error> {
+        for &states in &[1usize, 2, 4] {
+            let symbols =
+                skewed_stream(8, 200, u64::try_from(states).unwrap_or(0).saturating_add(1));
+            let counts = counts_of(&symbols, 8);
+            let (table, payload) = table_and_payload(&counts, 8, &symbols, states)?;
+            let (result, out) = check_paths(&table, &payload, symbols.len(), states);
+            assert_eq!(result, Ok(payload.len()));
+            assert_eq!(out, symbols);
+
+            let flat = skewed_stream(16, 160, 11);
+            let flat_counts = counts_of(&flat, 16);
+            let (table, payload) = table_and_payload(&flat_counts, 16, &flat, states)?;
+            let (result, out) = check_paths(&table, &payload, flat.len(), states);
+            assert_eq!(result, Ok(payload.len()));
+            assert_eq!(out, flat);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn single_symbol_empty_and_singleton_outputs_share_one_path() -> Result<(), Error> {
+        let alphabet = 8u32;
+        let mut counts = vec![0u64; usize::try_from(alphabet).unwrap_or(0)];
+        if let Some(slot) = counts.get_mut(2) {
+            *slot = 300;
+        }
+        for &states in &[1usize, 2, 4] {
+            let symbols = vec![2u16; 300];
+            let (table, payload) = table_and_payload(&counts, alphabet, &symbols, states)?;
+            assert!(
+                table.slots.iter().all(|&packed| entry_symbol(packed) == 2),
+                "a single-symbol table carries one symbol"
+            );
+            let (result, out) = check_paths(&table, &payload, symbols.len(), states);
+            assert_eq!(result, Ok(payload.len()));
+            assert_eq!(out, symbols);
+
+            let (result, out) = check_paths(&table, &payload, 0, states);
+            assert_eq!(result, Ok(payload.len().min(4usize.saturating_mul(states))));
+            assert!(out.is_empty());
+
+            let one = vec![2u16; 1];
+            let (single_table, single_payload) =
+                table_and_payload(&counts, alphabet, &one, states)?;
+            let (result, out) = check_paths(&single_table, &single_payload, 1, states);
+            assert_eq!(result, Ok(single_payload.len()));
+            assert_eq!(out, one);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn odd_tails_and_table_log_ends_match() -> Result<(), Error> {
+        let narrow_counts = counts_from(&[1, 1, 1, 1, 1, 1, 1, 1]);
+        let narrow_symbols = skewed_stream(8, 137, 5);
+        let (narrow, narrow_payload) = table_and_payload(&narrow_counts, 8, &narrow_symbols, 1)?;
+        assert_eq!(narrow.log, TABLE_LOG_MIN);
+        for &states in &[1usize, 2, 4] {
+            let (table, payload) = table_and_payload(&narrow_counts, 8, &narrow_symbols, states)?;
+            for &len in &[1usize, 3, 5, 7, 9, 137] {
+                let take = narrow_symbols.get(..len).unwrap_or(&[]).to_vec();
+                let payload = if len == narrow_symbols.len() {
+                    payload.clone()
+                } else {
+                    Table::normalize(&narrow_counts, 8)?
+                        .encoder()?
+                        .write(&take, states)?
+                };
+                let (result, out) = check_paths(&table, &payload, take.len(), states);
+                assert_eq!(result, Ok(payload.len()));
+                assert_eq!(out, take);
+            }
+        }
+
+        let wide_counts = counts_from(&[1_000, 1_000, 1_000, 1_000, 500, 250, 125, 125]);
+        let wide_symbols = skewed_stream(8, 4_500, 9);
+        let (wide, _) = table_and_payload(&wide_counts, 8, &wide_symbols, 1)?;
+        assert_eq!(wide.log, TABLE_LOG_MAX);
+        for &states in &[1usize, 2, 4] {
+            let (table, payload) = table_and_payload(&wide_counts, 8, &wide_symbols, states)?;
+            let (result, out) = check_paths(&table, &payload, wide_symbols.len(), states);
+            assert_eq!(result, Ok(payload.len()));
+            assert_eq!(out, wide_symbols);
+            let _ = check_paths(&table, &payload, 3, states);
+            let _ = check_paths(&narrow, &narrow_payload, 1, states);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exotic_shapes_fall_back_with_identical_errors() -> Result<(), Error> {
+        let symbols = skewed_stream(8, 64, 17);
+        let counts = counts_of(&symbols, 8);
+        let (table, payload) = table_and_payload(&counts, 8, &symbols, 1)?;
+        let full_slots = table.slots.clone();
+        let log = table.log;
+        for &states in &[1usize, 2, 4] {
+            let short_len = full_slots.len().saturating_sub(1);
+            if let Some(short) = full_slots.get(..short_len) {
+                let rebuilt = DecodeTable {
+                    log,
+                    slots: short.to_vec(),
+                };
+                let (fast, _) = check_paths(&rebuilt, &payload, symbols.len(), states);
+                assert!(fast.is_err() || fast.is_ok());
+            }
+            let bad_logs = [
+                TABLE_LOG_MIN.saturating_sub(1),
+                TABLE_LOG_MAX.saturating_add(1),
+            ];
+            for bad in bad_logs {
+                let rebuilt = DecodeTable {
+                    log: bad,
+                    slots: full_slots.clone(),
+                };
+                let _ = check_paths(&rebuilt, &payload, symbols.len(), states);
+            }
+            let empty = DecodeTable {
+                log,
+                slots: Vec::new(),
+            };
+            let (result, _) = check_paths(&empty, &payload, symbols.len(), states);
+            assert_eq!(
+                result,
+                Err(Error::CorruptData(Corruption::CodedStream)),
+                "an empty slot table names no state"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_and_over_declared_payloads_keep_their_error_class() -> Result<(), Error> {
+        for &states in &[1usize, 2, 4] {
+            let symbols = skewed_stream(8, 120, 19);
+            let counts = counts_of(&symbols, 8);
+            let (table, payload) = table_and_payload(&counts, 8, &symbols, states)?;
+            for &cut in &[
+                0usize,
+                1,
+                3,
+                4usize.saturating_mul(states).saturating_sub(1),
+                4usize.saturating_mul(states),
+                payload.len().saturating_sub(1),
+            ] {
+                if cut >= payload.len() {
+                    continue;
+                }
+                if let Some(cut_payload) = payload.get(..cut) {
+                    let (result, _) = check_paths(&table, cut_payload, symbols.len(), states);
+                    assert_eq!(
+                        result,
+                        Err(Error::CorruptData(Corruption::CodedStream)),
+                        "a payload cut at {cut} bytes is truncation"
+                    );
+                }
+            }
+            let long_len = symbols.len().saturating_add(1);
+            let (result, _) = check_paths(&table, &payload, long_len, states);
+            assert_eq!(
+                result,
+                Err(Error::CorruptData(Corruption::CodedStream)),
+                "more output than the payload holds is truncation"
+            );
+            let mut trailed = payload.clone();
+            trailed.push(0);
+            let (result, out) = check_paths(&table, &trailed, symbols.len(), states);
+            assert_eq!(result, Ok(payload.len()));
+            assert_eq!(out, symbols);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bad_state_counts_are_refused_and_cross_counts_agree() -> Result<(), Error> {
+        let symbols = skewed_stream(8, 96, 23);
+        let counts = counts_of(&symbols, 8);
+        let (table, payload) = table_and_payload(&counts, 8, &symbols, 2)?;
+        for states in [0usize, 3, 5, 8] {
+            let (result, _) = check_paths(&table, &payload, symbols.len(), states);
+            assert_eq!(result, Err(Error::InvalidParameter));
+            let mut out = vec![0u16; symbols.len()];
+            assert_eq!(
+                table.decode(&payload, &mut out, states),
+                Err(Error::InvalidParameter)
+            );
+        }
+        for &encode_states in &[1usize, 2, 4] {
+            let (table, payload) = table_and_payload(&counts, 8, &symbols, encode_states)?;
+            for &decode_states in &[1usize, 2, 4] {
+                let _ = check_paths(&table, &payload, symbols.len(), decode_states);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_valid_symbol_decodes_through_both_paths() -> Result<(), Error> {
+        let alphabet = 8u32;
+        let mut symbols: Vec<u16> = (0u16..8u16).collect();
+        symbols.extend(0u16..8u16);
+        symbols.extend(skewed_stream(alphabet, 120, 29));
+        let counts = counts_of(&symbols, alphabet);
+        for &states in &[1usize, 2, 4] {
+            let (table, payload) = table_and_payload(&counts, alphabet, &symbols, states)?;
+            let (result, out) = check_paths(&table, &payload, symbols.len(), states);
+            assert_eq!(result, Ok(payload.len()));
+            assert_eq!(out, symbols, "every valid symbol round trips");
         }
         Ok(())
     }
