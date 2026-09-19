@@ -25,6 +25,10 @@
 //! A stream of one distinct symbol carries a code of no bits at all, and the description says
 //! so with a flag. The symbol carries no information, and the alternative is a one-bit code
 //! whose Kraft sum is a half.
+//!
+//! The bits one stream would spend under a code are a function of the code's lengths and the
+//! stream's counts alone, so an encoder that already holds both knows the payload cost without
+//! writing the payload.
 
 use super::bits::{BitReader, BitWriter};
 use super::{ceil_log2, shift_left, shift_right, shift_right_wide};
@@ -197,6 +201,60 @@ impl Code {
         } else {
             table_bytes_for(self.max_length)
         }
+    }
+
+    /// The bits writing `counts` under this code would spend, without writing them.
+    ///
+    /// The payload writer pushes one code word per symbol, and the bit count it carries is the
+    /// bare sum of the widths it pushed: padding closes the final byte without changing the
+    /// count, and a code over one distinct symbol writes nothing per symbol. So the sum of each
+    /// occurring symbol's length times its count is exactly what a trial encode would report.
+    ///
+    /// A count of zero contributes nothing, whatever length the code holds for it. A symbol the
+    /// code does not carry has no width to contribute, so it is refused rather than skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParameter` when `counts` does not span this code's alphabet, when a
+    /// symbol with a nonzero count has no length in this code, or when a count times its length
+    /// or the running total does not fit in 64 bits.
+    pub fn encoded_bits_for_counts(&self, counts: &[u64]) -> Result<u64, Error> {
+        if counts.len() != self.lengths.len() {
+            return Err(Error::InvalidParameter);
+        }
+        if let Some(single) = self.single {
+            let held = usize::from(single);
+            let mut at = 0usize;
+            while at < counts.len() {
+                let count = counts.get(at).copied().ok_or(Error::InvalidParameter)?;
+                if count > 0 && at != held {
+                    return Err(Error::InvalidParameter);
+                }
+                at = at.saturating_add(1);
+            }
+            return Ok(0);
+        }
+        let mut total = 0u64;
+        let mut at = 0usize;
+        while at < counts.len() {
+            let count = counts.get(at).copied().ok_or(Error::InvalidParameter)?;
+            if count > 0 {
+                let length = self
+                    .lengths
+                    .get(at)
+                    .copied()
+                    .ok_or(Error::InvalidParameter)?;
+                if length == 0 {
+                    return Err(Error::InvalidParameter);
+                }
+                let add = count
+                    .checked_mul(u64::from(length))
+                    .ok_or(Error::InvalidParameter)?;
+                total = total.checked_add(add).ok_or(Error::InvalidParameter)?;
+            }
+            at = at.saturating_add(1);
+        }
+        Ok(total)
     }
 
     /// Writes the description a decoder rebuilds this code from.
@@ -1236,6 +1294,268 @@ mod tests {
         let (result, out) = check_paths(&table, &section, bits, symbols.len());
         assert_eq!(result, Ok(()));
         assert_eq!(out, symbols, "every valid symbol round trips");
+        Ok(())
+    }
+
+    /// The histogram of `symbols` over `span` slots.
+    fn histogram_of(symbols: &[u16], span: usize) -> Vec<u64> {
+        let mut counts = vec![0u64; span];
+        for &symbol in symbols {
+            if let Some(slot) = counts.get_mut(usize::from(symbol)) {
+                *slot = slot.saturating_add(1);
+            }
+        }
+        counts
+    }
+
+    /// Builds a code over `build_counts` and requires the analytic cost over the written
+    /// symbols to equal the trial encode bit count exactly.
+    fn check_case(build_counts: &[u64], symbols: &[u16]) -> Result<(), Error> {
+        let code = Code::build(build_counts, 256, LENGTH_LIMIT)?;
+        let written = histogram_of(symbols, 256);
+        let analytic = code.encoded_bits_for_counts(&written)?;
+        let mut writer = BitWriter::new();
+        code.encoder()?.write(symbols, &mut writer)?;
+        let actual = writer.finish().bits();
+        assert_eq!(
+            analytic, actual,
+            "analytic cost differs from trial encode bits"
+        );
+        Ok(())
+    }
+
+    /// The exact cost matches the trial encode on the small boundaries: one symbol, two
+    /// symbols, a flat alphabet, skew, a one-symbol payload, a non-byte-aligned total, and
+    /// maximum-length pressure.
+    #[test]
+    fn analytic_cost_matches_trial_encode_on_small_shapes() -> Result<(), Error> {
+        let mut build = vec![0u64; 256];
+        let slot = build.get_mut(7).ok_or(Error::InvalidParameter)?;
+        *slot = 1_000;
+        check_case(&build, &vec![7u16; 1_000])?;
+
+        let mut build = vec![0u64; 256];
+        let slot = build.get_mut(0).ok_or(Error::InvalidParameter)?;
+        *slot = 999;
+        let slot = build.get_mut(255).ok_or(Error::InvalidParameter)?;
+        *slot = 1;
+        let mut symbols = vec![0u16; 999];
+        symbols.push(255);
+        check_case(&build, &symbols)?;
+
+        let build = vec![10u64; 256];
+        let mut symbols = Vec::new();
+        let mut round = 0usize;
+        while round < 10usize {
+            let mut symbol = 0u16;
+            while u32::from(symbol) < 256 {
+                symbols.push(symbol);
+                let next = u32::from(symbol).saturating_add(1);
+                symbol = u16::try_from(next).unwrap_or(u16::MAX);
+            }
+            round = round.saturating_add(1);
+        }
+        check_case(&build, &symbols)?;
+
+        let weights = [5_000u64, 2_000, 1_000, 500, 200, 100, 50, 25];
+        let mut build = vec![0u64; 256];
+        let mut symbols = Vec::new();
+        let mut lane = 0usize;
+        while lane < weights.len() {
+            let weight = weights.get(lane).copied().unwrap_or(0);
+            let symbol = u16::try_from(lane).unwrap_or(u16::MAX);
+            let slot = build.get_mut(lane).ok_or(Error::InvalidParameter)?;
+            *slot = weight;
+            let mut left = usize::try_from(weight).unwrap_or(0);
+            while left > 0 {
+                symbols.push(symbol);
+                left = left.saturating_sub(1);
+            }
+            lane = lane.saturating_add(1);
+        }
+        check_case(&build, &symbols)?;
+
+        let mut build = vec![0u64; 256];
+        let slot = build.get_mut(3).ok_or(Error::InvalidParameter)?;
+        *slot = 50;
+        let slot = build.get_mut(4).ok_or(Error::InvalidParameter)?;
+        *slot = 50;
+        check_case(&build, &[3u16])?;
+
+        let mut build = vec![0u64; 256];
+        let slot = build.get_mut(0).ok_or(Error::InvalidParameter)?;
+        *slot = 4;
+        let slot = build.get_mut(1).ok_or(Error::InvalidParameter)?;
+        *slot = 2;
+        let slot = build.get_mut(2).ok_or(Error::InvalidParameter)?;
+        *slot = 1;
+        check_case(&build, &[0, 0, 0, 0, 1, 1, 2])?;
+
+        let mut build = vec![0u64; 256];
+        let (mut first, mut second) = (1u64, 1u64);
+        let mut lane = 0usize;
+        while lane < 20usize {
+            let slot = build.get_mut(lane).ok_or(Error::InvalidParameter)?;
+            *slot = second;
+            let next = first.saturating_add(second);
+            first = second;
+            second = next;
+            lane = lane.saturating_add(1);
+        }
+        let mut symbols = Vec::new();
+        let mut lane = 0usize;
+        while lane < 20usize {
+            let count = build.get(lane).copied().unwrap_or(0);
+            let symbol = u16::try_from(lane).unwrap_or(u16::MAX);
+            let mut left = usize::try_from(count).unwrap_or(0);
+            while left > 0 {
+                symbols.push(symbol);
+                left = left.saturating_sub(1);
+            }
+            lane = lane.saturating_add(1);
+        }
+        check_case(&build, &symbols)?;
+        Ok(())
+    }
+
+    /// The exact cost matches the trial encode when the held table is wider than the written
+    /// support, when most held lengths go unused, and when the counts run large.
+    #[test]
+    fn analytic_cost_matches_trial_encode_on_wide_and_large() -> Result<(), Error> {
+        let mut wide = vec![0u64; 256];
+        let mut lane = 0usize;
+        while lane < 256usize {
+            let value = u64::try_from(lane).unwrap_or(0).saturating_add(1);
+            let slot = wide.get_mut(lane).ok_or(Error::InvalidParameter)?;
+            *slot = value;
+            lane = lane.saturating_add(1);
+        }
+        check_case(&wide, &[0u16, 1, 2, 3])?;
+
+        let mut wide = vec![0u64; 256];
+        let mut lane = 0usize;
+        while lane < 256usize {
+            let residue = u64::try_from(lane).unwrap_or(0).saturating_add(1);
+            let mut remainder = residue;
+            while remainder >= 7 {
+                remainder = remainder.saturating_sub(7);
+            }
+            let slot = wide.get_mut(lane).ok_or(Error::InvalidParameter)?;
+            *slot = remainder.saturating_add(1);
+            lane = lane.saturating_add(1);
+        }
+        let mut narrow = Vec::new();
+        let mut lane = 0u16;
+        while u32::from(lane) < 8 {
+            let mut repeat = 0usize;
+            while repeat < 50usize {
+                narrow.push(lane);
+                repeat = repeat.saturating_add(1);
+            }
+            let next = u32::from(lane).saturating_add(1);
+            lane = u16::try_from(next).unwrap_or(u16::MAX);
+        }
+        check_case(&wide, &narrow)?;
+
+        let mut build = vec![0u64; 256];
+        let slot = build.get_mut(42).ok_or(Error::InvalidParameter)?;
+        *slot = 777;
+        check_case(&build, &vec![42u16; 777])?;
+
+        let mut build = vec![0u64; 256];
+        let slot = build.get_mut(9).ok_or(Error::InvalidParameter)?;
+        *slot = 200_000;
+        let slot = build.get_mut(10).ok_or(Error::InvalidParameter)?;
+        *slot = 100_000;
+        let mut symbols = vec![9u16; 200_000];
+        symbols.extend(core::iter::repeat_n(10u16, 100_000));
+        check_case(&build, &symbols)?;
+        Ok(())
+    }
+
+    /// A symbol the code does not carry, a span the code does not cover, and a single-symbol
+    /// code asked about another symbol are all refused rather than costed.
+    #[test]
+    fn analytic_cost_refuses_uncarried_and_out_of_range() -> Result<(), Error> {
+        let mut build = vec![0u64; 256];
+        let slot = build.get_mut(0).ok_or(Error::InvalidParameter)?;
+        *slot = 10;
+        let slot = build.get_mut(1).ok_or(Error::InvalidParameter)?;
+        *slot = 10;
+        let code = Code::build(&build, 256, LENGTH_LIMIT)?;
+
+        let mut foreign = vec![0u64; 256];
+        let slot = foreign.get_mut(2).ok_or(Error::InvalidParameter)?;
+        *slot = 1;
+        assert_eq!(
+            code.encoded_bits_for_counts(&foreign),
+            Err(Error::InvalidParameter),
+            "a symbol with no length has no cost"
+        );
+
+        let short = vec![1u64; 8];
+        assert_eq!(
+            code.encoded_bits_for_counts(&short),
+            Err(Error::InvalidParameter),
+            "a span the code does not cover is out of range"
+        );
+
+        let mut single_counts = vec![0u64; 256];
+        let slot = single_counts.get_mut(5).ok_or(Error::InvalidParameter)?;
+        *slot = 9;
+        let single = Code::build(&single_counts, 256, LENGTH_LIMIT)?;
+        let mut other = vec![0u64; 256];
+        let slot = other.get_mut(4).ok_or(Error::InvalidParameter)?;
+        *slot = 3;
+        assert_eq!(
+            single.encoded_bits_for_counts(&other),
+            Err(Error::InvalidParameter),
+            "a single-symbol code carries no other symbol"
+        );
+        let mut own = vec![0u64; 256];
+        let slot = own.get_mut(5).ok_or(Error::InvalidParameter)?;
+        *slot = 300;
+        assert_eq!(single.encoded_bits_for_counts(&own), Ok(0));
+        Ok(())
+    }
+
+    /// A count times its length and the running total are both checked: neither wraps.
+    #[test]
+    fn analytic_cost_refuses_overflow() -> Result<(), Error> {
+        let mut build = vec![0u64; 256];
+        let slot = build.get_mut(0).ok_or(Error::InvalidParameter)?;
+        *slot = 4;
+        let slot = build.get_mut(1).ok_or(Error::InvalidParameter)?;
+        *slot = 2;
+        let slot = build.get_mut(2).ok_or(Error::InvalidParameter)?;
+        *slot = 1;
+        let code = Code::build(&build, 256, LENGTH_LIMIT)?;
+
+        let mut wide = vec![0u64; 256];
+        let slot = wide.get_mut(2).ok_or(Error::InvalidParameter)?;
+        *slot = u64::MAX;
+        assert_eq!(
+            code.encoded_bits_for_counts(&wide),
+            Err(Error::InvalidParameter),
+            "a count times a length above two bits does not fit"
+        );
+
+        let mut narrow_build = vec![0u64; 256];
+        let slot = narrow_build.get_mut(0).ok_or(Error::InvalidParameter)?;
+        *slot = 1;
+        let slot = narrow_build.get_mut(1).ok_or(Error::InvalidParameter)?;
+        *slot = 1;
+        let narrow = Code::build(&narrow_build, 256, LENGTH_LIMIT)?;
+        let mut huge = vec![0u64; 256];
+        let slot = huge.get_mut(0).ok_or(Error::InvalidParameter)?;
+        *slot = u64::MAX;
+        let slot = huge.get_mut(1).ok_or(Error::InvalidParameter)?;
+        *slot = 1;
+        assert_eq!(
+            narrow.encoded_bits_for_counts(&huge),
+            Err(Error::InvalidParameter),
+            "the running total does not wrap"
+        );
         Ok(())
     }
 }
