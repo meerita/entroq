@@ -1629,6 +1629,36 @@ mod tests {
         Ok(())
     }
 
+    /// Capped rANS tables hold a structured block's peak to three preferences.
+    ///
+    /// The fixture carries three rANS streams and no literal table, so the peak is the
+    /// rANS sum alone: three tables of 4096 bytes, down from 49 152 bytes uncapped.
+    #[test]
+    fn capped_tables_hold_a_structured_block_peak_to_three_preferences() -> Result<(), Error> {
+        let history: Vec<u8> = (0..4_096_u32)
+            .map(|at| u8::try_from(at & 0xFF).unwrap_or(0))
+            .collect();
+        let matches = Shape {
+            run: 0,
+            length: MIN_MATCH,
+            distance: 64,
+            alphabet: 256,
+        };
+        let mut encoder = Encoder::at_region_start();
+        let mut decoder = Decoder::at_region_start();
+        let first = plan(matches, 65_536, &history, 71).ok_or(Error::InvalidParameter)?;
+        let _first = round_trip(&first, &history, true, FRESH, &mut encoder, &mut decoder)?;
+        assert!(
+            decoder.peak_table_bytes()
+                <= 3 * crate::entropy::rans::table_bytes_for(
+                    crate::entropy::rans::FAST_TABLE_LOG_MAX
+                ),
+            "a structured block peaked at {} rANS table bytes",
+            decoder.peak_table_bytes()
+        );
+        Ok(())
+    }
+
     /// The expansion bound: a block that stores at least what it decodes to is refused, and
     /// the refusal precedes every allocation the block would size.
     #[test]

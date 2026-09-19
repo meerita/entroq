@@ -903,6 +903,37 @@ mod tests {
     }
 
     #[test]
+    fn capped_tables_hold_at_most_4096_bytes_on_structured_shapes() -> Result<(), Error> {
+        let wide = counts_from(&[1_000, 1_000, 1_000, 1_000, 500, 250, 125, 125]);
+        let even = vec![328u64; 200];
+        let skewed = counts_of(&skewed_stream(64, 20_000, 7), 64);
+        for (shape, alphabet) in [(&wide, 8u32), (&even, 200u32), (&skewed, 64u32)] {
+            let table = Table::normalize(shape, alphabet)?;
+            assert!(
+                table.log() <= FAST_TABLE_LOG_MAX,
+                "a structured shape selected log {} above the preference",
+                table.log()
+            );
+            assert!(
+                table.table_bytes() <= table_bytes_for(FAST_TABLE_LOG_MAX),
+                "a capped table holds {} bytes",
+                table.table_bytes()
+            );
+            let mut writer = BitWriter::new();
+            table.describe(&mut writer);
+            let description = writer.finish();
+            let admitted =
+                Declared::parse(&mut BitReader::over(&description), alphabet)?.validate()?;
+            assert_eq!(admitted.table_bytes(), table.table_bytes());
+            assert!(
+                admitted.build()?.allocated_bytes() <= table_bytes_for(FAST_TABLE_LOG_MAX),
+                "an admitted capped table allocates above the preference"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn a_normalized_table_sums_to_its_total_and_keeps_every_symbol() -> Result<(), Error> {
         let shapes: [Vec<u64>; 4] = [
             counts_from(&[1, 1, 1, 1, 1, 1, 1, 1]),
