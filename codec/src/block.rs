@@ -785,7 +785,7 @@ impl Encoder {
                 fresh
             } else {
                 let (fresh, counts) = Self::fresh(coder, alphabet, symbols, share)?;
-                let chosen = Self::cheaper(fresh, in_force, symbols)?;
+                let chosen = Self::cheaper(fresh, &counts, in_force, symbols)?;
                 drop(counts);
                 chosen
             };
@@ -844,21 +844,41 @@ impl Encoder {
     /// fresh table would cost together. The mode field is not on either side of the
     /// comparison, because a block that is not the first of its region carries it whether or
     /// not a bit of it is set.
-    fn cheaper(fresh: Coded, in_force: Option<&Built>, symbols: &[u16]) -> Result<Coded, Error> {
+    ///
+    /// A literal-byte stream costs its held table analytically from the counts the fresh table
+    /// was built over, which is exactly what a trial encode would report, so a fresh win skips
+    /// the held encode and its buffer. Every other class runs the exact production trial.
+    fn cheaper(
+        fresh: Coded,
+        counts: &[u64],
+        in_force: Option<&Built>,
+        symbols: &[u16],
+    ) -> Result<Coded, Error> {
         let Some(held) = in_force else {
             return Ok(fresh);
         };
         if !held.carries(symbols) {
             return Ok(fresh);
         }
-        let payload = held.write(symbols)?;
         let spent = fresh
             .description
             .bits()
             .saturating_add(fresh.payload.bits());
-        if payload.bits() >= spent {
-            return Ok(fresh);
-        }
+        let payload = match *held {
+            Built::Huffman(ref code) => {
+                if code.encoded_bits_for_counts(counts)? >= spent {
+                    return Ok(fresh);
+                }
+                held.write(symbols)?
+            }
+            Built::Rans(..) => {
+                let payload = held.write(symbols)?;
+                if payload.bits() >= spent {
+                    return Ok(fresh);
+                }
+                payload
+            }
+        };
         Ok(Coded {
             description: BitWriter::new().finish(),
             payload,
@@ -1073,7 +1093,9 @@ pub fn expand(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::{Block, Decoder, Encoder, Terms, huffman};
+    use super::{
+        Block, Built, Coded, Coder, Decoder, Encoder, Streams, TABLE_SHARES, Terms, huffman,
+    };
     use crate::entropy::bits::{BitBuf, BitReader, BitWriter};
     use crate::format::{
         BLOCK_MODEL_V1, BLOCK_STREAMS, BlockPrologue, Corruption, DecoderPolicy, Error, Feature,
@@ -1838,6 +1860,207 @@ mod tests {
             out, next.content,
             "a repeating block did not decode to its content"
         );
+        Ok(())
+    }
+
+    /// The decision the exact trial encode reaches, over the inputs the shipped rule reads.
+    fn repeats_by_trial(fresh: &Coded, held: &Built, symbols: &[u16]) -> Result<bool, Error> {
+        if !held.carries(symbols) {
+            return Ok(false);
+        }
+        let spent = fresh
+            .description
+            .bits()
+            .saturating_add(fresh.payload.bits());
+        Ok(held.write(symbols)?.bits() < spent)
+    }
+
+    /// The literal-byte opportunity one block presents to the table in force.
+    struct Opportunity {
+        fresh: Coded,
+        counts: Vec<u64>,
+        symbols: Vec<u16>,
+    }
+
+    /// The fresh table a block's literal bytes build, the counts it was built over, and the
+    /// symbols a held table would have to code.
+    ///
+    /// A block whose literal-byte stream is empty presents no opportunity, because the encoder
+    /// codes no section for it and reaches no decision about it.
+    fn literal_byte_opportunity(
+        encoder: &Encoder,
+        sequences: &Sequences,
+        share: u64,
+    ) -> Result<Option<Opportunity>, Error> {
+        let mut cache = encoder.cache;
+        let streams = Streams::of(sequences, &mut cache)?;
+        let symbols = streams.stream(Alphabet::LiteralByte).symbols().to_vec();
+        if symbols.is_empty() {
+            return Ok(None);
+        }
+        let (fresh, counts) =
+            Encoder::fresh(Coder::Huffman, Alphabet::LiteralByte, &symbols, share)?;
+        Ok(Some(Opportunity {
+            fresh,
+            counts,
+            symbols,
+        }))
+    }
+
+    /// A coded stream that declares exactly `payload` bits and no description, for holding the
+    /// trigger against a held cost that lands on its total exactly.
+    fn fresh_costing(built: Built, payload: u64) -> Coded {
+        let mut writer = BitWriter::new();
+        let mut left = payload;
+        while left > 0 {
+            let width = u32::try_from(left.min(32)).unwrap_or(32);
+            writer.push(0, width);
+            left = left.saturating_sub(u64::from(width));
+        }
+        Coded {
+            description: BitWriter::new().finish(),
+            payload: writer.finish(),
+            built,
+            repeats: false,
+        }
+    }
+
+    /// Every literal-byte reuse opportunity a region presents decides the way the trial encode
+    /// decided it, and the analytic cost is the bit count that trial would have reported.
+    #[test]
+    fn the_analytic_literal_byte_cost_decides_as_the_trial_encode_did() -> Result<(), Error> {
+        let policy = DecoderPolicy::CONSERVATIVE;
+        let share = policy
+            .max_table_bytes()
+            .checked_div(TABLE_SHARES)
+            .ok_or(Error::InvalidParameter)?;
+        let mut repeat_wins = 0usize;
+        let mut fresh_wins = 0usize;
+        let all = shapes();
+        for (lane, pair) in all
+            .iter()
+            .flat_map(|first| all.iter().map(move |second| (*first, *second)))
+            .enumerate()
+        {
+            let mut encoder = Encoder::at_region_start();
+            let mut history: Vec<u8> = Vec::new();
+            let mut out = Vec::new();
+            for block in 0..4usize {
+                let seed = u64::try_from(lane.saturating_mul(16).saturating_add(block))
+                    .unwrap_or(0)
+                    .saturating_add(101);
+                let taken = if block % 2 == 0 { pair.0 } else { pair.1 };
+                let next = plan(taken, 4_096, &history, seed).ok_or(Error::InvalidParameter)?;
+                let first_in_region = block == 0;
+                let presented = literal_byte_opportunity(&encoder, &next.sequences, share)?;
+                let mut expected = false;
+                if let Some(Opportunity {
+                    fresh,
+                    counts,
+                    symbols,
+                }) = presented
+                {
+                    let held = if first_in_region {
+                        None
+                    } else {
+                        encoder
+                            .tables
+                            .get(LITERAL_BYTE_STREAM)
+                            .and_then(Option::as_ref)
+                    };
+                    if let Some(table) = held
+                        && table.carries(&symbols)
+                    {
+                        let Built::Huffman(ref code) = *table else {
+                            return Err(Error::InvalidParameter);
+                        };
+                        assert_eq!(
+                            code.encoded_bits_for_counts(&counts)?,
+                            table.write(&symbols)?.bits(),
+                            "pair {lane} block {block} costed the held table differently \
+                             from the trial encode"
+                        );
+                        expected = repeats_by_trial(&fresh, table, &symbols)?;
+                        if expected {
+                            repeat_wins = repeat_wins.saturating_add(1);
+                        } else {
+                            fresh_wins = fresh_wins.saturating_add(1);
+                        }
+                    }
+                    let chosen = Encoder::cheaper(fresh, &counts, held, &symbols)?;
+                    assert_eq!(
+                        chosen.repeats, expected,
+                        "pair {lane} block {block} decided against the trial encode"
+                    );
+                }
+
+                let assembly = encoder
+                    .assemble_into(
+                        &next.sequences,
+                        Terms {
+                            first_in_region,
+                            repeat: None,
+                            ceiling: usize::MAX,
+                        },
+                        &policy,
+                        &mut out,
+                    )?
+                    .ok_or(Error::InvalidParameter)?;
+                assert_eq!(
+                    assembly
+                        .repeated()
+                        .get(LITERAL_BYTE_STREAM)
+                        .copied()
+                        .unwrap_or(false),
+                    expected,
+                    "pair {lane} block {block} emitted a mode bit the decision did not name"
+                );
+                encoder.adopt(assembly);
+                history.extend_from_slice(&next.content);
+            }
+        }
+        assert!(
+            repeat_wins > 0 && fresh_wins > 0,
+            "the opportunities exercised {repeat_wins} repeat wins and {fresh_wins} fresh wins, \
+             so one side of the comparison went unread"
+        );
+        Ok(())
+    }
+
+    /// A held cost that lands exactly on what the fresh table spends takes the fresh table, and
+    /// one bit either side of it decides the other way.
+    #[test]
+    fn the_analytic_trigger_holds_the_tie_to_the_fresh_table() -> Result<(), Error> {
+        let mut counts = vec![0u64; 256];
+        for (symbol, count) in [(0usize, 4u64), (1, 2), (2, 1)] {
+            let slot = counts.get_mut(symbol).ok_or(Error::InvalidParameter)?;
+            *slot = count;
+        }
+        let symbols = [0u16, 0, 0, 0, 1, 1, 2];
+        let code = huffman::Code::build_within(&counts, 256, u64::MAX)?;
+        let held = Built::Huffman(code);
+        let Built::Huffman(ref code) = held else {
+            return Err(Error::InvalidParameter);
+        };
+        let exact = code.encoded_bits_for_counts(&counts)?;
+        assert_eq!(
+            exact,
+            held.write(&symbols)?.bits(),
+            "the analytic cost differs from the trial encode"
+        );
+
+        for (spent, repeats) in [
+            (exact.saturating_sub(1), false),
+            (exact, false),
+            (exact.saturating_add(1), true),
+        ] {
+            let fresh = fresh_costing(held.clone(), spent);
+            let chosen = Encoder::cheaper(fresh, &counts, Some(&held), &symbols)?;
+            assert_eq!(
+                chosen.repeats, repeats,
+                "a held cost of {exact} against a fresh cost of {spent} decided the wrong way"
+            );
+        }
         Ok(())
     }
 
