@@ -48,13 +48,21 @@ use crate::format::{
 };
 use crate::sequence::cache::OffsetCache;
 use crate::sequence::streams::{Streams, SymbolStream};
-use crate::sequence::{Alphabet, Sequences};
+use crate::sequence::{Alphabet, Match, Sequences};
 
 /// The classes a block may spend its table ceiling over.
 ///
 /// The encoder gives each class this share, so the four tables in force sum to at most the
 /// ceiling whatever the streams of one block carry.
 const TABLE_SHARES: u64 = BLOCK_STREAMS as u64;
+
+/// The width of one match-copy chunk.
+///
+/// Provisional at 32, pending the width measurement the selection phase runs; the kernel shape
+/// does not change with the width. A match whose distance is at least this width reads only
+/// bytes the region has already produced, so no chunk read reaches a byte the match is still
+/// to write.
+const COPY_WIDTH: usize = 32;
 
 /// One COMPRESSED block, as a decoder meets it inside its region.
 #[derive(Clone, Copy, Debug)]
@@ -1028,14 +1036,16 @@ fn frequencies(symbols: &[u16], alphabet: Alphabet) -> Result<Vec<u64>, Error> {
 pub fn expand(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(), Error> {
     #[cfg(test)]
     capture::record(sequences, history, out.len());
-    expand_scalar(sequences, history, out)
+    expand_width::<COPY_WIDTH>(sequences, history, out)
 }
 
 /// The scalar expansion body: the oracle every optimized match-copy path answers to.
 ///
 /// It validates and copies exactly as the format contract requires, one byte at a time. The
-/// scalar match copy it calls is the same one an optimized path falls back to, so the two
-/// cannot drift on the copy itself.
+/// scalar match copy it calls is the same one the production path falls back to, so the two
+/// cannot drift on the copy itself. It is compiled only for the tests that compare against it;
+/// production expands through the width-chunked body.
+#[cfg(test)]
 fn expand_scalar(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(), Error> {
     let literals = sequences.literals();
     let mut taken = 0usize;
@@ -1117,6 +1127,230 @@ fn copy_match_scalar(
         *slot = byte;
         written = written.saturating_add(1);
         from = from.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Validates one match exactly as the scalar oracle does, before its copy.
+///
+/// The scalar path makes the same checks per byte; with the same per-match values every
+/// per-byte check is implied, and the emit order is unchanged, so the accept set and the
+/// refusal class are the oracle's. Answers the absolute source position, the absolute end, and
+/// the distance.
+#[inline]
+fn admit_match(
+    history_len: usize,
+    written: usize,
+    logical: usize,
+    matched: Match,
+) -> Result<(usize, usize, usize), Error> {
+    let length = usize::try_from(matched.length)
+        .map_err(|_| Error::CorruptData(Corruption::BlockContent))?;
+    let distance = usize::try_from(matched.distance)
+        .map_err(|_| Error::CorruptData(Corruption::MatchReach))?;
+    let produced = history_len
+        .checked_add(written)
+        .ok_or(Error::CorruptData(Corruption::MatchReach))?;
+    if distance == 0 {
+        return Err(Error::CorruptData(Corruption::RepeatDistance));
+    }
+    if distance > produced {
+        return Err(Error::CorruptData(Corruption::MatchReach));
+    }
+    let end = written
+        .checked_add(length)
+        .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+    if end > logical {
+        return Err(Error::CorruptData(Corruption::BlockContent));
+    }
+    Ok((produced.saturating_sub(distance), end, distance))
+}
+
+/// Copies one literal run, with the oracle's checks and error classes.
+#[inline]
+fn copy_literals(
+    literals: &[u8],
+    out: &mut [u8],
+    taken: usize,
+    written: usize,
+    run: usize,
+) -> Result<usize, Error> {
+    let literal_end = taken
+        .checked_add(run)
+        .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+    let produced_end = written
+        .checked_add(run)
+        .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+    let source = literals
+        .get(taken..literal_end)
+        .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+    let target = out
+        .get_mut(written..produced_end)
+        .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+    target.copy_from_slice(source);
+    Ok(literal_end)
+}
+
+/// Copies one `K`-byte chunk whose source is inside the current block output.
+///
+/// The `distance >= K` contract puts `src + K` at or before `dst`, so the chunk reads only
+/// bytes the match has already produced and the two slices do not alias.
+#[inline]
+fn copy_out_chunk<const K: usize>(out: &mut [u8], dst: usize, src: usize) -> Result<(), Error> {
+    let (head, tail) = out.split_at_mut(dst);
+    let src_end = src
+        .checked_add(K)
+        .ok_or(Error::CorruptData(Corruption::MatchReach))?;
+    let source = head
+        .get(src..src_end)
+        .ok_or(Error::CorruptData(Corruption::MatchReach))?;
+    let target = tail
+        .get_mut(..K)
+        .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+    target.copy_from_slice(source);
+    Ok(())
+}
+
+/// Bulk-copies whole chunks of a match whose source is the current block output.
+///
+/// Every chunk read ends at or before the write cursor because the distance is at least `K`.
+/// Only chunks whose write ends at or before the match end are copied; the caller scalars the
+/// remainder, so no write reaches past the match end. Answers the destination it reached.
+fn copy_out_bulk<const K: usize>(
+    out: &mut [u8],
+    written: usize,
+    src: usize,
+    end: usize,
+) -> Result<usize, Error> {
+    let mut dst = written;
+    let mut at = src;
+    while dst.checked_add(K).is_some_and(|chunk_end| chunk_end <= end) {
+        copy_out_chunk::<K>(out, dst, at)?;
+        dst = dst
+            .checked_add(K)
+            .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+        at = at
+            .checked_add(K)
+            .ok_or(Error::CorruptData(Corruption::MatchReach))?;
+    }
+    Ok(dst)
+}
+
+/// Bulk-copies whole chunks of a match whose source lies in `history`.
+///
+/// A chunk read that crosses the history/output boundary is split into a history half and an
+/// output half. The output half reads bytes at or before the write cursor because the distance
+/// is at least `K`, so no read touches a byte the match is still to write. Answers the
+/// destination it reached.
+fn copy_history_bulk<const K: usize>(
+    history: &[u8],
+    out: &mut [u8],
+    written: usize,
+    from: usize,
+    end: usize,
+) -> Result<usize, Error> {
+    let h = history.len();
+    let mut dst = written;
+    let mut at = from;
+    while dst.checked_add(K).is_some_and(|chunk_end| chunk_end <= end) {
+        let at_end = at
+            .checked_add(K)
+            .ok_or(Error::CorruptData(Corruption::MatchReach))?;
+        let dst_end = dst
+            .checked_add(K)
+            .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+        if at_end <= h {
+            let source = history
+                .get(at..at_end)
+                .ok_or(Error::CorruptData(Corruption::MatchReach))?;
+            let target = out
+                .get_mut(dst..dst_end)
+                .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+            target.copy_from_slice(source);
+        } else {
+            let head = h.saturating_sub(at);
+            let dst_head = dst
+                .checked_add(head)
+                .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+            let source = history
+                .get(at..h)
+                .ok_or(Error::CorruptData(Corruption::MatchReach))?;
+            let target = out
+                .get_mut(dst..dst_head)
+                .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+            target.copy_from_slice(source);
+            let rest = K.saturating_sub(head);
+            let rest_end = dst_head
+                .checked_add(rest)
+                .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+            if rest_end > out.len() {
+                return Err(Error::CorruptData(Corruption::BlockContent));
+            }
+            out.copy_within(0..rest, dst_head);
+        }
+        dst = dst_end;
+        at = at_end;
+    }
+    Ok(dst)
+}
+
+/// Expands one block through a width-chunked match copy with a bounded exact scalar tail.
+///
+/// A match whose validated distance is at least `K` is copied `K` bytes at a time while a
+/// whole chunk fits inside the match end; the shorter final tail, every match with a smaller
+/// distance, every true overlap, and every source that crosses the history boundary without
+/// being wholly in one of the two is copied by the scalar oracle. Every chunk read ends at or
+/// before the write cursor and every chunk write ends at or before the match end, which is the
+/// logical block output end at most. The two paths agree on every accepted byte and every
+/// refusal.
+fn expand_width<const K: usize>(
+    sequences: &Sequences,
+    history: &[u8],
+    out: &mut [u8],
+) -> Result<(), Error> {
+    let literals = sequences.literals();
+    let logical = out.len();
+    let h = history.len();
+    let mut taken = 0usize;
+    let mut written = 0usize;
+    for step in sequences.steps() {
+        let run =
+            usize::try_from(step.run).map_err(|_| Error::CorruptData(Corruption::BlockContent))?;
+        taken = copy_literals(literals, out, taken, written, run)?;
+        written = written
+            .checked_add(run)
+            .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+        let Some(matched) = step.matched else {
+            continue;
+        };
+        let (from, end, distance) = admit_match(h, written, logical, matched)?;
+        let length = end
+            .checked_sub(written)
+            .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+        if distance >= K {
+            let done = if from >= h {
+                copy_out_bulk::<K>(out, written, from.saturating_sub(h), end)?
+            } else if from
+                .checked_add(length)
+                .is_some_and(|source_end| source_end <= h)
+            {
+                copy_history_bulk::<K>(history, out, written, from, end)?
+            } else {
+                written
+            };
+            if done < end {
+                let rest = from
+                    .checked_add(done.saturating_sub(written))
+                    .ok_or(Error::CorruptData(Corruption::MatchReach))?;
+                copy_match_scalar(history, out, done, end, rest)?;
+            }
+        } else {
+            copy_match_scalar(history, out, written, end, from)?;
+        }
+        written = end;
+    }
+    if written != logical {
+        return Err(Error::CorruptData(Corruption::BlockContent));
     }
     Ok(())
 }
@@ -3353,5 +3587,91 @@ mod tests {
         }
         assert!(cases > 0, "no mutation was checked");
         Ok(())
+    }
+
+    /// One block of `run` literals, one match, and an optional literal tail.
+    fn synthetic(
+        run: usize,
+        length: usize,
+        distance: usize,
+        tail: usize,
+    ) -> Option<(Sequences, usize)> {
+        let mut literals = Vec::new();
+        for index in 0..run {
+            literals.push(u8::try_from(index & 0xFF).ok()?);
+        }
+        for index in 0..tail {
+            literals.push(u8::try_from((index ^ 0x5A) & 0xFF).ok()?);
+        }
+        let mut steps = vec![Step {
+            run: u32::try_from(run).ok()?,
+            matched: Some(Match {
+                length: u32::try_from(length).ok()?,
+                distance: u32::try_from(distance).ok()?,
+            }),
+        }];
+        if tail > 0 {
+            steps.push(Step {
+                run: u32::try_from(tail).ok()?,
+                matched: None,
+            });
+        }
+        let out_len = run.checked_add(length)?.checked_add(tail)?;
+        Some((Sequences::new_unchecked(literals, steps), out_len))
+    }
+
+    /// The kernel agrees with the oracle at every chunk boundary.
+    ///
+    /// Lengths cover shorter than a chunk, exactly a chunk, one past a chunk, an exact multiple,
+    /// a remainder of one, and a remainder of `K - 1`. Distances cover below the width, exactly
+    /// the width, one past it, and a wide distance. A history of zero, one, several, and more
+    /// than a chunk covers a source entirely in the block output, entirely in history, and
+    /// crossing the boundary. A tail after the match puts the match end inside the block rather
+    /// than exactly at it, so the final partial chunk is exercised.
+    #[test]
+    fn the_width_chunked_kernel_agrees_at_every_chunk_boundary() {
+        let k = super::COPY_WIDTH;
+        let distances = [
+            1,
+            k.saturating_sub(1),
+            k,
+            k.saturating_add(1),
+            k.saturating_mul(2),
+        ];
+        let lengths = [
+            1,
+            k.saturating_sub(1),
+            k,
+            k.saturating_add(1),
+            k.saturating_mul(2),
+            k.saturating_mul(2).saturating_add(1),
+            k.saturating_mul(3).saturating_sub(1),
+            k.saturating_mul(3),
+        ];
+        let mut cases = 0usize;
+        for history_len in [0usize, 1, 8, 64, k.saturating_add(3)] {
+            let history: Vec<u8> = (0..history_len)
+                .map(|at| u8::try_from(at & 0xFF).unwrap_or(0))
+                .collect();
+            for distance in distances {
+                for length in lengths {
+                    for run in [0usize, 1, 8, k] {
+                        for tail in [0usize, 1] {
+                            let Some((sequences, out_len)) = synthetic(run, length, distance, tail)
+                            else {
+                                continue;
+                            };
+                            assert!(
+                                agree(&sequences, &history, out_len),
+                                "distance {distance} length {length} run {run} tail {tail} \
+                                 history {history_len} diverged"
+                            );
+                            cases = cases.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 0, "no boundary case was checked");
     }
 }
