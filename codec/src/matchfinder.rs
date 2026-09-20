@@ -38,13 +38,19 @@
 use crate::sequence::{MAX_MATCH_LENGTH, MIN_MATCH, Match, WINDOW};
 use crate::simd::{self, Kernel};
 
-/// The candidate positions one search may compare.
+/// The candidate positions a depth-8 search may compare.
 ///
 /// Eight, resolved against a parse rather than against a match count. Depth 1 costs 3.06
 /// nanoseconds per input byte less and 27.3 per cent more representation. Depths 32 and 128
 /// buy nothing a bounded-horizon parse wants, because at their cost a parser that looks one
 /// position further ahead on a shallower chain produces a cheaper parse.
-pub const SEARCH_DEPTH: u32 = 8;
+pub const CHAIN_DEPTH_FAST: u32 = 8;
+
+/// The candidate positions a BALANCED search may compare.
+///
+/// Thirty-two, selected as the production BALANCED operating point. The state is the same
+/// head and link tables at any depth; only the walk bound moves.
+pub const CHAIN_DEPTH_BALANCED: u32 = 32;
 
 /// The head-table entries, one per four window bytes.
 pub const HEAD_ENTRIES: usize = 16_384;
@@ -103,6 +109,7 @@ pub struct BoundedHashChain {
     head: Box<[u32]>,
     link: Box<[u32]>,
     kernel: Kernel,
+    depth: u32,
 }
 
 impl Default for BoundedHashChain {
@@ -112,22 +119,37 @@ impl Default for BoundedHashChain {
 }
 
 impl BoundedHashChain {
-    /// An empty chain, on the kernel this build selected.
+    /// An empty chain at the FAST depth, on the kernel this build selected.
     #[must_use]
     pub fn new() -> Self {
         Self::with_kernel(simd::SELECTED)
     }
 
-    /// An empty chain, on a named kernel.
+    /// An empty chain at the FAST depth, on a named kernel.
     ///
     /// The kernel changes speed and never the match a search reports. A caller names one to
     /// compare two of them or to reproduce a result on the scalar path.
     #[must_use]
     pub fn with_kernel(kernel: Kernel) -> Self {
+        Self::with_depth_and_kernel(CHAIN_DEPTH_FAST, kernel)
+    }
+
+    /// An empty chain at `depth`, on the kernel this build selected.
+    ///
+    /// The depth bounds the walk only; the tables are the same at any depth.
+    #[must_use]
+    pub fn with_depth(depth: u32) -> Self {
+        Self::with_depth_and_kernel(depth, simd::SELECTED)
+    }
+
+    /// An empty chain at `depth`, on a named kernel.
+    #[must_use]
+    pub fn with_depth_and_kernel(depth: u32, kernel: Kernel) -> Self {
         Self {
             head: vec![EMPTY; HEAD_ENTRIES].into_boxed_slice(),
             link: vec![EMPTY; LINK_ENTRIES].into_boxed_slice(),
             kernel,
+            depth,
         }
     }
 
@@ -135,6 +157,12 @@ impl BoundedHashChain {
     #[must_use]
     pub const fn kernel(&self) -> Kernel {
         self.kernel
+    }
+
+    /// The walk bound this chain searches under.
+    #[must_use]
+    pub const fn depth(&self) -> u32 {
+        self.depth
     }
 
     /// Discards every position the structure holds.
@@ -172,16 +200,34 @@ impl BoundedHashChain {
     /// and a tie goes to the smaller distance. No candidate's position in the walk, and no
     /// address, takes part in it.
     pub fn step(&mut self, data: &[u8], at: usize) -> Found {
+        let found = self.find(data, at);
+        self.insert(data, at);
+        found
+    }
+
+    /// Searches at `at` without inserting it.
+    ///
+    /// What a lazy parser reads for its current and lookahead candidates. The walk,
+    /// the tie-break, and the termination read exactly what `step` reads; only the
+    /// insert is deferred to the caller, which inserts every position exactly once.
+    #[must_use]
+    pub fn peek(&self, data: &[u8], at: usize) -> Found {
+        self.find(data, at)
+    }
+
+    /// The best match at `at` under this chain's depth, without inserting.
+    fn find(&self, data: &[u8], at: usize) -> Found {
         let mut found = Found::default();
         let Some(slot) = self.slot(data, at) else {
             return found;
         };
         let cap = (MAX_MATCH_LENGTH as usize).min(data.len().saturating_sub(at));
         let oldest = at.saturating_sub(WINDOW as usize);
+        let depth = self.depth;
         let mut candidate = self.head.get(slot).copied().unwrap_or(EMPTY);
         let mut best_length = 0u32;
         let mut best_distance = 0u32;
-        while candidate != EMPTY && found.candidates < SEARCH_DEPTH {
+        while candidate != EMPTY && found.candidates < depth {
             let position = candidate as usize;
             // A link that is not behind the position, or is older than the window, ends the
             // walk. Nothing reachable past it is newer.
@@ -215,7 +261,6 @@ impl BoundedHashChain {
                 distance: best_distance,
             });
         }
-        self.link_in(slot, at);
         found
     }
 
@@ -436,8 +481,8 @@ impl SingleHash {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedHashChain, EMPTY, HEAD_ENTRIES, LINK_ENTRIES, SEARCH_DEPTH, SINGLE_ENTRIES,
-        SINGLE_STATE_BYTES, STATE_BYTES, SingleHash,
+        BoundedHashChain, CHAIN_DEPTH_BALANCED, CHAIN_DEPTH_FAST, EMPTY, HEAD_ENTRIES,
+        LINK_ENTRIES, SINGLE_ENTRIES, SINGLE_STATE_BYTES, STATE_BYTES, SingleHash,
     };
     use crate::sequence::{MAX_MATCH_LENGTH, MIN_MATCH, Match, WINDOW};
     use crate::simd::{ALL, Kernel};
@@ -498,10 +543,11 @@ mod tests {
         for (name, data) in adversarial(16_384) {
             for &kernel in ALL {
                 let mut finder = BoundedHashChain::with_kernel(kernel);
+                assert_eq!(finder.depth(), CHAIN_DEPTH_FAST);
                 for at in 0..data.len() {
                     let found = finder.step(&data, at);
                     assert!(
-                        found.candidates <= SEARCH_DEPTH,
+                        found.candidates <= CHAIN_DEPTH_FAST,
                         "{name} on {} compared {} candidates at {at}",
                         kernel.name(),
                         found.candidates
@@ -510,7 +556,189 @@ mod tests {
                 }
             }
         }
-        assert_eq!(peak, SEARCH_DEPTH, "no shape reached the bound");
+        assert_eq!(peak, CHAIN_DEPTH_FAST, "no shape reached the bound");
+    }
+
+    #[test]
+    fn a_balanced_search_compares_at_most_thirty_two() {
+        let mut peak = 0u32;
+        for (name, data) in adversarial(16_384) {
+            for &kernel in ALL {
+                let mut finder =
+                    BoundedHashChain::with_depth_and_kernel(CHAIN_DEPTH_BALANCED, kernel);
+                assert_eq!(finder.depth(), CHAIN_DEPTH_BALANCED);
+                for at in 0..data.len() {
+                    let found = finder.step(&data, at);
+                    assert!(
+                        found.candidates <= CHAIN_DEPTH_BALANCED,
+                        "{name} on {} compared {} candidates at {at}",
+                        kernel.name(),
+                        found.candidates
+                    );
+                    peak = peak.max(found.candidates);
+                }
+            }
+        }
+        assert_eq!(
+            peak, CHAIN_DEPTH_BALANCED,
+            "no shape reached the balanced bound"
+        );
+    }
+
+    #[test]
+    fn the_depth_constructor_names_its_bound() {
+        let fast = BoundedHashChain::new();
+        assert_eq!(fast.depth(), CHAIN_DEPTH_FAST);
+        let balanced = BoundedHashChain::with_depth(CHAIN_DEPTH_BALANCED);
+        assert_eq!(balanced.depth(), CHAIN_DEPTH_BALANCED);
+        assert_eq!(CHAIN_DEPTH_FAST, 8);
+        assert_eq!(CHAIN_DEPTH_BALANCED, 32);
+    }
+
+    #[test]
+    fn a_balanced_search_reports_inside_every_domain() {
+        let mut shapes = adversarial(8_192);
+        shapes.push(("noise", noise(8_192, SEED)));
+        for (name, data) in shapes {
+            let mut finder = BoundedHashChain::with_depth(CHAIN_DEPTH_BALANCED);
+            for at in 0..data.len() {
+                let found = finder.step(&data, at);
+                assert!(found.candidates <= CHAIN_DEPTH_BALANCED, "{name} at {at}");
+                let Some(matched) = found.matched else {
+                    continue;
+                };
+                assert!(matched.length >= MIN_MATCH, "{name} at {at}");
+                assert!(matched.length <= MAX_MATCH_LENGTH, "{name} at {at}");
+                assert!(matched.distance >= 1, "{name} at {at}");
+                assert!(matched.distance <= WINDOW, "{name} at {at}");
+                assert!(matched.distance as usize <= at, "{name} at {at}");
+                let end = at.saturating_add(matched.length as usize);
+                assert!(end <= data.len(), "{name} at {at}");
+                assert_eq!(
+                    copied(&data, at, matched),
+                    data.get(at..end).unwrap_or_default(),
+                    "{name} at {at}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_balanced_tie_break_takes_the_longest_and_then_the_nearest() {
+        let mut equal = vec![b'.'; 64];
+        for start in [0usize, 8, 16] {
+            for (offset, byte) in b"WXYZAB".iter().enumerate() {
+                if let Some(slot) = equal.get_mut(start.saturating_add(offset)) {
+                    *slot = *byte;
+                }
+            }
+        }
+        let mut finder = BoundedHashChain::with_depth(CHAIN_DEPTH_BALANCED);
+        for at in 0..16usize {
+            let _ = finder.step(&equal, at);
+        }
+        let found = finder.step(&equal, 16);
+        assert_eq!(
+            found.matched,
+            Some(Match {
+                length: 8,
+                distance: 8
+            }),
+            "an equal-length tie goes to the nearer candidate at depth 32"
+        );
+    }
+
+    #[test]
+    fn a_balanced_window_bounds_a_candidate() {
+        let window = WINDOW as usize;
+        for extra in [0usize, 1] {
+            let later = window.saturating_add(extra);
+            let mut data = noise(later.saturating_add(64), SEED ^ extra as u64);
+            for offset in 0..16usize {
+                let byte = data.get(offset).copied().unwrap_or(0);
+                if let Some(slot) = data.get_mut(later.saturating_add(offset)) {
+                    *slot = byte;
+                }
+            }
+            let mut finder = BoundedHashChain::with_depth(CHAIN_DEPTH_BALANCED);
+            finder.insert(&data, 0);
+            let found = finder.step(&data, later);
+            if extra == 0 {
+                assert_eq!(
+                    found.matched.map(|matched| matched.distance),
+                    Some(WINDOW),
+                    "a candidate exactly one window back is reachable at depth 32"
+                );
+            } else {
+                assert_eq!(
+                    found.matched, None,
+                    "a candidate past the window is not reachable at depth 32"
+                );
+                assert_eq!(found.candidates, 0, "and it is not even compared");
+            }
+        }
+    }
+
+    #[test]
+    fn a_balanced_slide_moves_every_position_by_one_window() {
+        let window = WINDOW as usize;
+        let mut data = noise(window.saturating_mul(2), SEED ^ 0x11);
+        for offset in 0..16usize {
+            let byte = data
+                .get(window.saturating_add(offset))
+                .copied()
+                .unwrap_or(0);
+            if let Some(slot) = data.get_mut(window.saturating_add(100).saturating_add(offset)) {
+                *slot = byte;
+            }
+        }
+        let mut finder = BoundedHashChain::with_depth(CHAIN_DEPTH_BALANCED);
+        finder.insert(&data, window);
+        finder.slide();
+        let slid = data.get(window..).unwrap_or_default();
+        let found = finder.step(slid, 100);
+        assert_eq!(
+            found.matched.map(|matched| matched.distance),
+            Some(100),
+            "the position the slide moved is found at its new index at depth 32"
+        );
+    }
+
+    #[test]
+    fn a_balanced_reset_discards_every_position() {
+        let data = vec![3u8; 1_024];
+        let mut finder = BoundedHashChain::with_depth(CHAIN_DEPTH_BALANCED);
+        for at in 0..64usize {
+            let _ = finder.step(&data, at);
+        }
+        assert!(finder.step(&data, 64).matched.is_some());
+        finder.reset();
+        assert!(finder.head.iter().all(|entry| *entry == EMPTY));
+        assert!(finder.link.iter().all(|entry| *entry == EMPTY));
+        assert_eq!(finder.step(&data, 64).matched, None);
+    }
+
+    #[test]
+    fn every_kernel_reports_the_same_balanced_matches() {
+        let mut shapes = adversarial(4_096);
+        shapes.push(("noise", noise(4_096, SEED ^ 0x22)));
+        for (name, data) in shapes {
+            let mut finders: Vec<BoundedHashChain> = ALL
+                .iter()
+                .map(|&k| BoundedHashChain::with_depth_and_kernel(CHAIN_DEPTH_BALANCED, k))
+                .collect();
+            for at in 0..data.len() {
+                let mut expected = None;
+                for (index, finder) in finders.iter_mut().enumerate() {
+                    let found = finder.step(&data, at);
+                    if index == 0 {
+                        expected = Some(found);
+                    } else {
+                        assert_eq!(Some(found), expected, "{name} at {at}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

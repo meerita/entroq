@@ -138,6 +138,36 @@ impl Alphabet {
         lead.saturating_add(buckets).saturating_add(terminal)
     }
 
+    /// The widest span any one stream's histogram allocates over.
+    ///
+    /// The per-block histograms size one vector per alphabet, so the transient
+    /// counts scale with the sum of the four spans and no single one passes this.
+    #[must_use]
+    pub(crate) const fn max_size() -> u32 {
+        let run = Self::LiteralRun.size();
+        let length = Self::MatchLength.size();
+        let distance = Self::MatchDistance.size();
+        let widest = if run > length { run } else { length };
+        let widest = if widest > distance { widest } else { distance };
+        if Self::LiteralByte.size() > widest {
+            Self::LiteralByte.size()
+        } else {
+            widest
+        }
+    }
+
+    /// The spans of the four streams added together.
+    ///
+    /// Four histograms, one per alphabet, each holding its span in 64-bit counts.
+    #[must_use]
+    pub(crate) const fn total_size() -> u32 {
+        Self::LiteralByte
+            .size()
+            .saturating_add(Self::LiteralRun.size())
+            .saturating_add(Self::MatchLength.size())
+            .saturating_add(Self::MatchDistance.size())
+    }
+
     /// The symbol that ends a block after a literal run no match follows.
     ///
     /// The last symbol of the match-length alphabet, and of no other.

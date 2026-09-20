@@ -5,7 +5,7 @@ class: reference
 audience: someone reading, reproducing, or citing an Entroq measurement
 order: 2
 version_axes: [encoder_version, harness_version]
-encoder_version: 0.0.0. One encode path, no mode, a window of 65 536 bytes and a block of 65 536 input bytes.
+encoder_version: 0.1.0. Two encoder modes, FAST and BALANCED, at a window of 65 536 bytes and a block of 65 536 input bytes.
 harness_version: 0.0.0
 ---
 
@@ -76,12 +76,14 @@ result was produced with. It is not a claim that the build is bit reproducible.
 ## Operating points
 
 A competitor is measured across the points its project exposes, not at one default level.
-Entroq exposes one, because this revision admits no mode: it ships one encode path, with one
-match finder, one parser, one representation, and one block length.
+Entroq exposes two, in one group: FAST is the default, a single-entry match table of 16 384
+entries behind a tag gate, an adaptive skip over searched misses, and a greedy parse. BALANCED
+is a bounded hash chain at depth 32 feeding a length-lazy depth-1 parse, carrying the same
+skip.
 
 | Codec | Points | Groups |
 |---|---|---|
-| Entroq | `default` | `default` |
+| Entroq | `fast`, `balanced` | `default` |
 | LZ4 | `fast-1`, `fast-3`, `fast-5`, `fast-9`, `hc-1`, `hc-4`, `hc-9`, `hc-12` | `fast`, `hc` |
 | Zstandard | `level-1`, `level-3`, `level-6`, `level-9`, `level-12`, `level-15`, `level-19`, `level-22` | `low`, `high`, `max` |
 | Brotli | `q0`, `q2`, `q5`, `q9`, `q11` | `low`, `high`, `max` |
@@ -153,9 +155,9 @@ meaning.
 
 ## Measured numbers
 
-Source: a gate-tier campaign sealed at one revision, 48 of 48 segments, 501 seconds. It holds
-572 measured rows over 22 corpus entries: 22 Entroq rows, one per entry at the one operating
-point this revision exposes, and 550 competitor rows. The six tables below are the entries
+Source: a gate-tier campaign sealed at one revision, 48 of 48 segments, 197 seconds. It holds
+594 measured rows over 22 corpus entries: 44 Entroq rows, two per entry at the two operating
+points this revision exposes, and 550 competitor rows. The six tables below are the entries
 that show the most about codec behavior; the campaign measured the rest.
 
 Every row of every table shares this scope:
@@ -163,10 +165,12 @@ Every row of every table shares this scope:
 ```text
 machine       Apple M1 Pro, 10 cores, 16 GiB, macOS Darwin 25.5.0, aarch64
 build         release profile, rustc 1.98.1
-Entroq        encoder version 0.0.0. One frame, resource class small, regions independent,
+Entroq        encoder version 0.1.0. One frame, resource class small, regions independent,
               a window of 65 536 bytes, a region of 1 048 576 input bytes, a block of
-              65 536 input bytes. A single-entry match table of 16 384 entries behind a tag
-              gate, an adaptive skip over searched misses, and a greedy parse
+              65 536 input bytes. FAST: a single-entry match table of 16 384 entries behind a
+              tag gate, an adaptive skip over searched misses, and a greedy parse. BALANCED:
+              a bounded hash chain at depth 32 feeding a length-lazy depth-1 parse, carrying
+              the same skip
 competitors   LZ4 v1.10.0, Zstandard v1.5.7, Brotli v1.2.0, Snappy 1.2.2, zlib v1.3.2,
               each built from the commit named above
 threads       1
@@ -182,267 +186,273 @@ throughput beside it did not repeat closely even within its own segment.
 
 ### project-source-small
 
-Source text at the small class. Small class, 32768 bytes.
-
 | Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Entroq | `default` | 10.719 | 3057 | 313.8 | 0.046 | 562.9 | 0.057 |
-| LZ4 | `fast-1` | 5.587 | 5865 | 1998.8 | 0.005 | 7178.1 | 0.018 |
-| LZ4 | `fast-3` | 5.599 | 5852 | 2041.2 | 0.128 | 7383.5 | 0.054 |
-| LZ4 | `fast-5` | 5.496 | 5962 | 2057.3 | 0.018 | 7425.3 | 0.010 |
-| LZ4 | `fast-9` | 5.351 | 6124 | 2046.2 | 0.021 | 7435.4 | 0.023 |
-| LZ4 | `hc-1` | 8.478 | 3865 | 2201.3 | 0.025 | 11736.4 | 0.025 |
-| LZ4 | `hc-4` | 14.397 | 2276 | 534.9 | 0.048 | 21099.8 | 0.050 |
-| LZ4 | `hc-9` | 14.888 | 2201 | 403.0 | 0.123 | 21801.7 | 0.023 |
-| LZ4 | `hc-12` | 15.170 | 2160 | 50.1 | 0.025 | 22459.2 | 0.024 |
-| Snappy | `default` | 6.861 | 4776 | 2581.0 | 0.064 | 6696.9 | 0.073 |
-| zlib | `level-1` | 10.304 | 3180 | 962.3 | 0.159 | 1760.7 | 0.212 |
-| zlib | `level-6` | 19.692 | 1664 | 279.9 | 0.184 | 2410.8 | 0.237 |
-| zlib | `level-9` | 19.859 | 1650 | 181.0 | 0.272 | 2426.9 | 0.152 |
-| Zstandard | `level-1` | 11.130 | 2944 | 1080.5 | 0.018 | 2935.7 | 0.031 |
-| Zstandard | `level-3` | 14.309 | 2290 | 1508.8 | 0.037 | 3970.0 | 0.016 |
-| Zstandard | `level-6` | 16.744 | 1957 | 333.7 | 0.214 | 4652.6 | 0.030 |
-| Zstandard | `level-9` | 19.230 | 1704 | 215.1 | 0.101 | 5305.7 | 0.014 |
-| Zstandard | `level-12` | 19.692 | 1664 | 72.4 | 0.046 | 6055.8 | 0.009 |
-| Zstandard | `level-15` | 20.818 | 1574 | 10.8 | 0.010 | 5496.1 | 0.096 |
-| Zstandard | `level-19` | 21.347 | 1535 | 1.9 | 0.019 | 5523.0 | 0.022 |
-| Zstandard | `level-22` | 21.347 | 1535 | 1.8 | 0.094 | 5200.4 | 0.107 |
-| Brotli | `q0` | 8.219 | 3987 | 1265.9 | 0.135 | 1132.7 | 0.058 |
-| Brotli | `q2` | 11.405 | 2873 | 512.6 | 0.198 | 1471.1 | 0.304 |
-| Brotli | `q5` | 19.219 | 1705 | 244.6 | 0.326 | 2699.8 | 0.301 |
-| Brotli | `q9` | 21.154 | 1549 | 240.4 | 0.142 | 3025.7 | 0.138 |
-| Brotli | `q11` | 22.291 | 1470 | 0.7 | 0.059 | 2696.5 | 0.016 |
+| Entroq | `fast` | 10.719 | 3057 | 307.5 | 0.203 | 517.5 | 0.274 |
+| Entroq | `balanced` | 18.094 | 1811 | 141.1 | 0.189 | 807.4 | 0.151 |
+| LZ4 | `fast-1` | 5.587 | 5865 | 1880.6 | 0.157 | 6879.7 | 0.232 |
+| LZ4 | `fast-3` | 5.599 | 5852 | 1960.5 | 0.148 | 7246.4 | 0.196 |
+| LZ4 | `fast-5` | 5.496 | 5962 | 1921.8 | 0.155 | 7294.7 | 0.155 |
+| LZ4 | `fast-9` | 5.351 | 6124 | 1989.7 | 0.119 | 7433.8 | 0.219 |
+| LZ4 | `hc-1` | 8.478 | 3865 | 2179.9 | 0.040 | 11089.0 | 0.103 |
+| LZ4 | `hc-4` | 14.397 | 2276 | 512.9 | 0.185 | 19859.4 | 0.093 |
+| LZ4 | `hc-9` | 14.888 | 2201 | 373.5 | 0.297 | 20608.8 | 0.098 |
+| LZ4 | `hc-12` | 15.170 | 2160 | 48.2 | 0.111 | 21614.8 | 0.111 |
+| Snappy | `default` | 6.861 | 4776 | 2604.6 | 0.085 | 6676.4 | 0.158 |
+| zlib | `level-1` | 10.304 | 3180 | 970.7 | 0.333 | 1535.6 | 0.035 |
+| zlib | `level-6` | 19.692 | 1664 | 284.4 | 0.195 | 2197.4 | 0.113 |
+| zlib | `level-9` | 19.859 | 1650 | 182.0 | 0.218 | 2338.2 | 0.102 |
+| Zstandard | `level-1` | 11.130 | 2944 | 1055.3 | 0.131 | 2949.9 | 0.027 |
+| Zstandard | `level-3` | 14.309 | 2290 | 1519.6 | 0.024 | 3923.4 | 0.303 |
+| Zstandard | `level-6` | 16.744 | 1957 | 325.3 | 0.247 | 4537.2 | 0.167 |
+| Zstandard | `level-9` | 19.230 | 1704 | 194.1 | 0.302 | 5317.8 | 0.057 |
+| Zstandard | `level-12` | 19.692 | 1664 | 71.9 | 0.149 | 6018.0 | 0.095 |
+| Zstandard | `level-15` | 20.818 | 1574 | 10.5 | 0.067 | 5465.0 | 0.060 |
+| Zstandard | `level-19` | 21.347 | 1535 | 1.9 | 0.061 | 5527.7 | 0.041 |
+| Zstandard | `level-22` | 21.347 | 1535 | 1.8 | 0.040 | 5522.1 | 0.106 |
+| Brotli | `q0` | 8.219 | 3987 | 1256.7 | 0.052 | 1128.6 | 0.055 |
+| Brotli | `q2` | 11.405 | 2873 | 521.0 | 0.229 | 1411.4 | 0.254 |
+| Brotli | `q5` | 19.219 | 1705 | 273.4 | 0.170 | 2705.9 | 0.159 |
+| Brotli | `q9` | 21.154 | 1549 | 210.9 | 0.311 | 2931.7 | 0.129 |
+| Brotli | `q11` | 22.291 | 1470 | 0.8 | 0.009 | 2714.2 | 0.055 |
 
 ### project-json-medium
 
-JSON records, generated from a recorded seed. Medium class, 262144 bytes.
-
 | Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Entroq | `default` | 4.863 | 53905 | 146.1 | 0.068 | 287.8 | 0.058 |
-| LZ4 | `fast-1` | 3.641 | 71999 | 977.4 | 0.093 | 4734.0 | 0.029 |
-| LZ4 | `fast-3` | 3.455 | 75871 | 944.7 | 0.132 | 4762.7 | 0.104 |
-| LZ4 | `fast-5` | 3.396 | 77203 | 1023.5 | 0.082 | 4702.1 | 0.072 |
-| LZ4 | `fast-9` | 3.292 | 79641 | 983.5 | 0.051 | 4723.3 | 0.078 |
-| LZ4 | `hc-1` | 3.886 | 67466 | 555.6 | 0.125 | 4653.5 | 0.109 |
-| LZ4 | `hc-4` | 4.880 | 53723 | 165.9 | 0.112 | 5693.7 | 0.068 |
-| LZ4 | `hc-9` | 5.330 | 49180 | 50.6 | 0.082 | 6838.6 | 0.073 |
-| LZ4 | `hc-12` | 5.412 | 48438 | 18.5 | 0.026 | 6615.6 | 0.096 |
-| Snappy | `default` | 3.397 | 77166 | 1206.0 | 0.057 | 3917.4 | 0.003 |
-| zlib | `level-1` | 4.801 | 54601 | 308.1 | 0.142 | 780.3 | 0.320 |
-| zlib | `level-6` | 6.515 | 40236 | 93.6 | 0.126 | 911.9 | 0.267 |
-| zlib | `level-9` | 6.831 | 38376 | 33.2 | 0.058 | 911.8 | 0.208 |
-| Zstandard | `level-1` | 5.595 | 46852 | 668.5 | 0.042 | 1902.5 | 0.726 |
-| Zstandard | `level-3` | 5.478 | 47853 | 560.5 | 0.057 | 2081.9 | 0.096 |
-| Zstandard | `level-6` | 6.423 | 40816 | 143.9 | 0.138 | 2515.6 | 0.083 |
-| Zstandard | `level-9` | 7.068 | 37089 | 76.3 | 0.038 | 2868.9 | 0.075 |
-| Zstandard | `level-12` | 7.531 | 34809 | 22.3 | 0.163 | 3130.1 | 0.076 |
-| Zstandard | `level-15` | 7.932 | 33049 | 7.2 | 0.129 | 3036.4 | 0.121 |
-| Zstandard | `level-19` | 7.995 | 32787 | 3.5 | 0.155 | 3054.1 | 0.100 |
-| Zstandard | `level-22` | 7.995 | 32787 | 2.4 | 0.124 | 2911.4 | 0.077 |
-| Brotli | `q0` | 4.313 | 60785 | 778.9 | 0.372 | 668.2 | 0.180 |
-| Brotli | `q2` | 5.575 | 47018 | 279.4 | 0.177 | 726.6 | 0.143 |
-| Brotli | `q5` | 6.706 | 39092 | 89.3 | 0.185 | 882.4 | 0.193 |
-| Brotli | `q9` | 7.229 | 36263 | 51.3 | 0.122 | 914.1 | 0.379 |
-| Brotli | `q11` | 8.416 | 31147 | 0.9 | 0.047 | 826.4 | 0.058 |
+| Entroq | `fast` | 4.863 | 53905 | 141.8 | 0.096 | 268.5 | 0.181 |
+| Entroq | `balanced` | 6.521 | 40202 | 52.1 | 0.143 | 389.6 | 0.216 |
+| LZ4 | `fast-1` | 3.641 | 71999 | 878.8 | 0.211 | 4411.9 | 0.092 |
+| LZ4 | `fast-3` | 3.455 | 75871 | 986.9 | 0.113 | 4688.2 | 0.055 |
+| LZ4 | `fast-5` | 3.396 | 77203 | 975.1 | 0.296 | 4762.6 | 0.049 |
+| LZ4 | `fast-9` | 3.292 | 79641 | 968.8 | 0.149 | 4862.0 | 0.073 |
+| LZ4 | `hc-1` | 3.886 | 67466 | 567.9 | 0.101 | 4646.5 | 0.056 |
+| LZ4 | `hc-4` | 4.880 | 53723 | 164.9 | 0.128 | 5798.6 | 0.109 |
+| LZ4 | `hc-9` | 5.330 | 49180 | 49.8 | 0.123 | 7085.0 | 0.080 |
+| LZ4 | `hc-12` | 5.412 | 48438 | 17.5 | 0.120 | 6743.3 | 0.154 |
+| Snappy | `default` | 3.397 | 77166 | 1100.1 | 0.105 | 3681.3 | 0.096 |
+| zlib | `level-1` | 4.801 | 54601 | 311.6 | 0.032 | 750.6 | 0.052 |
+| zlib | `level-6` | 6.515 | 40236 | 95.0 | 0.054 | 918.1 | 0.056 |
+| zlib | `level-9` | 6.831 | 38376 | 33.5 | 0.045 | 910.1 | 0.034 |
+| Zstandard | `level-1` | 5.595 | 46852 | 706.0 | 0.168 | 1867.5 | 0.288 |
+| Zstandard | `level-3` | 5.478 | 47853 | 539.8 | 0.302 | 1978.4 | 0.076 |
+| Zstandard | `level-6` | 6.423 | 40816 | 135.4 | 0.226 | 2507.5 | 0.059 |
+| Zstandard | `level-9` | 7.068 | 37089 | 71.0 | 0.154 | 2888.6 | 0.085 |
+| Zstandard | `level-12` | 7.531 | 34809 | 23.6 | 0.259 | 3153.6 | 0.085 |
+| Zstandard | `level-15` | 7.932 | 33049 | 6.9 | 0.058 | 3069.0 | 0.127 |
+| Zstandard | `level-19` | 7.995 | 32787 | 3.2 | 0.062 | 3024.7 | 0.509 |
+| Zstandard | `level-22` | 7.995 | 32787 | 2.4 | 0.051 | 3035.0 | 0.201 |
+| Brotli | `q0` | 4.313 | 60785 | 760.1 | 0.161 | 646.5 | 0.204 |
+| Brotli | `q2` | 5.575 | 47018 | 274.9 | 0.241 | 764.2 | 0.087 |
+| Brotli | `q5` | 6.706 | 39092 | 94.0 | 0.080 | 870.3 | 0.049 |
+| Brotli | `q9` | 7.229 | 36263 | 53.5 | 0.200 | 955.7 | 0.070 |
+| Brotli | `q11` | 8.416 | 31147 | 0.9 | 0.032 | 826.8 | 0.042 |
 
 ### project-source-medium
 
-Rust and C source text, generated from a recorded seed. Medium class, 1048576 bytes.
-
 | Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Entroq | `default` | 12.233 | 85717 | 305.3 | 0.073 | 484.3 | 0.096 |
-| LZ4 | `fast-1` | 6.026 | 174021 | 1875.8 | 0.031 | 6180.2 | 0.033 |
-| LZ4 | `fast-3` | 6.015 | 174315 | 1884.7 | 0.023 | 6244.6 | 0.044 |
-| LZ4 | `fast-5` | 6.005 | 174622 | 1881.1 | 0.018 | 6258.6 | 0.032 |
-| LZ4 | `fast-9` | 6.000 | 174773 | 1879.4 | 0.025 | 6260.2 | 0.027 |
-| LZ4 | `hc-1` | 9.422 | 111293 | 2298.9 | 0.056 | 8009.5 | 0.051 |
-| LZ4 | `hc-4` | 20.108 | 52146 | 427.8 | 0.094 | 13294.1 | 0.092 |
-| LZ4 | `hc-9` | 24.835 | 42221 | 145.3 | 0.034 | 16416.1 | 0.068 |
-| LZ4 | `hc-12` | 26.209 | 40008 | 39.4 | 0.032 | 15354.3 | 0.109 |
-| Snappy | `default` | 7.196 | 145711 | 2453.3 | 0.275 | 6563.9 | 0.014 |
-| zlib | `level-1` | 11.528 | 90957 | 629.4 | 0.102 | 1453.0 | 0.087 |
-| zlib | `level-6` | 29.997 | 34956 | 239.8 | 0.043 | 2532.8 | 0.039 |
-| zlib | `level-9` | 31.104 | 33712 | 127.3 | 0.064 | 2534.8 | 0.197 |
-| Zstandard | `level-1` | 14.677 | 71445 | 1570.2 | 0.092 | 3682.4 | 0.057 |
-| Zstandard | `level-3` | 17.101 | 61318 | 1704.4 | 0.295 | 4531.1 | 0.095 |
-| Zstandard | `level-6` | 23.171 | 45253 | 320.4 | 0.098 | 6410.1 | 0.042 |
-| Zstandard | `level-9` | 28.063 | 37365 | 243.2 | 0.096 | 8416.7 | 0.078 |
-| Zstandard | `level-12` | 33.152 | 31629 | 140.6 | 0.085 | 9482.3 | 0.076 |
-| Zstandard | `level-15` | 39.779 | 26360 | 48.1 | 0.170 | 12234.3 | 0.381 |
-| Zstandard | `level-19` | 42.782 | 24510 | 2.2 | 0.041 | 11732.3 | 0.124 |
-| Zstandard | `level-22` | 43.070 | 24346 | 2.1 | 0.064 | 12646.2 | 0.116 |
-| Brotli | `q0` | 8.897 | 117852 | 1656.3 | 0.090 | 1213.9 | 0.091 |
-| Brotli | `q2` | 13.068 | 80242 | 536.4 | 0.127 | 1455.7 | 0.254 |
-| Brotli | `q5` | 26.484 | 39593 | 288.4 | 0.092 | 3087.1 | 0.126 |
-| Brotli | `q9` | 36.194 | 28971 | 141.9 | 0.073 | 4814.6 | 0.628 |
-| Brotli | `q11` | 40.558 | 25854 | 0.6 | 0.006 | 5318.2 | 0.050 |
+| Entroq | `fast` | 12.233 | 85717 | 287.9 | 0.137 | 488.9 | 0.109 |
+| Entroq | `balanced` | 27.881 | 37609 | 117.3 | 0.085 | 919.9 | 0.093 |
+| LZ4 | `fast-1` | 6.026 | 174021 | 1784.4 | 0.076 | 6010.5 | 0.082 |
+| LZ4 | `fast-3` | 6.015 | 174315 | 1873.0 | 0.040 | 5566.4 | 0.272 |
+| LZ4 | `fast-5` | 6.005 | 174622 | 1860.6 | 0.063 | 6247.7 | 0.109 |
+| LZ4 | `fast-9` | 6.000 | 174773 | 1749.2 | 0.187 | 6235.4 | 0.207 |
+| LZ4 | `hc-1` | 9.422 | 111293 | 2144.5 | 0.145 | 8192.0 | 0.024 |
+| LZ4 | `hc-4` | 20.108 | 52146 | 405.0 | 0.144 | 13052.7 | 0.120 |
+| LZ4 | `hc-9` | 24.835 | 42221 | 138.2 | 0.115 | 16589.0 | 0.088 |
+| LZ4 | `hc-12` | 26.209 | 40008 | 38.3 | 0.025 | 15817.5 | 0.071 |
+| Snappy | `default` | 7.196 | 145711 | 2426.8 | 0.056 | 6326.3 | 0.162 |
+| zlib | `level-1` | 11.528 | 90957 | 683.1 | 0.032 | 1438.3 | 0.022 |
+| zlib | `level-6` | 29.997 | 34956 | 245.4 | 0.040 | 2524.2 | 0.033 |
+| zlib | `level-9` | 31.104 | 33712 | 127.7 | 0.067 | 2559.6 | 0.131 |
+| Zstandard | `level-1` | 14.677 | 71445 | 1521.1 | 0.125 | 3737.7 | 0.053 |
+| Zstandard | `level-3` | 17.101 | 61318 | 1604.5 | 0.220 | 4550.0 | 0.075 |
+| Zstandard | `level-6` | 23.171 | 45253 | 317.3 | 0.080 | 6304.1 | 0.128 |
+| Zstandard | `level-9` | 28.063 | 37365 | 232.3 | 0.139 | 8133.7 | 0.102 |
+| Zstandard | `level-12` | 33.152 | 31629 | 137.1 | 0.071 | 9404.3 | 0.067 |
+| Zstandard | `level-15` | 39.779 | 26360 | 47.2 | 0.158 | 11570.5 | 0.413 |
+| Zstandard | `level-19` | 42.782 | 24510 | 2.1 | 0.033 | 12069.9 | 0.074 |
+| Zstandard | `level-22` | 43.070 | 24346 | 2.0 | 0.006 | 11842.8 | 0.226 |
+| Brotli | `q0` | 8.897 | 117852 | 1620.5 | 0.098 | 1157.5 | 0.123 |
+| Brotli | `q2` | 13.068 | 80242 | 561.3 | 0.064 | 1475.5 | 0.037 |
+| Brotli | `q5` | 26.484 | 39593 | 301.5 | 0.048 | 3126.2 | 0.170 |
+| Brotli | `q9` | 36.194 | 28971 | 144.8 | 0.056 | 4594.0 | 0.821 |
+| Brotli | `q11` | 40.558 | 25854 | 0.6 | 0.023 | 4905.6 | 0.224 |
 
 ### project-high-entropy-medium
 
-Incompressible bytes, generated from a recorded seed. Medium class, 1048576 bytes.
-
 | Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Entroq | `default` | 1.000 | 1048674 | 1429.9 | 0.051 | 24892.0 | 0.139 |
-| LZ4 | `fast-1` | 0.996 | 1052690 | 31068.9 | 0.177 | 59211.5 | 0.174 |
-| LZ4 | `fast-3` | 0.996 | 1052690 | 29262.0 | 0.126 | 57065.4 | 0.150 |
-| LZ4 | `fast-5` | 0.996 | 1052690 | 32514.0 | 0.234 | 59352.2 | 0.165 |
-| LZ4 | `fast-9` | 0.996 | 1052690 | 31935.7 | 0.174 | 59211.5 | 0.153 |
-| LZ4 | `hc-1` | 0.996 | 1052690 | 31222.5 | 0.218 | 57456.2 | 0.139 |
-| LZ4 | `hc-4` | 0.996 | 1052681 | 58.9 | 0.075 | 43240.2 | 0.024 |
-| LZ4 | `hc-9` | 0.996 | 1052681 | 59.4 | 0.065 | 43240.2 | 0.033 |
-| LZ4 | `hc-12` | 0.996 | 1052681 | 50.3 | 0.049 | 43240.2 | 0.014 |
-| Snappy | `default` | 1.000 | 1048627 | 30283.8 | 0.290 | 60349.7 | 0.098 |
-| zlib | `level-1` | 1.000 | 1048896 | 65.3 | 0.032 | 62137.8 | 0.057 |
-| zlib | `level-6` | 1.000 | 1048896 | 61.6 | 0.046 | 58390.5 | 0.146 |
-| zlib | `level-9` | 1.000 | 1048896 | 60.2 | 0.032 | 61230.7 | 0.139 |
-| Zstandard | `level-1` | 1.000 | 1048610 | 9645.7 | 0.223 | 65197.8 | 0.119 |
-| Zstandard | `level-3` | 1.000 | 1048609 | 8654.0 | 0.129 | 60349.7 | 0.084 |
-| Zstandard | `level-6` | 1.000 | 1048609 | 4969.6 | 0.039 | 66576.3 | 0.124 |
-| Zstandard | `level-9` | 1.000 | 1048609 | 4572.3 | 0.241 | 61983.6 | 0.214 |
-| Zstandard | `level-12` | 1.000 | 1048609 | 4341.2 | 0.234 | 66223.1 | 0.266 |
-| Zstandard | `level-15` | 1.000 | 1048609 | 530.0 | 0.336 | 64691.0 | 0.121 |
-| Zstandard | `level-19` | 1.000 | 1048609 | 38.8 | 0.214 | 65536.0 | 0.091 |
-| Zstandard | `level-22` | 1.000 | 1048609 | 34.8 | 0.296 | 65536.0 | 0.115 |
-| Brotli | `q0` | 1.000 | 1048581 | 10352.0 | 0.079 | 24916.9 | 0.161 |
-| Brotli | `q2` | 1.000 | 1048581 | 2459.8 | 0.167 | 22469.3 | 0.088 |
-| Brotli | `q5` | 1.000 | 1048581 | 878.7 | 0.233 | 21694.8 | 0.403 |
-| Brotli | `q9` | 1.000 | 1048581 | 318.1 | 0.156 | 23989.9 | 0.180 |
-| Brotli | `q11` | 1.000 | 1048581 | 4.4 | 0.123 | 25165.6 | 0.032 |
+| Entroq | `fast` | 1.000 | 1048674 | 1418.3 | 0.237 | 19166.8 | 0.164 |
+| Entroq | `balanced` | 1.000 | 1048674 | 654.2 | 0.165 | 19225.5 | 0.082 |
+| LZ4 | `fast-1` | 0.996 | 1052690 | 27746.0 | 0.184 | 58796.5 | 0.633 |
+| LZ4 | `fast-3` | 0.996 | 1052690 | 28959.0 | 0.125 | 55069.4 | 0.120 |
+| LZ4 | `fast-5` | 0.996 | 1052690 | 26829.5 | 0.543 | 56423.6 | 0.157 |
+| LZ4 | `fast-9` | 0.996 | 1052690 | 28793.6 | 0.806 | 56299.4 | 0.074 |
+| LZ4 | `hc-1` | 0.996 | 1052690 | 35196.6 | 0.104 | 56426.6 | 0.128 |
+| LZ4 | `hc-4` | 0.996 | 1052681 | 59.2 | 0.039 | 43165.5 | 0.033 |
+| LZ4 | `hc-9` | 0.996 | 1052681 | 58.6 | 0.044 | 43018.5 | 0.103 |
+| LZ4 | `hc-12` | 0.996 | 1052681 | 48.1 | 0.038 | 43165.5 | 0.034 |
+| Snappy | `default` | 1.000 | 1048627 | 33915.8 | 0.092 | 66929.0 | 0.154 |
+| zlib | `level-1` | 1.000 | 1048896 | 65.7 | 0.014 | 65877.7 | 0.244 |
+| zlib | `level-6` | 1.000 | 1048896 | 62.3 | 0.022 | 65364.4 | 0.223 |
+| zlib | `level-9` | 1.000 | 1048896 | 61.6 | 0.022 | 62445.0 | 0.055 |
+| Zstandard | `level-1` | 1.000 | 1048610 | 8814.7 | 0.194 | 61080.9 | 0.129 |
+| Zstandard | `level-3` | 1.000 | 1048609 | 8394.2 | 0.097 | 63072.2 | 0.113 |
+| Zstandard | `level-6` | 1.000 | 1048609 | 5061.5 | 0.041 | 68200.1 | 0.125 |
+| Zstandard | `level-9` | 1.000 | 1048609 | 4635.5 | 0.216 | 63388.7 | 0.186 |
+| Zstandard | `level-12` | 1.000 | 1048609 | 3810.7 | 0.164 | 61680.9 | 0.049 |
+| Zstandard | `level-15` | 1.000 | 1048609 | 537.0 | 0.396 | 61830.1 | 0.049 |
+| Zstandard | `level-19` | 1.000 | 1048609 | 29.3 | 0.554 | 61230.7 | 0.431 |
+| Zstandard | `level-22` | 1.000 | 1048609 | 30.3 | 0.276 | 68570.2 | 0.147 |
+| Brotli | `q0` | 1.000 | 1048581 | 10708.8 | 0.035 | 23989.9 | 0.129 |
+| Brotli | `q2` | 1.000 | 1048581 | 2390.4 | 0.153 | 25653.2 | 0.061 |
+| Brotli | `q5` | 1.000 | 1048581 | 895.5 | 0.168 | 24551.6 | 0.260 |
+| Brotli | `q9` | 1.000 | 1048581 | 332.5 | 0.086 | 24268.1 | 0.297 |
+| Brotli | `q11` | 1.000 | 1048581 | 4.3 | 0.050 | 25317.5 | 0.137 |
 
 ### gutenberg-shakespeare
 
-English literary text, the complete works of Shakespeare. Large class, 5638480 bytes.
-
 | Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Entroq | `default` | 2.337 | 2412291 | 74.9 | 0.027 | 157.6 | 0.027 |
-| LZ4 | `fast-1` | 1.598 | 3527975 | 472.2 | 0.034 | 3944.9 | 0.012 |
-| LZ4 | `fast-3` | 1.455 | 3874515 | 563.1 | 0.031 | 3959.8 | 0.025 |
-| LZ4 | `fast-5` | 1.345 | 4191284 | 669.7 | 0.039 | 3868.3 | 0.048 |
-| LZ4 | `fast-9` | 1.236 | 4562723 | 857.2 | 0.077 | 4035.2 | 0.013 |
-| LZ4 | `hc-1` | 1.909 | 2953359 | 255.4 | 0.056 | 2903.6 | 0.056 |
-| LZ4 | `hc-4` | 2.207 | 2555370 | 69.2 | 0.106 | 3198.6 | 0.093 |
-| LZ4 | `hc-9` | 2.283 | 2469328 | 28.7 | 0.034 | 3481.3 | 0.184 |
-| LZ4 | `hc-12` | 2.313 | 2438082 | 15.6 | 0.100 | 3420.1 | 0.084 |
-| Snappy | `default` | 1.643 | 3430938 | 507.6 | 0.024 | 1886.0 | 0.056 |
-| zlib | `level-1` | 2.232 | 2526146 | 122.9 | 0.022 | 363.8 | 0.062 |
-| zlib | `level-6` | 2.637 | 2138320 | 24.0 | 0.011 | 378.5 | 0.030 |
-| zlib | `level-9` | 2.650 | 2127930 | 18.5 | 0.023 | 379.6 | 0.035 |
-| Zstandard | `level-1` | 2.337 | 2412580 | 439.9 | 0.045 | 1498.1 | 0.007 |
-| Zstandard | `level-3` | 2.679 | 2104953 | 225.8 | 0.131 | 1271.0 | 0.063 |
-| Zstandard | `level-6` | 2.873 | 1962341 | 85.1 | 0.038 | 1249.2 | 0.096 |
-| Zstandard | `level-9` | 2.965 | 1901851 | 51.9 | 0.123 | 1439.2 | 0.061 |
-| Zstandard | `level-12` | 3.046 | 1850924 | 22.1 | 0.197 | 1539.8 | 0.043 |
-| Zstandard | `level-15` | 3.130 | 1801201 | 3.6 | 0.098 | 1421.7 | 0.212 |
-| Zstandard | `level-19` | 3.334 | 1691406 | 2.4 | 0.113 | 1393.1 | 0.207 |
-| Zstandard | `level-22` | 3.334 | 1691408 | 2.1 | 0.046 | 1453.7 | 0.199 |
-| Brotli | `q0` | 2.274 | 2479566 | 295.1 | 0.029 | 292.5 | 0.032 |
-| Brotli | `q2` | 2.565 | 2198605 | 119.6 | 0.061 | 349.3 | 0.042 |
-| Brotli | `q5` | 2.913 | 1935540 | 48.2 | 0.062 | 386.3 | 0.163 |
-| Brotli | `q9` | 3.108 | 1814427 | 14.7 | 0.159 | 500.7 | 0.087 |
-| Brotli | `q11` | 3.367 | 1674501 | 0.7 | 0.000 | 493.6 | 0.146 |
+| Entroq | `fast` | 2.337 | 2412291 | 73.1 | 0.018 | 153.5 | 0.036 |
+| Entroq | `balanced` | 2.685 | 2100016 | 24.8 | 0.062 | 182.0 | 0.036 |
+| LZ4 | `fast-1` | 1.598 | 3527975 | 456.6 | 0.041 | 3706.0 | 0.216 |
+| LZ4 | `fast-3` | 1.455 | 3874515 | 536.7 | 0.045 | 3761.0 | 0.121 |
+| LZ4 | `fast-5` | 1.345 | 4191284 | 617.7 | 0.312 | 3615.7 | 0.141 |
+| LZ4 | `fast-9` | 1.236 | 4562723 | 825.3 | 0.106 | 3875.1 | 0.099 |
+| LZ4 | `hc-1` | 1.909 | 2953359 | 263.2 | 0.021 | 2939.7 | 0.052 |
+| LZ4 | `hc-4` | 2.207 | 2555370 | 69.6 | 0.020 | 3352.8 | 0.130 |
+| LZ4 | `hc-9` | 2.283 | 2469328 | 28.1 | 0.019 | 3467.0 | 0.088 |
+| LZ4 | `hc-12` | 2.313 | 2438082 | 15.3 | 0.034 | 3403.1 | 0.099 |
+| Snappy | `default` | 1.643 | 3430938 | 510.0 | 0.020 | 1848.0 | 0.048 |
+| zlib | `level-1` | 2.232 | 2526146 | 122.6 | 0.015 | 363.1 | 0.053 |
+| zlib | `level-6` | 2.637 | 2138320 | 24.2 | 0.018 | 378.4 | 0.032 |
+| zlib | `level-9` | 2.650 | 2127930 | 18.7 | 0.035 | 384.2 | 0.019 |
+| Zstandard | `level-1` | 2.337 | 2412580 | 427.6 | 0.032 | 1457.3 | 0.055 |
+| Zstandard | `level-3` | 2.679 | 2104953 | 215.6 | 0.053 | 1236.4 | 0.069 |
+| Zstandard | `level-6` | 2.873 | 1962341 | 80.8 | 0.029 | 1252.6 | 0.100 |
+| Zstandard | `level-9` | 2.965 | 1901851 | 50.1 | 0.421 | 1313.2 | 0.175 |
+| Zstandard | `level-12` | 3.046 | 1850924 | 22.0 | 0.235 | 1367.7 | 0.306 |
+| Zstandard | `level-15` | 3.130 | 1801201 | 3.3 | 0.098 | 1495.2 | 0.254 |
+| Zstandard | `level-19` | 3.334 | 1691406 | 2.4 | 0.010 | 1438.7 | 0.220 |
+| Zstandard | `level-22` | 3.334 | 1691408 | 2.4 | 0.008 | 1430.0 | 0.125 |
+| Brotli | `q0` | 2.274 | 2479566 | 304.4 | 0.085 | 302.3 | 0.029 |
+| Brotli | `q2` | 2.565 | 2198605 | 122.8 | 0.055 | 359.7 | 0.047 |
+| Brotli | `q5` | 2.913 | 1935540 | 43.9 | 0.075 | 422.6 | 0.100 |
+| Brotli | `q9` | 3.108 | 1814427 | 14.2 | 0.043 | 505.8 | 0.092 |
+| Brotli | `q11` | 3.367 | 1674501 | 0.8 | 0.000 | 502.8 | 0.094 |
 
 ### project-logs-large
 
-Line-oriented application logs, generated from a recorded seed. Large class, 8388608 bytes.
-
 | Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Entroq | `default` | 3.920 | 2139704 | 127.7 | 0.019 | 262.1 | 0.026 |
-| LZ4 | `fast-1` | 2.874 | 2918436 | 856.8 | 0.010 | 5091.2 | 0.022 |
-| LZ4 | `fast-3` | 2.667 | 3144767 | 952.4 | 0.036 | 5161.8 | 0.016 |
-| LZ4 | `fast-5` | 2.716 | 3089031 | 977.4 | 0.048 | 5052.1 | 0.109 |
-| LZ4 | `fast-9` | 2.509 | 3343188 | 1028.5 | 0.029 | 4979.6 | 0.056 |
-| LZ4 | `hc-1` | 3.130 | 2680172 | 371.2 | 0.040 | 4296.0 | 0.066 |
-| LZ4 | `hc-4` | 3.649 | 2298760 | 126.2 | 0.016 | 4425.4 | 0.009 |
-| LZ4 | `hc-9` | 3.855 | 2176141 | 46.1 | 0.027 | 4988.5 | 0.092 |
-| LZ4 | `hc-12` | 3.916 | 2142253 | 18.7 | 0.011 | 4335.9 | 0.010 |
-| Snappy | `default` | 2.693 | 3114991 | 996.3 | 0.041 | 3402.9 | 0.082 |
-| zlib | `level-1` | 3.699 | 2267654 | 237.0 | 0.061 | 605.1 | 0.060 |
-| zlib | `level-6` | 4.793 | 1750314 | 71.5 | 0.014 | 658.7 | 0.049 |
-| zlib | `level-9` | 5.018 | 1671738 | 32.6 | 0.018 | 669.2 | 0.041 |
-| Zstandard | `level-1` | 4.478 | 1873220 | 664.5 | 0.020 | 1889.3 | 0.061 |
-| Zstandard | `level-3` | 4.428 | 1894602 | 434.3 | 0.077 | 1998.7 | 0.067 |
-| Zstandard | `level-6` | 5.020 | 1670950 | 130.5 | 0.109 | 2321.6 | 0.064 |
-| Zstandard | `level-9` | 5.348 | 1568556 | 76.8 | 0.206 | 2360.9 | 0.422 |
-| Zstandard | `level-12` | 5.527 | 1517666 | 36.2 | 0.050 | 2510.6 | 0.138 |
-| Zstandard | `level-15` | 5.713 | 1468351 | 7.3 | 0.038 | 2677.6 | 0.442 |
-| Zstandard | `level-19` | 6.164 | 1360813 | 2.6 | 0.010 | 2853.5 | 0.373 |
-| Zstandard | `level-22` | 6.164 | 1360813 | 2.7 | 0.023 | 2637.0 | 0.217 |
-| Brotli | `q0` | 3.664 | 2289283 | 573.4 | 0.096 | 528.1 | 0.029 |
-| Brotli | `q2` | 4.297 | 1952286 | 203.8 | 0.073 | 618.7 | 0.079 |
-| Brotli | `q5` | 5.236 | 1602023 | 74.4 | 0.055 | 673.2 | 0.140 |
-| Brotli | `q9` | 5.556 | 1509696 | 24.7 | 0.394 | 746.3 | 0.092 |
-| Brotli | `q11` | 6.337 | 1323781 | 0.8 | 0.000 | 655.0 | 0.171 |
+| Entroq | `fast` | 3.920 | 2139704 | 118.9 | 0.097 | 249.1 | 0.067 |
+| Entroq | `balanced` | 4.891 | 1714939 | 47.8 | 0.062 | 312.6 | 0.069 |
+| LZ4 | `fast-1` | 2.874 | 2918436 | 811.2 | 0.083 | 4810.4 | 0.063 |
+| LZ4 | `fast-3` | 2.667 | 3144767 | 898.1 | 0.090 | 4911.1 | 0.099 |
+| LZ4 | `fast-5` | 2.716 | 3089031 | 914.4 | 0.217 | 4941.6 | 0.107 |
+| LZ4 | `fast-9` | 2.509 | 3343188 | 968.8 | 0.070 | 4729.6 | 0.129 |
+| LZ4 | `hc-1` | 3.130 | 2680172 | 354.6 | 0.036 | 4131.8 | 0.121 |
+| LZ4 | `hc-4` | 3.649 | 2298760 | 121.3 | 0.272 | 4280.1 | 0.143 |
+| LZ4 | `hc-9` | 3.855 | 2176141 | 44.4 | 0.047 | 4918.8 | 0.130 |
+| LZ4 | `hc-12` | 3.916 | 2142253 | 18.1 | 0.031 | 4314.1 | 0.121 |
+| Snappy | `default` | 2.693 | 3114991 | 1037.1 | 0.042 | 3450.3 | 0.016 |
+| zlib | `level-1` | 3.699 | 2267654 | 240.3 | 0.041 | 615.3 | 0.050 |
+| zlib | `level-6` | 4.793 | 1750314 | 72.0 | 0.023 | 674.6 | 0.021 |
+| zlib | `level-9` | 5.018 | 1671738 | 32.8 | 0.031 | 669.9 | 0.038 |
+| Zstandard | `level-1` | 4.478 | 1873220 | 640.3 | 0.150 | 1864.7 | 0.101 |
+| Zstandard | `level-3` | 4.428 | 1894602 | 417.4 | 0.089 | 1940.1 | 0.124 |
+| Zstandard | `level-6` | 5.020 | 1670950 | 117.3 | 0.170 | 2095.6 | 0.226 |
+| Zstandard | `level-9` | 5.348 | 1568556 | 70.9 | 0.114 | 2429.2 | 0.205 |
+| Zstandard | `level-12` | 5.527 | 1517666 | 35.4 | 0.049 | 2664.6 | 0.160 |
+| Zstandard | `level-15` | 5.713 | 1468351 | 6.7 | 0.102 | 2530.1 | 0.273 |
+| Zstandard | `level-19` | 6.164 | 1360813 | 2.5 | 0.044 | 2875.7 | 0.295 |
+| Zstandard | `level-22` | 6.164 | 1360813 | 2.6 | 0.005 | 2890.7 | 0.324 |
+| Brotli | `q0` | 3.664 | 2289283 | 586.3 | 0.048 | 541.2 | 0.037 |
+| Brotli | `q2` | 4.297 | 1952286 | 212.1 | 0.083 | 627.2 | 0.057 |
+| Brotli | `q5` | 5.236 | 1602023 | 71.0 | 0.034 | 713.1 | 0.121 |
+| Brotli | `q9` | 5.556 | 1509696 | 24.6 | 0.051 | 732.1 | 0.235 |
+| Brotli | `q11` | 6.337 | 1323781 | 0.8 | 0.000 | 638.4 | 0.097 |
+
 
 ### Reading these tables
 
 The ratios are properties of the bytes. They reproduce exactly, run to run, and the compressed
 length beside each one is what the codec actually stored.
 
-The throughputs are not stable in the same way. Measured against an earlier campaign on this
-machine, 77 of 550 competitor encode throughputs and 72 of 550 competitor decode throughputs
-moved outside the spread the earlier record states, by up to 46 and 66 per cent. Treat a
-throughput here as the order of magnitude and the shape of the curve, not as a value to compare
-against another published figure. The timing stability section below states what that costs.
+The throughputs are not stable in the same way. Measured against the preceding campaign on this
+machine, all 1 756 competitor readings that are properties of the bytes agree, and 103 of 550
+competitor encode throughputs and 79 of 550 competitor decode throughputs moved outside the
+spread the earlier record states, by up to 29 and 38 per cent. Treat a throughput here as the
+order of magnitude and the shape of the curve, not as a value to compare against another
+published figure. The timing stability section below states what that costs.
 
 ### Where Entroq sits, on this machine, at this revision
 
 This is a description of one gate-tier campaign. It is not a frontier claim, and no operating
 point here is claimed against any competitor.
 
-**The ratio is above LZ4 `fast-1` and Snappy on 16 of the 22 entries.** The six exceptions are
-the three entries no codec compresses, the two sparse entries, and the tiny run of zeros, where
-the run handling of LZ4 and Snappy wins.
+**FAST holds a ratio above LZ4 `fast-1` and Snappy on 16 of the 22 entries.** The six
+exceptions are the three entries no codec compresses, the two sparse entries, and the tiny run
+of zeros, where the run handling of LZ4 and Snappy wins. **BALANCED is at or above FAST on
+every entry**: strictly above on the seventeen compressible entries, from 1.0 per cent on
+project-mixed-medium to 128 per cent on project-source-medium, and equal on the five
+incompressible and RLE entries where both modes store the same bytes.
 
-| Entry | Entroq | LZ4 `fast-1` | Snappy | Zstandard `level-1` |
-|---|---:|---:|---:|---:|
-| project-source-small | 10.719 | 5.587 | 6.861 | 11.130 |
-| project-json-medium | 4.863 | 3.641 | 3.397 | 5.595 |
-| project-source-medium | 12.233 | 6.026 | 7.196 | 14.677 |
-| gutenberg-shakespeare | 2.337 | 1.598 | 1.643 | 2.337 |
-| project-logs-large | 3.920 | 2.874 | 2.693 | 4.478 |
-| project-high-entropy-medium | 1.000 | 0.996 | 1.000 | 1.000 |
+| Entry | FAST | BALANCED | LZ4 `fast-1` | Snappy | Zstandard `level-1` |
+|---|---:|---:|---:|---:|---:|
+| project-source-small | 10.719 | 18.094 | 5.587 | 6.861 | 11.130 |
+| project-json-medium | 4.863 | 6.521 | 3.641 | 3.397 | 5.595 |
+| project-source-medium | 12.233 | 27.881 | 6.026 | 7.196 | 14.677 |
+| gutenberg-shakespeare | 2.337 | 2.685 | 1.598 | 1.643 | 2.337 |
+| project-logs-large | 3.920 | 4.891 | 2.874 | 2.693 | 4.478 |
+| project-high-entropy-medium | 1.000 | 1.000 | 0.996 | 1.000 | 1.000 |
 
-Zstandard `level-1` is the Zstandard level Entroq comes closest to, and it reaches a higher
-ratio on four of the five compressible entries above. On gutenberg-shakespeare the two ratios
-agree to three decimals and Entroq stores 2 412 291 bytes against 2 412 580, 289 bytes fewer.
-Every Zstandard level above `level-1` reaches a higher ratio than Entroq on all five.
+Zstandard `level-1` is the Zstandard level FAST comes closest to, and it reaches a higher ratio
+than FAST on four of the five compressible entries above. BALANCED exceeds Zstandard `level-1`
+on all five. Every Zstandard level above `level-1` reaches a higher ratio than FAST on all
+five, and BALANCED exceeds Zstandard up to `level-6` on project-source-medium.
 
-**Encode is six to eight times below LZ4 `fast-1` and Snappy.** On the five compressible
-entries above the encode gap against LZ4 `fast-1` runs from 6.1 to 6.7 times, and against
-Snappy from 6.8 to 8.3 times. On project-source-medium Entroq encodes at 305 MB/s against LZ4
-`fast-1` at 1876 MB/s and Snappy at 2453 MB/s.
+**FAST encodes six to nine times below LZ4 `fast-1` and Snappy, and BALANCED costs about two to
+three times FAST.** On the five compressible entries above the FAST encode gap against LZ4
+`fast-1` runs from 6.1 to 6.8 times, and against Snappy from 7.0 to 8.7 times: on
+project-source-medium FAST encodes at 288 MB/s against LZ4 `fast-1` at 1784 MB/s and Snappy at
+2427 MB/s. BALANCED encodes at 117 MB/s on the same entry.
 
-**Decode is the widest gap.** Against Zstandard `level-1`, whose ratio Entroq reaches between
-0.83 and 1.00 times on these entries, Entroq decodes between 5.2 and 9.5 times slower on the
-five compressible entries: 484 MB/s against 3682 MB/s on project-source-medium, and 158 MB/s
-against 1498 MB/s on gutenberg-shakespeare. Against LZ4 `fast-1` the gap runs from 12.8 to
-25.0 times. This project's stated priority is decode-first, so this is the number furthest
-from where it needs to be. Nothing in the format requires it.
+**Decode is the widest gap, and BALANCED narrows it.** Against Zstandard `level-1`, FAST
+decodes between 5.7 and 9.5 times slower on the five compressible entries and BALANCED between
+3.7 and 8.0 times slower. BALANCED decodes faster than FAST on every compressible entry:
+920 MB/s against 489 MB/s on project-source-medium, and 182 MB/s against 154 MB/s on
+gutenberg-shakespeare. This project's stated priority is decode-first, and the better parse
+buys decoder throughput as well as ratio: fewer, longer steps to expand.
 
-**Incompressible input costs the parse and nothing after it.** Entroq encodes
-project-high-entropy-medium at 1430 MB/s, where LZ4 `fast-1` reaches 31 069 MB/s and Snappy
-30 284 MB/s, a gap of about 21 times. A block whose bytes are all equal is stored as RLE
-without assembly, and a block the parse finds few matches in is stored as RAW when its literal
+**Incompressible input costs the parse and nothing after it.** FAST encodes
+project-high-entropy-medium at 1418 MB/s and BALANCED at 654 MB/s, where LZ4 `fast-1` reaches
+27 746 MB/s and Snappy 33 916 MB/s. A block whose bytes are all equal is stored as RLE without
+assembly, and a block the parse finds few matches in is stored as RAW when its literal
 distribution leaves no room to code, so such a block never assembles the entropy-coded
 candidate streams. It stores the right bytes: the ratio is 1.000 and the frame is 98 bytes
 above its content. The parse itself still runs.
 
 **The memory figures are the ones a competitor mostly cannot report.** Entroq states 2 818 164
-bytes of encoder steady state and 327 716 bytes of decoder steady state, from the machines
-themselves, at every entry. Of the five competitors, four publish an encoder state size and one
-publishes a decoder state size.
+bytes of encoder steady state under FAST and 3 080 308 under BALANCED, and 327 716 bytes of
+decoder steady state, from the machines themselves, at every entry. Of the five competitors,
+four publish an encoder state size and one publishes a decoder state size.
 
-**Every point this revision exposes is dominated.** The Pareto report over this campaign marks
-a point dominated when another point for the same entry is equal or better in compression ratio
-and in the other axis of the chart, and strictly better in at least one of them. Entroq's
-single point is dominated on all 22 entries for ratio against encode throughput, on all 22 for
-ratio against encoder memory, and on 21 of the 22 for ratio against decode throughput. The one
-exception is project-zeros-medium on the decode axis.
+**On the ratio-against-encoder-memory chart, BALANCED is not dominated on seven entries.**
+The Pareto report over this campaign marks a point dominated when another point for the same
+entry is equal or better in compression ratio and in the other axis of the chart, and strictly
+better in at least one of them. FAST is dominated on all 22 entries for ratio against encode
+throughput, on all 22 for ratio against encoder memory, and on 21 of the 22 for ratio against
+decode throughput; the one exception is project-zeros-medium on the decode axis. BALANCED is
+dominated on the throughput axes on every compressible entry and stays non-dominated on ratio
+against encoder memory on gutenberg-shakespeare, project-large-blob,
+project-database-rows-medium, project-json-medium, project-mixed-medium,
+project-serialized-binary-medium, and project-source-medium. Where both modes store the same
+bytes, FAST dominates BALANCED on the encode and memory axes, and BALANCED is not slower on
+decode.
 
 A dominated point is not a rejected one. It can still be the right choice for a property the
 axis does not measure, such as a declared memory bound, streaming, random access, or corruption
@@ -525,15 +535,13 @@ was rejected as measuring different work, no row existed in one campaign alone, 
 records disagreed about no field of the host.
 
 The campaign on this page was compared against the preceding gate-tier campaign on the same
-host, two days apart, at two Entroq revisions. All 572 rows paired: no row existed in one
-campaign alone, no pair was rejected as measuring different work, and the two records disagreed
-about no field of the host.
-
-Across the 550 competitor rows every metric that is a property of the bytes was identical, not
-within a tolerance: 1 756 such metrics compared and 0 differ. Across the 22 Entroq rows the
-encoder state size and the decoder state size were identical on every row, and 10 of the 22
-compressed lengths were identical. The other 12 changed, because the encoder changed between
-the two revisions.
+host, at two Entroq encoder versions. All 550 competitor rows paired: no pair was rejected as
+measuring different work, and the two records disagreed about no field of the host. Every
+metric that is a property of the bytes was identical, not within a tolerance: 1 756 such
+metrics compared and 0 differ. The Entroq rows do not pair across the two campaigns, because
+the earlier campaign measured one operating point and this one measures two; the FAST rows
+store the same bytes the earlier point stored, and the BALANCED rows are measured here for the
+first time.
 
 The ratios beside the Entroq rows are the ones this encoder version writes. A later encoder
 version is free to change them without changing what a decoder accepts.
@@ -544,15 +552,11 @@ Throughput did not reproduce inside the spread a record states. This is a proper
 and it is stated here so that no future number from an uncontrolled machine is read as more
 stable than it is.
 
-Between the two campaigns described above, 77 of the 550 competitor encode throughputs and 72
+Between the two campaigns described above, 103 of the 550 competitor encode throughputs and 79
 of the 550 competitor decode throughputs moved outside the spread the earlier record states.
-The largest movement was 46 per cent on an encode throughput and 66 per cent on a decode
+The largest movement was 29 per cent on an encode throughput and 38 per cent on a decode
 throughput. Those rows ran the same library over the same bytes at the same operating point, so
 the movement is the machine and nothing else.
-
-The Entroq rows moved further, and their movement is not a noise figure: 15 of the 22 decode
-throughputs fell outside the earlier spread, and the decoder changed between the two revisions,
-so that figure mixes a code change with the host.
 
 The spread a result reports is taken from samples seconds apart inside one segment, under one
 machine state. It does not bound the movement between runs on different days, and the gap
@@ -584,13 +588,13 @@ Blocks:
 ```
 
 ```text
-GAP: the decode throughput is far below every competitor at a comparable
-ratio.
+GAP: the decode throughput is below every competitor at a comparable ratio.
 
 Known:
-- Measured above, on the five compressible entries tabled: between 5.2 and
-  9.5 times below Zstandard level-1, at a ratio at or below Zstandard
-  level-1's own, and between 12.8 and 25.0 times below LZ4 fast-1.
+- Measured above, on the five compressible entries tabled: FAST decodes
+  between 5.7 and 9.5 times below Zstandard level-1 at a ratio at or below
+  Zstandard level-1's own, and BALANCED between 3.7 and 8.0 times below it at
+  a ratio above Zstandard level-1's own on all five.
 - Nothing in the format requires it. This revision's decoder allocates a
   symbol vector per stream, per block.
 - Decode-first is a stated project priority, so this is the figure furthest
@@ -608,8 +612,9 @@ Blocks:
 GAP: the encoder still parses a block it will store raw.
 
 Known:
-- Measured above: 1 430 MB/s on incompressible input, against 31 069 MB/s for
-  LZ4 fast-1 and 30 284 MB/s for Snappy, a gap of about 21 times.
+- Measured above: FAST at 1 418 MB/s and BALANCED at 654 MB/s on
+  incompressible input, against 27 746 MB/s for LZ4 fast-1 and 33 916 MB/s
+  for Snappy, a gap of about 20 times for FAST.
 - A block the parse finds few matches in is stored as RAW without assembling
   the entropy-coded candidate streams, and a block whose bytes are all equal
   is stored as RLE without assembly. The parse itself runs either way, so the
@@ -627,22 +632,23 @@ Blocks:
 ```
 
 ```text
-GAP: the one operating point this revision exposes is dominated.
+GAP: the two operating points this revision exposes are dominated on the throughput frontiers.
 
 Known:
-- Measured above, by the Pareto report over this campaign: dominated on 22 of
-  22 entries for ratio against encode throughput, 22 of 22 for ratio against
-  encoder memory, and 21 of 22 for ratio against decode throughput.
-- The encoder steady state is 2 818 164 bytes, against 582 680 for Zstandard
-  level-1 and 262 200 for LZ4 hc-4, both of which also reach a higher ratio on
-  project-source-medium.
+- Measured above, by the Pareto report over this campaign: FAST is dominated on 22 of 22
+  entries for ratio against encode throughput and for ratio against encoder memory, and on
+  21 of 22 for ratio against decode throughput. BALANCED is dominated on the throughput axes
+  on every compressible entry, and non-dominated on ratio against encoder memory on seven.
+- The FAST encoder steady state is 2 818 164 bytes and the BALANCED one is 3 080 308, against
+  582 680 for Zstandard level-1 and 262 200 for LZ4 hc-4, both of which also reach a higher
+  ratio than FAST on project-source-medium.
 
 Unknown:
-- Which axis the point should be moved along first, and what a mode that
-  declared a memory bound would buy on an axis this report does not chart.
+- Which axis the points should be moved along first, and what a further mechanism would buy
+  on an axis this report does not chart.
 
 Blocks:
-- Any statement that this operating point sits on a frontier.
+- Any statement that either operating point sits on the throughput frontier.
 ```
 
 ```text

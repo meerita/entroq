@@ -24,7 +24,7 @@ use crate::format::{
 };
 use crate::sequence::WINDOW;
 
-pub use crate::encode::{DEFAULT_BLOCK_BYTES, DEFAULT_REGION_BYTES, Statistics};
+pub use crate::encode::{DEFAULT_BLOCK_BYTES, DEFAULT_REGION_BYTES, Mode, Statistics};
 
 /// The bytes a streaming machine keeps for one header.
 ///
@@ -107,6 +107,8 @@ pub struct Encoder {
 impl Encoder {
     /// An encoder for `header`, using the default region and block sizes.
     ///
+    /// Selects FAST with byte-identical behavior.
+    ///
     /// # Errors
     ///
     /// Returns `InvalidParameter` when the header declares an index, which this encoder does
@@ -115,7 +117,22 @@ impl Encoder {
         Self::with_layout(header, DEFAULT_REGION_BYTES, DEFAULT_BLOCK_BYTES)
     }
 
+    /// A BALANCED encoder for `header`, using the default region and block sizes.
+    ///
+    /// Selects the production chain32 path. The mode never reaches the format;
+    /// the decoder reads the stream without learning it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParameter` when the header declares an index, which this encoder does
+    /// not write.
+    pub fn balanced(header: FrameHeader) -> Result<Self, Error> {
+        Self::balanced_with_layout(header, DEFAULT_REGION_BYTES, DEFAULT_BLOCK_BYTES)
+    }
+
     /// An encoder that stages `region_bytes` of input and cuts it into `block_bytes` blocks.
+    ///
+    /// Selects FAST with byte-identical behavior.
     ///
     /// # Errors
     ///
@@ -127,13 +144,56 @@ impl Encoder {
         region_bytes: usize,
         block_bytes: u32,
     ) -> Result<Self, Error> {
+        Self::open(header, region_bytes, block_bytes, crate::encode::Mode::Fast)
+    }
+
+    /// A BALANCED encoder that stages `region_bytes` of input and cuts it into
+    /// `block_bytes` blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParameter` when a size is zero, when the block size is above what a
+    /// block header declares or above what one parse may take, or when the header declares an
+    /// index this encoder does not write.
+    pub fn balanced_with_layout(
+        header: FrameHeader,
+        region_bytes: usize,
+        block_bytes: u32,
+    ) -> Result<Self, Error> {
+        Self::open(
+            header,
+            region_bytes,
+            block_bytes,
+            crate::encode::Mode::Balanced,
+        )
+    }
+
+    /// Opens an encoder under `mode`.
+    ///
+    /// The one place the streaming constructor threads the mode into the engine.
+    /// FAST keeps the frozen constructor; BALANCED threads the mode parameter.
+    fn open(
+        header: FrameHeader,
+        region_bytes: usize,
+        block_bytes: u32,
+        mode: crate::encode::Mode,
+    ) -> Result<Self, Error> {
         if header.index_location.is_some() {
             return Err(Error::InvalidParameter);
         }
         let layout = Layout::new(region_bytes, block_bytes)?;
         // The layout is the one authority on how long a block is, so the emitter is sized from
         // what it settled on rather than from the parameter beside it.
-        let emitter = Emitter::new(DecoderPolicy::CONSERVATIVE, layout.block_bytes())?;
+        let emitter = match mode {
+            crate::encode::Mode::Fast => {
+                Emitter::new(DecoderPolicy::CONSERVATIVE, layout.block_bytes())?
+            }
+            crate::encode::Mode::Balanced => Emitter::with_mode(
+                DecoderPolicy::CONSERVATIVE,
+                layout.block_bytes(),
+                crate::encode::Mode::Balanced,
+            )?,
+        };
         let physical = usize::try_from(layout.physical_bytes(region_bytes)?)
             .map_err(|_| Error::InvalidParameter)?;
         Ok(Self {
@@ -155,15 +215,15 @@ impl Encoder {
 
     /// The bytes this encoder holds between calls, beyond the buffers the caller passes it.
     ///
-    /// One region of staged input, the blocks that region assembles to, the parse state, the
-    /// payload scratch, the tables in force at the ceiling that bounds them, and one header
-    /// scratch. The figure does not move with the input.
+    /// One region of staged input, the blocks that region assembles to, the parse state the
+    /// mode selected, the payload scratch, the tables in force at the ceiling that bounds
+    /// them, and one header scratch. FAST counts the single-table parse state, BALANCED the
+    /// chain parse state; both read the declaration the emitter holds for the mode this
+    /// encoder opened under. The figure does not move with the input.
     ///
-    /// **This is not the peak.** Assembling one block allocates a buffer per coded section and
-    /// per table it builds, in proportion to that block, and frees them before the call
-    /// returns. Those bytes are real peak memory and they are outside this figure. The peak is
-    /// measured rather than declared, because no mode declares a bound yet and a figure that
-    /// was not measured would not be one.
+    /// **This is not the peak.** Assembling one block allocates in proportion to that block
+    /// and frees it before the call returns; `peak_bytes` bounds those bytes, so the two
+    /// figures together are the whole of what one block costs.
     #[must_use]
     pub fn steady_state_bytes(&self) -> usize {
         self.staged
@@ -173,12 +233,33 @@ impl Encoder {
             .saturating_add(SCRATCH_BYTES)
     }
 
+    /// The bytes one block costs at most: what this encoder holds plus what assembling that
+    /// block transiently allocates.
+    ///
+    /// The held figure is exact from construction capacities under this encoder's mode; the
+    /// transient figure is the per-site ceiling the emitter states for its block size and
+    /// policy. The caller-owned input and output fragments stay outside both figures.
+    #[must_use]
+    pub fn peak_bytes(&self) -> usize {
+        self.staged
+            .capacity()
+            .saturating_add(self.blocks.capacity())
+            .saturating_add(self.emitter.peak_bytes())
+            .saturating_add(SCRATCH_BYTES)
+    }
+
     /// What this encoder recorded about the blocks it emitted.
     ///
     /// Reading it changes no byte the encoder writes.
     #[must_use]
     pub const fn statistics(&self) -> Statistics {
         self.emitter.statistics()
+    }
+
+    /// Which contract this encoder assembles under.
+    #[must_use]
+    pub const fn mode(&self) -> Mode {
+        self.emitter.mode()
     }
 
     /// Takes input and writes whatever the stream is ready to emit.
@@ -567,13 +648,13 @@ impl Decoder {
     ///
     /// The header scratch and the two content buffers are fixed at construction. The tables in
     /// force are counted at the table memory the policy admits, which is the figure this
-    /// decoder refuses a block against and therefore what bounds them.
+    /// decoder refuses a block against and therefore what bounds them. The decoder never learns
+    /// the encoder's mode, so this figure is the same for FAST and BALANCED streams.
     ///
     /// **This is not the peak.** Reading one COMPRESSED block allocates a symbol vector per
     /// stream and a copy of each suffix section, in proportion to that block, and frees them
     /// before the call returns. Those bytes are real peak memory and they are outside this
-    /// figure. The peak is measured rather than declared, because no mode declares a bound yet
-    /// and a figure that was not measured would not be one.
+    /// figure; they scale with the admitted block size and never with the stream.
     #[must_use]
     pub fn steady_state_bytes(&self) -> usize {
         SCRATCH_BYTES
@@ -1061,8 +1142,9 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_BLOCK_BYTES, DEFAULT_REGION_BYTES, Decoder, Encoder, Progress, StreamState,
+        DEFAULT_BLOCK_BYTES, DEFAULT_REGION_BYTES, Decoder, Encoder, Mode, Progress, StreamState,
     };
+    use crate::encode::Emitter;
     use crate::entropy;
     use crate::format::{
         BLOCK_HEADER_BYTES, BlockHeader, Corruption, DEFAULT_MAX_BLOCK_BYTES, DecoderPolicy, Error,
@@ -1741,7 +1823,7 @@ mod tests {
         let mut bounds = Vec::new();
         for megabytes in [1_usize, 4, 16] {
             let total = megabytes.saturating_mul(1_048_576);
-            bounds.push(streamed(header, total)?);
+            bounds.push(streamed(header, total, Mode::Fast)?);
         }
         let first = bounds.first().copied().ok_or(Error::InvalidParameter)?;
         for bound in &bounds {
@@ -1767,16 +1849,72 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn the_balanced_steady_state_figure_holds_across_a_decade_of_input_sizes() -> Result<(), Error>
+    {
+        let header = FrameHeader::new(
+            ResourceClass::Small,
+            RegionIndependence::Independent,
+            IntegrityMode::PerRegion,
+        );
+        // The same decade the FAST figure holds, through the BALANCED parse: sixteen blocks a
+        // region, sixteen regions at the top length, every one reusing the storage the
+        // construction sized.
+        let mut bounds = Vec::new();
+        for megabytes in [1_usize, 4, 16] {
+            let total = megabytes.saturating_mul(1_048_576);
+            bounds.push(streamed(header, total, Mode::Balanced)?);
+        }
+        let first = bounds.first().copied().ok_or(Error::InvalidParameter)?;
+        for bound in &bounds {
+            assert_eq!(*bound, first, "the steady state moved with the input size");
+        }
+        let block_bytes = usize::try_from(DEFAULT_BLOCK_BYTES).unwrap_or(0);
+        let region_blocks = DEFAULT_REGION_BYTES
+            .div_ceil(block_bytes)
+            .saturating_mul(BLOCK_HEADER_BYTES);
+        let tables = usize::try_from(entropy::MAX_BLOCK_TABLE_BYTES).unwrap_or(0);
+        let encoder = DEFAULT_REGION_BYTES
+            .saturating_add(DEFAULT_REGION_BYTES.saturating_add(region_blocks))
+            .saturating_add(Parser::balanced_declared_bytes(block_bytes))
+            .saturating_add(block_bytes)
+            .saturating_add(tables)
+            .saturating_add(super::SCRATCH_BYTES);
+        let admitted = usize::try_from(DEFAULT_MAX_BLOCK_BYTES).unwrap_or(0);
+        let decoder = super::SCRATCH_BYTES
+            .saturating_add(admitted)
+            .saturating_add(admitted.saturating_add(super::DECODER_WINDOW_SLACK))
+            .saturating_add(tables);
+        assert_eq!(first, (encoder, decoder));
+        // The peak is the steady state and the transient, whatever the length ran: the
+        // construction capacities fix the first and the block size fixes the second.
+        let ceiling = entropy::MAX_BLOCK_TABLE_BYTES;
+        let transient = Emitter::transient_bytes(block_bytes, ceiling);
+        let balanced = Encoder::balanced(header)?;
+        assert_eq!(
+            balanced.peak_bytes(),
+            balanced.steady_state_bytes().saturating_add(transient),
+            "the BALANCED peak is not its steady state and its transient"
+        );
+        assert_eq!(balanced.steady_state_bytes(), encoder);
+        assert_eq!(balanced.mode(), Mode::Balanced);
+        Ok(())
+    }
+
     /// Streams `total` generated bytes through both machines without holding any of them.
     ///
     /// Nothing here is proportional to `total`: the generated content is produced and checked
     /// in place, and every buffer is fixed before the run.
-    fn streamed(header: FrameHeader, total: usize) -> Result<(usize, usize), Error> {
+    fn streamed(header: FrameHeader, total: usize, mode: Mode) -> Result<(usize, usize), Error> {
         const CHUNK: usize = 64 * 1024;
 
-        let mut encoder = Encoder::new(header)?;
+        let mut encoder = match mode {
+            Mode::Fast => Encoder::new(header)?,
+            Mode::Balanced => Encoder::balanced(header)?,
+        };
         let mut decoder = Decoder::new(permissive());
         let bound = (encoder.steady_state_bytes(), decoder.steady_state_bytes());
+        let peak = encoder.peak_bytes();
 
         let mut input = vec![0_u8; CHUNK];
         let mut coded = vec![0_u8; CHUNK];
@@ -1808,6 +1946,7 @@ mod tests {
             }
             fed = fed.saturating_add(span);
             assert_eq!(encoder.steady_state_bytes(), bound.0, "the encoder grew");
+            assert_eq!(encoder.peak_bytes(), peak, "the encoder peak moved");
         }
         loop {
             let progress = encoder.finish(&mut coded)?;
@@ -1842,6 +1981,7 @@ mod tests {
             u64::try_from(total).map_err(|_| Error::InvalidParameter)?
         );
         assert_eq!(encoder.steady_state_bytes(), bound.0, "the encoder grew");
+        assert_eq!(encoder.peak_bytes(), peak, "the encoder peak moved");
         assert_eq!(decoder.steady_state_bytes(), bound.1, "the decoder grew");
         Ok(bound)
     }
@@ -1957,5 +2097,88 @@ mod tests {
             assert_eq!(plain.get(..length), content.get(..length));
         }
         Ok(())
+    }
+
+    #[test]
+    fn the_balanced_encoder_round_trips_through_the_production_decoder() -> Result<(), Error> {
+        let header = FrameHeader::new(
+            ResourceClass::Small,
+            RegionIndependence::Independent,
+            IntegrityMode::Absent,
+        );
+        let phrase = b"the quick brown fox jumps over the lazy dog. ";
+        let text: Vec<u8> = (0..65_536usize)
+            .map(|at| {
+                phrase
+                    .get(at.checked_rem(phrase.len()).unwrap_or(0))
+                    .copied()
+                    .unwrap_or(b' ')
+            })
+            .collect();
+        let zeros = vec![0u8; 8_192];
+        for (name, data) in [("text", text), ("zeros", zeros)] {
+            let room = bound(header, data.len());
+            let mut out = vec![0u8; room];
+            let mut encoder = Encoder::balanced(header)?;
+            assert_eq!(encoder.mode(), crate::encode::Mode::Balanced);
+            let mut at = 0usize;
+            let mut fed = 0usize;
+            while fed < data.len() {
+                let rest = data.get(fed..).ok_or(Error::InvalidParameter)?;
+                let target = out.get_mut(at..).ok_or(Error::InvalidParameter)?;
+                let progress = encoder.encode(rest, target)?;
+                fed = fed.saturating_add(progress.consumed);
+                at = at.saturating_add(progress.produced);
+            }
+            loop {
+                let target = out.get_mut(at..).ok_or(Error::InvalidParameter)?;
+                let progress = encoder.finish(target)?;
+                at = at.saturating_add(progress.produced);
+                if progress.state == StreamState::Finished {
+                    break;
+                }
+            }
+            let mut decoder = Decoder::new(permissive());
+            let mut plain = vec![0u8; data.len().max(1)];
+            let source = out.get(..at).ok_or(Error::InvalidParameter)?;
+            let progress = decoder.decode(source, &mut plain)?;
+            decoder.finish()?;
+            assert_eq!(progress.produced, data.len(), "{name}");
+            assert_eq!(plain.get(..data.len()), Some(data.as_slice()), "{name}");
+            let second = encode_all_balanced(header, &data)?;
+            let first = out.get(..at).ok_or(Error::InvalidParameter)?.to_vec();
+            assert_eq!(
+                first, second,
+                "{name} balanced encoding is not deterministic"
+            );
+        }
+        Ok(())
+    }
+
+    fn encode_all_balanced(header: FrameHeader, data: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut encoder = Encoder::balanced(header)?;
+        let mut out = Vec::new();
+        let mut room = vec![0u8; 8_192];
+        let mut fed = 0usize;
+        while fed < data.len() {
+            let rest = data.get(fed..).ok_or(Error::InvalidParameter)?;
+            let progress = encoder.encode(rest, &mut room)?;
+            out.extend_from_slice(
+                room.get(..progress.produced)
+                    .ok_or(Error::InvalidParameter)?,
+            );
+            fed = fed.saturating_add(progress.consumed);
+        }
+        loop {
+            let progress = encoder.finish(&mut room)?;
+            out.extend_from_slice(
+                room.get(..progress.produced)
+                    .ok_or(Error::InvalidParameter)?,
+            );
+            if progress.state == StreamState::Finished {
+                break;
+            }
+        }
+        Ok(out)
     }
 }

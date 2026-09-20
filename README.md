@@ -21,11 +21,13 @@ without assembly, and a block the parse finds few matches in is stored as RAW wh
 distribution leaves no room to code. The decoder reads every block type and returns the input
 byte for byte. `docs/format.md` states what a conforming decoder accepts.
 
-One encode path ships and it declares no mode. It is a single-entry match table of 16 384
-entries behind a tag gate, an adaptive skip over searched misses, and a greedy parser, at a
-window of 65 536 bytes. No operating point is claimed against any competitor: the numbers in
-`docs/benchmarks.md` are gate-tier measurements of one machine, and no Entroq number has left a
-publication-tier record.
+Two encode modes ship and both write the same format. FAST is the default: a single-entry
+match table of 16 384 entries behind a tag gate, an adaptive skip over searched misses, and a
+greedy parser. BALANCED is a bounded hash chain at depth 32 feeding a length-lazy depth-1
+parse, and it carries the same skip. Both work at a window of 65 536 bytes. `docs/memory.md`
+states the memory bound each mode declares. No operating point is claimed against any
+competitor: the numbers in `docs/benchmarks.md` are gate-tier measurements of one machine, and
+no Entroq number has left a publication-tier record.
 
 Beyond that, the repository holds the measurement foundation the codec is built against:
 
