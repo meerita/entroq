@@ -17,14 +17,15 @@ use std::fmt;
 
 use crate::catalog::{self, Codec, PointGroup};
 
-/// The one operating point this revision of Entroq exposes.
+/// The operating points this revision of Entroq exposes.
 ///
-/// The codec admits no mode yet: it ships one match finder, one parser, one representation,
-/// and one block length. A mode needs a declared memory bound and a competitor point, and the
-/// milestone that admits the first of them produces both.
+/// The codec admits two modes, FAST and BALANCED, and both write the same format. The group
+/// holds both because one segment can afford them together: each is cheaper than the
+/// competitor groups the tier measures beside it. FAST stays the default, because it is the
+/// shipped mode and the one the dev tier measures.
 const ENTROQ_POINTS: &[PointGroup] = &[PointGroup {
     name: "default",
-    points: &["default"],
+    points: &["fast", "balanced"],
 }];
 
 /// The identifier a segment, a directory, and a result use for this repository's codec.
@@ -110,7 +111,7 @@ impl Subject {
     /// The point this subject selects when a caller states no level.
     pub const fn default_point(self) -> &'static str {
         match self {
-            Self::Entroq => "default",
+            Self::Entroq => "fast",
             Self::Competitor(codec) => codec.default_point,
         }
     }
@@ -198,9 +199,9 @@ mod tests {
     }
 
     #[test]
-    fn the_codec_exposes_one_point_because_it_admits_no_mode() {
-        assert_eq!(Subject::Entroq.operating_points(), vec!["default"]);
-        assert_eq!(Subject::Entroq.default_point(), "default");
+    fn the_codec_exposes_both_modes_and_defaults_to_the_shipped_one() {
+        assert_eq!(Subject::Entroq.operating_points(), vec!["fast", "balanced"]);
+        assert_eq!(Subject::Entroq.default_point(), "fast");
         assert!(
             Subject::Entroq
                 .operating_points()

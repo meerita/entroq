@@ -442,7 +442,8 @@ macro_rules! baseline_segment {
 /// unit that holds one budget and that a resumed campaign re-runs alone.
 ///
 /// The subject comes first, because a comparison with no subject in it is a table of
-/// competitors. It has one operating point group, because this revision admits no mode.
+/// competitors. It has one operating point group holding both of its modes, because one
+/// segment can afford them together.
 const BENCH_GATE_SEGMENTS: &[Segment] = &[
     baseline_segment!("entroq", "default", "tiny"),
     baseline_segment!("entroq", "default", "small"),
@@ -911,8 +912,8 @@ impl Suite {
                  workspace, at the revision the result records, so both sides cross one \
                  call and one process. A segmented tier covers one operating point group \
                  and one size class per segment, and the groups of a codec cover every \
-                 point declared for it. The subject declares one, because this revision \
-                 admits no mode."
+                 point declared for it. The subject declares both of its modes in one \
+                 group."
             }
             Self::Skeleton => {
                 "The format skeleton's closing gate. Seven segments round-trip generated \

@@ -38,21 +38,32 @@ use crate::error::{Error, Result};
 /// that declares that window is the smallest one. The other four stay declared and unmeasured.
 const CLASS: ResourceClass = ResourceClass::Small;
 
-/// One Entroq session, at the one operating point this revision exposes.
+/// One Entroq session, at one of the modes the subject declares.
 pub struct Session {
     header: FrameHeader,
     policy: DecoderPolicy,
+    /// Whether this session drives the BALANCED mode. FAST is the shipped default.
+    balanced: bool,
 }
 
 impl Session {
-    /// Opens the codec at one of the points the subject names.
+    /// Opens the codec at one of the mode points the subject names.
     ///
     /// # Errors
     ///
-    /// Never fails. The shape matches the competitors', whose libraries can refuse a context.
-    pub const fn open(_point: &str) -> Result<Self> {
-        // The subject declares one operating point, because this revision admits no mode.
-        // `Session::open` has already checked the name against it.
+    /// Fails when `point` names no mode this revision admits. The caller has already checked
+    /// the name against the subject's declared points, so this is a guard and not a lookup.
+    pub fn open(point: &str) -> Result<Self> {
+        let balanced = match point {
+            "fast" => false,
+            "balanced" => true,
+            _ => {
+                return Err(Error::measure(
+                    "the Entroq operating point",
+                    "names no mode this revision admits",
+                ));
+            }
+        };
         Ok(Self {
             header: FrameHeader::new(
                 CLASS,
@@ -60,7 +71,17 @@ impl Session {
                 IntegrityMode::Absent,
             ),
             policy: DecoderPolicy::CONSERVATIVE,
+            balanced,
         })
+    }
+
+    /// An encoder at this session's mode.
+    fn encoder(&self) -> Result<Encoder> {
+        if self.balanced {
+            Encoder::balanced(self.header).map_err(failed)
+        } else {
+            Encoder::new(self.header).map_err(failed)
+        }
     }
 
     /// The version the codec crate declares for itself.
@@ -120,7 +141,7 @@ impl Session {
     ///
     /// Fails when the codec refuses the request, or when `dst` is smaller than the bound.
     pub fn compress(&mut self, src: &[u8], dst: &mut [u8]) -> Result<usize> {
-        let mut encoder = Encoder::new(self.header).map_err(failed)?;
+        let mut encoder = self.encoder()?;
         let mut at = 0_usize;
         let mut fed = 0_usize;
         while fed < src.len() {
@@ -174,7 +195,7 @@ impl Session {
 
     /// The bytes the encoder holds between calls, as the machine reports them.
     pub fn encoder_state_bytes(&self) -> Option<u64> {
-        Encoder::new(self.header)
+        self.encoder()
             .ok()
             .map(|encoder| u64::try_from(encoder.steady_state_bytes()).unwrap_or(u64::MAX))
     }
@@ -195,7 +216,7 @@ impl Session {
     ///
     /// Fails when the codec refuses the request, or when `dst` is smaller than the bound.
     pub fn stream(&mut self, src: &[u8], chunk: usize, dst: &mut [u8]) -> Result<Vec<Chunk>> {
-        let mut encoder = Encoder::new(self.header).map_err(failed)?;
+        let mut encoder = self.encoder()?;
         let mut chunks = Vec::new();
         let mut at = 0_usize;
         let mut fed = 0_usize;
@@ -270,7 +291,7 @@ mod tests {
 
     #[test]
     fn the_codec_round_trips_through_the_boundary_the_harness_drives() {
-        let Ok(mut session) = Session::open("default") else {
+        let Ok(mut session) = Session::open("fast") else {
             unreachable!("the codec opens at the one point it declares")
         };
         for length in [0_usize, 1, 1_024, 200_000] {
@@ -292,7 +313,7 @@ mod tests {
 
     #[test]
     fn a_compression_stays_inside_the_bound_the_session_states() {
-        let Ok(mut session) = Session::open("default") else {
+        let Ok(mut session) = Session::open("fast") else {
             unreachable!("the codec opens at the one point it declares")
         };
         let data = content(300_000);
@@ -307,7 +328,7 @@ mod tests {
 
     #[test]
     fn streaming_produces_the_same_bytes_as_one_call() {
-        let Ok(mut session) = Session::open("default") else {
+        let Ok(mut session) = Session::open("fast") else {
             unreachable!("the codec opens at the one point it declares")
         };
         let data = content(200_000);
@@ -328,7 +349,7 @@ mod tests {
 
     #[test]
     fn both_machines_report_the_bytes_they_hold() {
-        let Ok(session) = Session::open("default") else {
+        let Ok(session) = Session::open("fast") else {
             unreachable!("the codec opens at the one point it declares")
         };
         assert!(session.encoder_state_bytes().unwrap_or(0) > 0);
@@ -337,7 +358,7 @@ mod tests {
 
     #[test]
     fn every_metric_the_notes_claim_is_one_this_boundary_reaches() {
-        let Ok(session) = Session::open("default") else {
+        let Ok(session) = Session::open("fast") else {
             unreachable!("the codec opens at the one point it declares")
         };
         let notes = session.notes();

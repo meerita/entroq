@@ -379,11 +379,19 @@ mod tests {
     }
 
     #[test]
-    fn the_codec_measures_its_one_point_at_every_tier() {
-        for tier in TIERS {
+    fn the_codec_measures_its_shipped_point_cheaply_and_both_points_at_the_gate() {
+        for tier in [Tier::Smoke, Tier::Dev] {
             assert_eq!(
                 points(&request(tier, Subject::Entroq, None)),
-                vec!["default"],
+                vec!["fast"],
+                "{}",
+                tier.name()
+            );
+        }
+        for tier in [Tier::Gate, Tier::Publication] {
+            assert_eq!(
+                points(&request(tier, Subject::Entroq, None)),
+                vec!["fast", "balanced"],
                 "{}",
                 tier.name()
             );
