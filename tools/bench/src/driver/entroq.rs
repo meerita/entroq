@@ -61,6 +61,8 @@ impl Session {
             "balanced16" => (true, 16),
             "fast64" => (false, 64),
             "balanced64" => (true, 64),
+            "fastR" => (false, 0),
+            "balancedR" => (true, 0),
             _ => {
                 return Err(Error::measure(
                     "the Entroq operating point",

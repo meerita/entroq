@@ -1040,9 +1040,82 @@ pub fn expand(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(
     match crate::width_selection::selected() {
         16 => return expand_width::<16>(sequences, history, out),
         64 => return expand_width::<64>(sequences, history, out),
+        0 => return expand_rule(sequences, history, out),
         _ => {}
     }
     expand_width::<COPY_WIDTH>(sequences, history, out)
+}
+
+/// Temporary: the length-directed rule arm of the width-selection campaign.
+///
+/// A match of at least 64 bytes at a distance of at least 64 copies in 64-byte chunks; a
+/// shorter one copies in 16-byte chunks; a match with a distance below 16 takes the scalar
+/// path. Removed when the width is selected.
+#[cfg(feature = "width-selection")]
+fn expand_rule(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(), Error> {
+    let literals = sequences.literals();
+    let logical = out.len();
+    let h = history.len();
+    let mut taken = 0usize;
+    let mut written = 0usize;
+    for step in sequences.steps() {
+        let run =
+            usize::try_from(step.run).map_err(|_| Error::CorruptData(Corruption::BlockContent))?;
+        taken = copy_literals(literals, out, taken, written, run)?;
+        written = written
+            .checked_add(run)
+            .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+        let Some(matched) = step.matched else {
+            continue;
+        };
+        let (from, end, distance) = admit_match(h, written, logical, matched)?;
+        let length = end
+            .checked_sub(written)
+            .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+        let done = if length >= 64 && distance >= 64 {
+            converge::<64>(history, out, written, from, end, h)?
+        } else if length >= 16 && distance >= 16 {
+            converge::<16>(history, out, written, from, end, h)?
+        } else {
+            written
+        };
+        if done < end {
+            let rest = from
+                .checked_add(done.saturating_sub(written))
+                .ok_or(Error::CorruptData(Corruption::MatchReach))?;
+            copy_match_scalar(history, out, done, end, rest)?;
+        }
+        written = end;
+    }
+    if written != logical {
+        return Err(Error::CorruptData(Corruption::BlockContent));
+    }
+    Ok(())
+}
+
+/// Temporary: the bulk half of one rule arm, answering the destination it reached.
+#[cfg(feature = "width-selection")]
+fn converge<const K: usize>(
+    history: &[u8],
+    out: &mut [u8],
+    written: usize,
+    from: usize,
+    end: usize,
+    h: usize,
+) -> Result<usize, Error> {
+    let length = end
+        .checked_sub(written)
+        .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+    if from >= h {
+        copy_out_bulk::<K>(out, written, from.saturating_sub(h), end)
+    } else if from
+        .checked_add(length)
+        .is_some_and(|source_end| source_end <= h)
+    {
+        copy_history_bulk::<K>(history, out, written, from, end)
+    } else {
+        Ok(written)
+    }
 }
 
 /// The scalar expansion body: the oracle every optimized match-copy path answers to.

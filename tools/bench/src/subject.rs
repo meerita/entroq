@@ -32,6 +32,8 @@ const ENTROQ_POINTS: &[PointGroup] = &[PointGroup {
         "balanced16",
         "fast64",
         "balanced64",
+        "fastR",
+        "balancedR",
     ],
 }];
 
@@ -215,7 +217,9 @@ mod tests {
                 "fast16",
                 "balanced16",
                 "fast64",
-                "balanced64"
+                "balanced64",
+                "fastR",
+                "balancedR"
             ]
         );
         assert_eq!(Subject::Entroq.default_point(), "fast");
