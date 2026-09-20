@@ -1026,6 +1026,17 @@ fn frequencies(symbols: &[u16], alphabet: Alphabet) -> Result<Vec<u64>, Error> {
 /// checked against the block's remaining decoded bytes and against the bytes the region holds,
 /// so nothing here reaches past either.
 pub fn expand(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(), Error> {
+    #[cfg(test)]
+    capture::record(sequences, history, out.len());
+    expand_scalar(sequences, history, out)
+}
+
+/// The scalar expansion body: the oracle every optimized match-copy path answers to.
+///
+/// It validates and copies exactly as the format contract requires, one byte at a time. The
+/// scalar match copy it calls is the same one an optimized path falls back to, so the two
+/// cannot drift on the copy itself.
+fn expand_scalar(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(), Error> {
     let literals = sequences.literals();
     let mut taken = 0usize;
     let mut written = 0usize;
@@ -1071,19 +1082,9 @@ pub fn expand(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(
         if end > out.len() {
             return Err(Error::CorruptData(Corruption::BlockContent));
         }
-        let mut from = produced.saturating_sub(distance);
-        while written < end {
-            let byte = from
-                .checked_sub(history.len())
-                .map_or_else(|| history.get(from).copied(), |at| out.get(at).copied())
-                .ok_or(Error::CorruptData(Corruption::MatchReach))?;
-            let slot = out
-                .get_mut(written)
-                .ok_or(Error::CorruptData(Corruption::BlockContent))?;
-            *slot = byte;
-            written = written.saturating_add(1);
-            from = from.saturating_add(1);
-        }
+        let from = produced.saturating_sub(distance);
+        copy_match_scalar(history, out, written, end, from)?;
+        written = end;
     }
     if written != out.len() {
         return Err(Error::CorruptData(Corruption::BlockContent));
@@ -1091,10 +1092,82 @@ pub fn expand(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(
     Ok(())
 }
 
+/// Copies one match's bytes from the bytes its region has already produced.
+///
+/// The source may sit in `history`, in `out`, or cross the boundary between them. An
+/// overlapping source propagates one byte at a time, which is what a match whose length
+/// exceeds its distance requires. The caller has validated the length against the logical
+/// block end and the distance against the produced bytes, so no read or write reaches past
+/// either.
+fn copy_match_scalar(
+    history: &[u8],
+    out: &mut [u8],
+    mut written: usize,
+    end: usize,
+    mut from: usize,
+) -> Result<(), Error> {
+    while written < end {
+        let byte = from
+            .checked_sub(history.len())
+            .map_or_else(|| history.get(from).copied(), |at| out.get(at).copied())
+            .ok_or(Error::CorruptData(Corruption::MatchReach))?;
+        let slot = out
+            .get_mut(written)
+            .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+        *slot = byte;
+        written = written.saturating_add(1);
+        from = from.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Records every block expansion a test drives, so the differential can replay the exact
+/// validated sequences and history production saw.
+#[cfg(test)]
+mod capture {
+    use super::Sequences;
+    use std::cell::{Cell, RefCell};
+
+    /// One captured expansion: the sequences, the history, and the logical output length.
+    pub type Captured = (Sequences, Vec<u8>, usize);
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static HELD: RefCell<Vec<Captured>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub fn record(sequences: &Sequences, history: &[u8], out_len: usize) {
+        if !ARMED.with(Cell::get) {
+            return;
+        }
+        HELD.with(|held| {
+            held.borrow_mut()
+                .push((sequences.clone(), history.to_vec(), out_len));
+        });
+    }
+
+    /// Arms capture on this thread and discards anything captured before.
+    pub fn arm() {
+        HELD.with(|held| held.borrow_mut().clear());
+        ARMED.with(|armed| armed.set(true));
+    }
+
+    /// Disarms capture on this thread.
+    pub fn disarm() {
+        ARMED.with(|armed| armed.set(false));
+    }
+
+    /// Takes everything captured since the last arm.
+    pub fn take() -> Vec<Captured> {
+        HELD.with(|held| std::mem::take(&mut *held.borrow_mut()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Block, Built, Coded, Coder, Decoder, Encoder, Streams, TABLE_SHARES, Terms, huffman,
+        Block, Built, Coded, Coder, Decoder, Encoder, Streams, TABLE_SHARES, Terms, capture,
+        expand, expand_scalar, huffman,
     };
     use crate::entropy::bits::{BitBuf, BitReader, BitWriter};
     use crate::format::{
@@ -3076,6 +3149,209 @@ mod tests {
                 0
             );
         }
+        Ok(())
+    }
+
+    /// Runs both expansions over one case.
+    ///
+    /// Reports whether they agree on the logical output bytes and on the refusal class. A case
+    /// both paths accept must decode to the same bytes; a case both paths refuse must refuse
+    /// for the same reason.
+    fn agree(sequences: &Sequences, history: &[u8], out_len: usize) -> bool {
+        let mut oracle = vec![0_u8; out_len];
+        let mut production = vec![0_u8; out_len];
+        let expected = expand_scalar(sequences, history, &mut oracle);
+        let got = expand(sequences, history, &mut production);
+        match (expected, got) {
+            (Ok(()), Ok(())) => oracle == production,
+            (Err(expected), Err(got)) => format!("{expected:?}") == format!("{got:?}"),
+            _ => false,
+        }
+    }
+
+    /// Assembles and reads one plan, keeping every expansion production performed.
+    ///
+    /// A block the reader refuses before its expansion captures nothing, which is the same
+    /// case in which there is no expansion to compare.
+    fn capture_plan(
+        plan: &Plan,
+        history: &[u8],
+        first_in_region: bool,
+    ) -> Result<Vec<capture::Captured>, Error> {
+        let mut encoder = Encoder::at_region_start();
+        let mut payload = Vec::new();
+        let assembly = encoder
+            .assemble_into(
+                &plan.sequences,
+                Terms {
+                    first_in_region,
+                    repeat: Some(FRESH),
+                    ceiling: usize::MAX,
+                },
+                &DecoderPolicy::CONSERVATIVE,
+                &mut payload,
+            )?
+            .ok_or(Error::InvalidParameter)?;
+        encoder.adopt(assembly);
+        capture::arm();
+        let mut decoder = Decoder::at_region_start();
+        let mut out = vec![0_u8; plan.content.len()];
+        let block = Block {
+            arrived: &payload,
+            declared: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+            first_in_region,
+            history,
+        };
+        let _read = decoder.read(&block, &DecoderPolicy::CONSERVATIVE, &mut out);
+        capture::disarm();
+        Ok(capture::take())
+    }
+
+    /// Every expansion production performs answers the scalar oracle on bytes and refusal.
+    #[test]
+    fn every_production_expansion_agrees_with_the_scalar_oracle() -> Result<(), Error> {
+        let sizes = [1_usize, 2, 64, 4_096, 16_384, 65_536];
+        let mut cases = 0usize;
+        for size in sizes {
+            for (index, shape) in shapes().into_iter().enumerate() {
+                let seed = u64::try_from(index).unwrap_or(0).saturating_add(1);
+                let plan = plan(shape, size, &[], seed).ok_or(Error::InvalidParameter)?;
+                for (sequences, history, out_len) in capture_plan(&plan, &[], true)? {
+                    assert!(
+                        agree(&sequences, &history, out_len),
+                        "shape {index} at {size} bytes diverged"
+                    );
+                    cases = cases.saturating_add(1);
+                }
+            }
+        }
+        assert!(cases > 0, "no expansion was captured");
+        Ok(())
+    }
+
+    /// An expansion whose source crosses the history boundary answers the scalar oracle.
+    #[test]
+    fn a_history_crossing_expansion_agrees_with_the_scalar_oracle() -> Result<(), Error> {
+        let history: Vec<u8> = (0..4_096_u32)
+            .map(|at| u8::try_from(at & 0xFF).unwrap_or(0))
+            .collect();
+        let shape = Shape {
+            run: 16,
+            length: MAX_MATCH_LENGTH,
+            distance: 64,
+            alphabet: 256,
+        };
+        let plan = plan(shape, 16_384, &history, 211).ok_or(Error::InvalidParameter)?;
+        let mut cases = 0usize;
+        for (sequences, held, out_len) in capture_plan(&plan, &history, false)? {
+            assert!(
+                agree(&sequences, &held, out_len),
+                "a crossing case diverged"
+            );
+            cases = cases.saturating_add(1);
+        }
+        assert!(cases > 0, "no history-crossing expansion was captured");
+        Ok(())
+    }
+
+    /// Rewrites one step of a block into a case no valid stream produces.
+    ///
+    /// The values are drawn from outside every domain the sequence representation enforces, so
+    /// the caller uses the unchecked constructor; the two paths must still agree on both the
+    /// bytes and the refusal class.
+    fn mutate(
+        sequences: &Sequences,
+        at: usize,
+        kind: usize,
+        h: usize,
+        out_len: usize,
+    ) -> Option<Sequences> {
+        let mut changed = sequences.steps().to_vec();
+        let step = *changed.get(at)?;
+        let mut written = 0usize;
+        for prior in changed.get(..at)? {
+            written = written.saturating_add(usize::try_from(prior.run).ok()?);
+            if let Some(matched) = prior.matched {
+                written = written.saturating_add(usize::try_from(matched.length).ok()?);
+            }
+        }
+        let produced = h.checked_add(written)?;
+        let original = step.matched.unwrap_or(Match {
+            length: MIN_MATCH,
+            distance: 1,
+        });
+        let matched = match kind {
+            0 => Match {
+                distance: 0,
+                ..original
+            },
+            1 => Match {
+                distance: u32::try_from(produced.checked_add(1)?).ok()?,
+                ..original
+            },
+            2 => Match {
+                length: u32::try_from(out_len.checked_sub(written)?.checked_add(1)?).ok()?,
+                ..original
+            },
+            3 => original,
+            4 => Match {
+                distance: u32::try_from(written.checked_add(1)?).ok()?,
+                ..original
+            },
+            _ => Match {
+                distance: original.distance.max(1),
+                length: original.distance.max(1).saturating_add(8),
+            },
+        };
+        let new_step = if kind == 3 {
+            Step {
+                run: step.run.checked_add(1)?,
+                matched: step.matched,
+            }
+        } else {
+            Step {
+                run: step.run,
+                matched: Some(matched),
+            }
+        };
+        *changed.get_mut(at)? = new_step;
+        Some(Sequences::new_unchecked(
+            sequences.literals().to_vec(),
+            changed,
+        ))
+    }
+
+    /// Every mutated case answers the scalar oracle on bytes and refusal class.
+    ///
+    /// The mutations carry a zero distance, a distance past the produced bytes, a length past
+    /// the block's remaining output, a run that overruns the literal bytes, a source that
+    /// crosses the history boundary, and a true self-overlap.
+    #[test]
+    fn every_mutated_expansion_agrees_with_the_scalar_oracle() -> Result<(), Error> {
+        let history: Vec<u8> = (0..4_096_u32)
+            .map(|at| u8::try_from(at & 0xFF).unwrap_or(0))
+            .collect();
+        let mut cases = 0usize;
+        for (index, shape) in shapes().into_iter().enumerate() {
+            let seed = u64::try_from(index).unwrap_or(0).saturating_add(101);
+            let plan = plan(shape, 16_384, &history, seed).ok_or(Error::InvalidParameter)?;
+            for (sequences, held, out_len) in capture_plan(&plan, &history, false)? {
+                let h = held.len();
+                for at in 0..sequences.steps().len() {
+                    for kind in 0..6 {
+                        let Some(mutated) = mutate(&sequences, at, kind, h, out_len) else {
+                            continue;
+                        };
+                        assert!(
+                            agree(&mutated, &held, out_len),
+                            "shape {index} step {at} kind {kind} diverged"
+                        );
+                        cases = cases.saturating_add(1);
+                    }
+                }
+            }
+        }
+        assert!(cases > 0, "no mutation was checked");
         Ok(())
     }
 }
