@@ -17,15 +17,14 @@ A page here states what Entroq does now. A page that would state intent is not w
 
 | Page | Class | Covers |
 |---|---|---|
-| [benchmarks.md](benchmarks.md) | reference | the measurement laboratory, the corpus, the metric set, the tiers, the first measurement of Entroq beside the pinned competitors, and what a number from each tier licenses |
+| [benchmarks.md](benchmarks.md) | reference | the measurement laboratory, the corpus, the metric set, the tiers, the measurement of Entroq beside the pinned competitors, and what a number from each tier licenses |
 | [format.md](format.md) | reference | the frame, region, and block structure of a stream, the compressed block and the symbol model it carries, and what a conforming decoder accepts, refuses, and ignores |
 
 ## Pages that do not exist yet
 
-Entroq admits no mode and ships no command line tool. It has numbers of its own now, and
-`benchmarks.md` carries them with the scope they were measured under; none of them has left a
-publication-tier record. The pages below state behavior that does not exist, so they are named
-here and not written.
+Entroq admits no mode and ships no command line tool. `benchmarks.md` carries its numbers with
+the scope they were measured under, and none of them has left a publication-tier record. The
+pages below state behavior that does not exist, so they are named here and not written.
 
 | Page | Will cover | Waits for |
 |---|---|---|

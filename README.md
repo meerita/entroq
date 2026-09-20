@@ -15,15 +15,17 @@ the parser that produce the sequences, the kernel dispatch the finder runs on, a
 pair. The compressed block is private: it carries state that crosses the blocks of a region, and
 the streaming pair is the only thing that drives it. There is no Entroq command line tool.
 
-Entroq compresses. The encoder finds matches, parses them, codes four symbol streams, assembles
-every block type a block admits, and emits the one storing the fewest bytes. The decoder reads
-every block type and returns the input byte for byte. `docs/format.md` states what a conforming
-decoder accepts.
+Entroq compresses. The encoder finds matches, parses them, codes four symbol streams, and emits
+the block type that stores the fewest bytes. A block whose bytes are all equal is stored as RLE
+without assembly, and a block the parse finds few matches in is stored as RAW when its literal
+distribution leaves no room to code. The decoder reads every block type and returns the input
+byte for byte. `docs/format.md` states what a conforming decoder accepts.
 
-One encode path ships and it declares no mode. It is a bounded hash chain at a search depth of
-8 and a greedy parser, at a window of 65 536 bytes. No operating point is claimed against any
-competitor: the numbers in `docs/benchmarks.md` are gate-tier measurements of one machine, and
-no Entroq number has left a publication-tier record.
+One encode path ships and it declares no mode. It is a single-entry match table of 16 384
+entries behind a tag gate, an adaptive skip over searched misses, and a greedy parser, at a
+window of 65 536 bytes. No operating point is claimed against any competitor: the numbers in
+`docs/benchmarks.md` are gate-tier measurements of one machine, and no Entroq number has left a
+publication-tier record.
 
 Beyond that, the repository holds the measurement foundation the codec is built against:
 
@@ -46,9 +48,8 @@ Beyond that, the repository holds the measurement foundation the codec is built 
 
 The benchmark harness drives Entroq and every pinned competitor in-process, through one call
 and one process each, so neither side of a comparison is charged for a boundary the other does
-not pay. `docs/benchmarks.md` carries the first measured comparison and the scope it is read
-under. It is a gate-tier measurement of one machine and it is not a claim against any
-competitor.
+not pay. `docs/benchmarks.md` carries the measured comparison and the scope it is read under.
+It is a gate-tier measurement of one machine and it is not a claim against any competitor.
 
 The next section states goals. Read no sentence in it as current behavior.
 
