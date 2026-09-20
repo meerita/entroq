@@ -287,6 +287,19 @@ fn abort_to_raw(matched_bytes: usize, literals: &[u8], input_len: usize) -> bool
     shannon_scaled(literals) >= threshold
 }
 
+/// Which encoder contract a block is assembled under.
+///
+/// FAST is the shipped path. BALANCED is the production chain32 path beside it.
+/// The mode selects the matcher and the parse only; the format and the decoder
+/// never learn it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mode {
+    /// The shipped single-table greedy path.
+    Fast,
+    /// The bounded chain at depth 32 behind the chain parse.
+    Balanced,
+}
+
 /// Turns one block of input into the cheapest block type it can assemble.
 ///
 /// The emitter owns the two things a block needs and a layout does not: the parse the
@@ -298,6 +311,7 @@ pub struct Emitter {
     payload: Vec<u8>,
     policy: DecoderPolicy,
     block_bytes: usize,
+    mode: Mode,
     statistics: Statistics,
 }
 
@@ -305,16 +319,35 @@ impl Emitter {
     /// An emitter at a region start, assembling blocks of at most `block_bytes` for a decoder
     /// holding `policy`.
     ///
+    /// Selects FAST with byte-identical behavior.
+    ///
     /// # Errors
     ///
     /// Returns `InvalidParameter` when the block size is above the bytes one parse may take.
     pub fn new(policy: DecoderPolicy, block_bytes: u32) -> Result<Self, Error> {
+        Self::with_mode(policy, block_bytes, Mode::Fast)
+    }
+
+    /// An emitter at a region start, under `mode`.
+    ///
+    /// The one place mode threads into the engine: FAST builds the single-table
+    /// parser, BALANCED builds the chain32 parser. Everything downstream reads
+    /// the sequences and never the mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParameter` when the block size is above the bytes one parse may take.
+    pub fn with_mode(policy: DecoderPolicy, block_bytes: u32, mode: Mode) -> Result<Self, Error> {
         let block_bytes = usize::try_from(block_bytes).map_err(|_| Error::InvalidParameter)?;
         if block_bytes == 0 || block_bytes > MAX_PARSE_BYTES {
             return Err(Error::InvalidParameter);
         }
+        let parser = match mode {
+            Mode::Fast => Parser::new(),
+            Mode::Balanced => Parser::balanced(),
+        };
         Ok(Self {
-            parser: Parser::new(),
+            parser,
             tables: block::Encoder::at_region_start(),
             // A COMPRESSED block this emitter writes stores fewer bytes than it decodes to,
             // and an assembly that does not is never written here, so the block length is the
@@ -322,8 +355,15 @@ impl Emitter {
             payload: Vec::with_capacity(block_bytes),
             policy,
             block_bytes,
+            mode,
             statistics: Statistics::default(),
         })
+    }
+
+    /// Which contract this emitter assembles under.
+    #[must_use]
+    pub const fn mode(&self) -> Mode {
+        self.mode
     }
 
     /// What this emitter recorded about the blocks it emitted.
@@ -342,7 +382,11 @@ impl Emitter {
     /// frees it before the call returns, and those bytes are outside this figure.
     #[must_use]
     pub fn steady_state_bytes(&self) -> usize {
-        Parser::declared_bytes(self.block_bytes)
+        let declared = match self.mode {
+            Mode::Fast => Parser::declared_bytes(self.block_bytes),
+            Mode::Balanced => Parser::balanced_declared_bytes(self.block_bytes),
+        };
+        declared
             .saturating_add(self.block_bytes)
             .saturating_add(usize::try_from(self.policy.max_table_bytes()).unwrap_or(0))
     }
@@ -481,7 +525,7 @@ impl Emitter {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_BLOCK_BYTES, DEFAULT_REGION_BYTES, Emitter, Layout, abort_to_raw, log2_fixed,
+        DEFAULT_BLOCK_BYTES, DEFAULT_REGION_BYTES, Emitter, Layout, Mode, abort_to_raw, log2_fixed,
         shannon_scaled,
     };
     use crate::block;
@@ -1070,6 +1114,50 @@ mod tests {
             assert_eq!(fast, again, "determinism failed at length {len}");
             let (_, slow, _, _) = emit_both(&content, true, true, DecoderPolicy::CONSERVATIVE)?;
             assert_eq!(fast, slow, "bytes differ at length {len}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_default_emitter_stays_fast() -> Result<(), Error> {
+        let fast = Emitter::new(DecoderPolicy::CONSERVATIVE, 16_384)?;
+        assert_eq!(fast.mode(), Mode::Fast);
+        let balanced = Emitter::with_mode(DecoderPolicy::CONSERVATIVE, 16_384, Mode::Balanced)?;
+        assert_eq!(balanced.mode(), Mode::Balanced);
+        assert_eq!(Mode::Fast, Mode::Fast);
+        assert_ne!(Mode::Fast, Mode::Balanced);
+        Ok(())
+    }
+
+    #[test]
+    fn the_balanced_emitter_holds_the_chain_state() -> Result<(), Error> {
+        let fast = Emitter::new(DecoderPolicy::CONSERVATIVE, 65_536)?;
+        let balanced = Emitter::with_mode(DecoderPolicy::CONSERVATIVE, 65_536, Mode::Balanced)?;
+        let gap = balanced
+            .steady_state_bytes()
+            .saturating_sub(fast.steady_state_bytes());
+        assert_eq!(
+            gap,
+            Parser::balanced_declared_bytes(65_536).saturating_sub(Parser::declared_bytes(65_536)),
+            "the BALANCED steady state differs only by the parser declaration"
+        );
+        assert_eq!(gap, 262_144);
+        Ok(())
+    }
+
+    #[test]
+    fn the_balanced_emitter_round_trips() -> Result<(), Error> {
+        for class in Class::ALL {
+            let content = class.content(8_192);
+            let mut emitter =
+                Emitter::with_mode(DecoderPolicy::CONSERVATIVE, 8_192, Mode::Balanced)?;
+            let mut out = Vec::new();
+            let _ = emitter.emit(&content, true, true, &mut out)?;
+            assert!(
+                !out.is_empty(),
+                "BALANCED emitted nothing on {}",
+                class.name()
+            );
         }
         Ok(())
     }

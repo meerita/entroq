@@ -24,7 +24,7 @@ use crate::format::{
 };
 use crate::sequence::WINDOW;
 
-pub use crate::encode::{DEFAULT_BLOCK_BYTES, DEFAULT_REGION_BYTES, Statistics};
+pub use crate::encode::{DEFAULT_BLOCK_BYTES, DEFAULT_REGION_BYTES, Mode, Statistics};
 
 /// The bytes a streaming machine keeps for one header.
 ///
@@ -107,6 +107,8 @@ pub struct Encoder {
 impl Encoder {
     /// An encoder for `header`, using the default region and block sizes.
     ///
+    /// Selects FAST with byte-identical behavior.
+    ///
     /// # Errors
     ///
     /// Returns `InvalidParameter` when the header declares an index, which this encoder does
@@ -115,7 +117,22 @@ impl Encoder {
         Self::with_layout(header, DEFAULT_REGION_BYTES, DEFAULT_BLOCK_BYTES)
     }
 
+    /// A BALANCED encoder for `header`, using the default region and block sizes.
+    ///
+    /// Selects the production chain32 path. The mode never reaches the format;
+    /// the decoder reads the stream without learning it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParameter` when the header declares an index, which this encoder does
+    /// not write.
+    pub fn balanced(header: FrameHeader) -> Result<Self, Error> {
+        Self::balanced_with_layout(header, DEFAULT_REGION_BYTES, DEFAULT_BLOCK_BYTES)
+    }
+
     /// An encoder that stages `region_bytes` of input and cuts it into `block_bytes` blocks.
+    ///
+    /// Selects FAST with byte-identical behavior.
     ///
     /// # Errors
     ///
@@ -127,13 +144,56 @@ impl Encoder {
         region_bytes: usize,
         block_bytes: u32,
     ) -> Result<Self, Error> {
+        Self::open(header, region_bytes, block_bytes, crate::encode::Mode::Fast)
+    }
+
+    /// A BALANCED encoder that stages `region_bytes` of input and cuts it into
+    /// `block_bytes` blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParameter` when a size is zero, when the block size is above what a
+    /// block header declares or above what one parse may take, or when the header declares an
+    /// index this encoder does not write.
+    pub fn balanced_with_layout(
+        header: FrameHeader,
+        region_bytes: usize,
+        block_bytes: u32,
+    ) -> Result<Self, Error> {
+        Self::open(
+            header,
+            region_bytes,
+            block_bytes,
+            crate::encode::Mode::Balanced,
+        )
+    }
+
+    /// Opens an encoder under `mode`.
+    ///
+    /// The one place the streaming constructor threads the mode into the engine.
+    /// FAST keeps the frozen constructor; BALANCED threads the mode parameter.
+    fn open(
+        header: FrameHeader,
+        region_bytes: usize,
+        block_bytes: u32,
+        mode: crate::encode::Mode,
+    ) -> Result<Self, Error> {
         if header.index_location.is_some() {
             return Err(Error::InvalidParameter);
         }
         let layout = Layout::new(region_bytes, block_bytes)?;
         // The layout is the one authority on how long a block is, so the emitter is sized from
         // what it settled on rather than from the parameter beside it.
-        let emitter = Emitter::new(DecoderPolicy::CONSERVATIVE, layout.block_bytes())?;
+        let emitter = match mode {
+            crate::encode::Mode::Fast => {
+                Emitter::new(DecoderPolicy::CONSERVATIVE, layout.block_bytes())?
+            }
+            crate::encode::Mode::Balanced => Emitter::with_mode(
+                DecoderPolicy::CONSERVATIVE,
+                layout.block_bytes(),
+                crate::encode::Mode::Balanced,
+            )?,
+        };
         let physical = usize::try_from(layout.physical_bytes(region_bytes)?)
             .map_err(|_| Error::InvalidParameter)?;
         Ok(Self {
@@ -155,15 +215,13 @@ impl Encoder {
 
     /// The bytes this encoder holds between calls, beyond the buffers the caller passes it.
     ///
-    /// One region of staged input, the blocks that region assembles to, the parse state, the
-    /// payload scratch, the tables in force at the ceiling that bounds them, and one header
-    /// scratch. The figure does not move with the input.
+    /// One region of staged input, the blocks that region assembles to, the parse state the
+    /// mode selected, the payload scratch, the tables in force at the ceiling that bounds
+    /// them, and one header scratch. The figure does not move with the input.
     ///
     /// **This is not the peak.** Assembling one block allocates a buffer per coded section and
     /// per table it builds, in proportion to that block, and frees them before the call
-    /// returns. Those bytes are real peak memory and they are outside this figure. The peak is
-    /// measured rather than declared, because no mode declares a bound yet and a figure that
-    /// was not measured would not be one.
+    /// returns. Those bytes are real peak memory and they are outside this figure.
     #[must_use]
     pub fn steady_state_bytes(&self) -> usize {
         self.staged
@@ -179,6 +237,12 @@ impl Encoder {
     #[must_use]
     pub const fn statistics(&self) -> Statistics {
         self.emitter.statistics()
+    }
+
+    /// Which contract this encoder assembles under.
+    #[must_use]
+    pub const fn mode(&self) -> Mode {
+        self.emitter.mode()
     }
 
     /// Takes input and writes whatever the stream is ready to emit.

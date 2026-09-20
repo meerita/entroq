@@ -48,7 +48,7 @@
 //! nothing else, and no branch here reads an address.
 
 use crate::format::Error;
-use crate::matchfinder::{BoundedHashChain, SingleHash};
+use crate::matchfinder::{BoundedHashChain, CHAIN_DEPTH_BALANCED, SingleHash};
 use crate::sequence::{MIN_MATCH, Sequences, Step, WINDOW};
 use crate::simd::Kernel;
 
@@ -137,6 +137,27 @@ impl Parser {
         Self::of(Matcher::Chain(BoundedHashChain::with_kernel(kernel)))
     }
 
+    /// A BALANCED parser with no history, on the kernel this build selected.
+    ///
+    /// The production BALANCED matcher: the bounded hash chain at depth 32 behind the
+    /// same greedy chain parse the reference uses. The lazy parse arrives separately;
+    /// this constructor names the matcher the BALANCED mode parses through.
+    #[must_use]
+    pub fn balanced() -> Self {
+        Self::of(Matcher::Chain(BoundedHashChain::with_depth(
+            CHAIN_DEPTH_BALANCED,
+        )))
+    }
+
+    /// A BALANCED parser with no history, on a named kernel.
+    #[must_use]
+    pub fn balanced_with_kernel(kernel: Kernel) -> Self {
+        Self::of(Matcher::Chain(BoundedHashChain::with_depth_and_kernel(
+            CHAIN_DEPTH_BALANCED,
+            kernel,
+        )))
+    }
+
     /// The kernel the matcher compares candidates with.
     #[must_use]
     pub const fn kernel(&self) -> Kernel {
@@ -158,6 +179,14 @@ impl Parser {
         BoundedHashChain::state_bytes().saturating_add(CAPACITY)
     }
 
+    /// The bytes a BALANCED parser holds between calls, whatever the input is.
+    ///
+    /// The depth moves the walk bound only, so the figure equals the chain figure.
+    #[must_use]
+    pub const fn balanced_state_bytes() -> usize {
+        Self::chain_state_bytes()
+    }
+
     /// The bytes the parser allocates and holds, for a block of `block_bytes`.
     ///
     /// This is parser-owned allocated memory: every allocation the parser makes, held from the
@@ -171,6 +200,17 @@ impl Parser {
     #[must_use]
     pub const fn declared_bytes(block_bytes: usize) -> usize {
         Self::state_bytes()
+            .saturating_add(block_bytes)
+            .saturating_add(step_capacity(block_bytes).saturating_mul(size_of::<Step>()))
+    }
+
+    /// The bytes a BALANCED parser allocates and holds, for a block of `block_bytes`.
+    ///
+    /// Same accounting as the FAST declaration, over the chain state the BALANCED
+    /// matcher holds.
+    #[must_use]
+    pub const fn balanced_declared_bytes(block_bytes: usize) -> usize {
+        Self::balanced_state_bytes()
             .saturating_add(block_bytes)
             .saturating_add(step_capacity(block_bytes).saturating_mul(size_of::<Step>()))
     }
@@ -654,6 +694,8 @@ mod tests {
         );
         assert_eq!(Parser::declared_bytes(MAX_PARSE_BYTES), 589_840);
         assert_eq!(Parser::chain_state_bytes(), 524_288);
+        assert_eq!(Parser::balanced_state_bytes(), 524_288);
+        assert_eq!(Parser::balanced_declared_bytes(MAX_PARSE_BYTES), 851_984);
         assert_eq!(LOOKAHEAD_BYTES, MAX_MATCH_LENGTH as usize);
     }
 
@@ -872,6 +914,90 @@ mod tests {
             let mut parser = Parser::new();
             let out = round_trip(&mut parser, &data, MAX_PARSE_BYTES)?;
             assert_eq!(out, data, "{name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_balanced_parser_round_trips_and_is_deterministic() -> Result<(), Error> {
+        for shape in SHAPES {
+            let data = shape.content(100_000);
+            let mut parser = Parser::balanced();
+            let out = round_trip(&mut parser, &data, MAX_PARSE_BYTES)?;
+            assert_eq!(out, data, "balanced round trip on {}", shape.name());
+            let first = parse_all_balanced(&data)?;
+            let second = parse_all_balanced(&data)?;
+            assert_eq!(first, second, "balanced determinism on {}", shape.name());
+        }
+        Ok(())
+    }
+
+    fn parse_all_balanced(data: &[u8]) -> Result<Vec<Sequences>, Error> {
+        let mut parser = Parser::balanced();
+        let mut out = Vec::new();
+        for chunk in data.chunks(MAX_PARSE_BYTES) {
+            out.push(parser.parse(chunk)?.clone());
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn the_balanced_parser_keeps_block_continuity() -> Result<(), Error> {
+        let data = Shape::Repetitive.content(100_000);
+        let mut whole = Parser::balanced();
+        let mut split = Parser::balanced();
+        let mut first_out = Vec::new();
+        for chunk in data.chunks(MAX_PARSE_BYTES) {
+            first_out.push(whole.parse(chunk)?.clone());
+        }
+        let mut second_out = Vec::new();
+        for chunk in data.chunks(1_019) {
+            let _ = split.parse(chunk)?.clone();
+        }
+        split.reset();
+        for chunk in data.chunks(MAX_PARSE_BYTES) {
+            second_out.push(split.parse(chunk)?.clone());
+        }
+        assert_eq!(
+            first_out, second_out,
+            "a reset balanced parser is a fresh one"
+        );
+        let _ = second_out;
+        Ok(())
+    }
+
+    #[test]
+    fn every_kernel_produces_the_same_balanced_sequences() -> Result<(), Error> {
+        for shape in SHAPES {
+            let data = shape.content(40_000);
+            let mut expected: Option<Vec<Sequences>> = None;
+            for &kernel in ALL {
+                let mut parser = Parser::balanced_with_kernel(kernel);
+                assert_eq!(parser.kernel(), kernel);
+                let mut produced = Vec::new();
+                for chunk in data.chunks(MAX_PARSE_BYTES) {
+                    produced.push(parser.parse(chunk)?.clone());
+                }
+                match expected {
+                    None => expected = Some(produced),
+                    Some(ref first) => {
+                        assert_eq!(&produced, first, "{} on {}", kernel.name(), shape.name());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_balanced_block_boundary_leaves_no_position_out_of_the_chain() -> Result<(), Error> {
+        let mut parser = Parser::balanced();
+        for size in [4_096usize, 1, 3, 65_536, 700] {
+            let _ = parser.parse(&noise(size, SEED ^ 0x51))?;
+            assert!(
+                parser.inserted <= BoundedHashChain::insertable_end(parser.filled),
+                "a position the chain could not hash was recorded as inserted"
+            );
         }
         Ok(())
     }
