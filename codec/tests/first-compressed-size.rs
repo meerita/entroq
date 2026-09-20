@@ -50,6 +50,122 @@ const EARLIER_CONTENT_BYTES: u64 = 2_473_728;
 /// which is exact in integers where a ratio is not.
 const SCALE: u64 = 100_000;
 
+/// One entry's FAST frame pin: what the frame spent, its FNV-1a digest, and the
+/// raw, rle, and compressed block counts the selection rule chose.
+///
+/// The figures were measured at `master` 809df39 and at the BALANCED branch tip
+/// separately, and the two revisions produced identical streams on every entry;
+/// these pins are that identity, held by the suite from here on. The digest is
+/// over the frame length and every frame byte, so a byte that moves fails even
+/// when the length does not.
+struct Pin {
+    frame_bytes: usize,
+    digest: u64,
+    raw: u64,
+    rle: u64,
+    compressed: u64,
+}
+
+/// The eleven FAST regression pins, in the order of `ENTRIES`.
+const PINS: [Pin; 11] = [
+    Pin {
+        frame_bytes: 294,
+        digest: 0xA985_C834_E06D_53BA,
+        raw: 1,
+        rle: 0,
+        compressed: 0,
+    },
+    Pin {
+        frame_bytes: 39,
+        digest: 0xD888_79D6_523E_3A78,
+        raw: 0,
+        rle: 1,
+        compressed: 0,
+    },
+    Pin {
+        frame_bytes: 485,
+        digest: 0xA4F8_827A_2077_7070,
+        raw: 0,
+        rle: 0,
+        compressed: 1,
+    },
+    Pin {
+        frame_bytes: 193,
+        digest: 0x1E49_A6D6_D668_0625,
+        raw: 0,
+        rle: 0,
+        compressed: 1,
+    },
+    Pin {
+        frame_bytes: 4_242,
+        digest: 0x0644_0D87_B712_5F84,
+        raw: 0,
+        rle: 0,
+        compressed: 1,
+    },
+    Pin {
+        frame_bytes: 3_057,
+        digest: 0xD0B0_0D0F_020C_DA56,
+        raw: 0,
+        rle: 0,
+        compressed: 1,
+    },
+    Pin {
+        frame_bytes: 16_873,
+        digest: 0xA716_F2F5_FF3D_7692,
+        raw: 0,
+        rle: 0,
+        compressed: 1,
+    },
+    Pin {
+        frame_bytes: 13_636,
+        digest: 0x91FA_6237_37AA_6FFA,
+        raw: 0,
+        rle: 0,
+        compressed: 1,
+    },
+    Pin {
+        frame_bytes: 5_743,
+        digest: 0x8593_7121_AA19_F546,
+        raw: 0,
+        rle: 0,
+        compressed: 1,
+    },
+    Pin {
+        frame_bytes: 39,
+        digest: 0x5866_7C7B_F742_76A3,
+        raw: 0,
+        rle: 1,
+        compressed: 0,
+    },
+    Pin {
+        frame_bytes: 4_578,
+        digest: 0x149C_DE35_7193_7288,
+        raw: 0,
+        rle: 0,
+        compressed: 1,
+    },
+];
+
+/// The FNV-1a digest of a frame: its length and every byte, in order.
+///
+/// The same arithmetic the cross-revision harness used, so the pins above are
+/// the identity that comparison measured.
+fn digest(stream: &[u8]) -> u64 {
+    let mut hash = 0xCBF2_9CE4_8422_2325_u64;
+    let mix = |hash: &mut u64, value: u64| {
+        for shift in 0..8u32 {
+            *hash ^= (value >> shift.saturating_mul(8)) & 0xFF;
+            *hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+    };
+    mix(&mut hash, u64::try_from(stream.len()).unwrap_or(u64::MAX));
+    for &byte in stream {
+        mix(&mut hash, u64::from(byte));
+    }
+    hash
+}
+
 /// The frame bytes `bytes` of content cost, per hundred thousand content bytes.
 fn per_hundred_thousand(frame_bytes: usize, content: usize) -> u64 {
     let frame = u64::try_from(frame_bytes).unwrap_or(u64::MAX);
@@ -182,7 +298,9 @@ fn the_first_compressed_size_is_recorded_against_the_earlier_figure() -> Result<
     let mut content = 0_usize;
     let mut frame_bytes = 0_usize;
     let mut histogram = [0_u64; 3];
-    for (name, bytes) in ENTRIES {
+    for (index, (name, bytes)) in ENTRIES.iter().enumerate() {
+        let (name, bytes) = (*name, *bytes);
+        let pin = PINS.get(index).ok_or(Error::InvalidParameter)?;
         let path = cache.join(name);
         let Ok(whole) = std::fs::read(&path) else {
             println!(
@@ -201,6 +319,21 @@ fn the_first_compressed_size_is_recorded_against_the_earlier_figure() -> Result<
             whole.len()
         );
         let (stream, types) = frame(data)?;
+        assert_eq!(
+            stream.len(),
+            pin.frame_bytes,
+            "{name} moved from its recorded FAST frame bytes"
+        );
+        assert_eq!(
+            digest(&stream),
+            pin.digest,
+            "{name} moved from its recorded FAST frame digest at equal length"
+        );
+        assert_eq!(
+            types,
+            [pin.raw, pin.rle, pin.compressed],
+            "{name} moved from its recorded FAST block selection"
+        );
         assert_eq!(
             expand(&stream)?,
             data,
