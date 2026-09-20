@@ -19,6 +19,29 @@
 /// decoder of the format version they declare.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Temporary measurement seam for the width-selection campaign.
+///
+/// It lets the benchmark harness select the match-copy width at run time, so the three
+/// candidate widths are measured as three arms at one revision. The selected width is compiled
+/// in and this module is removed when the selection is made; it is not part of the API.
+#[cfg(feature = "width-selection")]
+pub mod width_selection {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static WIDTH: AtomicUsize = AtomicUsize::new(32);
+
+    /// Selects the match-copy width the next expansions use.
+    pub fn select(width: usize) {
+        WIDTH.store(width, Ordering::Relaxed);
+    }
+
+    /// The match-copy width currently selected.
+    #[must_use]
+    pub fn selected() -> usize {
+        WIDTH.load(Ordering::Relaxed)
+    }
+}
+
 mod block;
 mod checksum;
 mod decode;

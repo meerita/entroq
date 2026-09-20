@@ -1036,6 +1036,12 @@ fn frequencies(symbols: &[u16], alphabet: Alphabet) -> Result<Vec<u64>, Error> {
 pub fn expand(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(), Error> {
     #[cfg(test)]
     capture::record(sequences, history, out.len());
+    #[cfg(feature = "width-selection")]
+    match crate::width_selection::selected() {
+        16 => return expand_width::<16>(sequences, history, out),
+        64 => return expand_width::<64>(sequences, history, out),
+        _ => {}
+    }
     expand_width::<COPY_WIDTH>(sequences, history, out)
 }
 

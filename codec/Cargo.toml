@@ -6,5 +6,11 @@ rust-version = "1.98.1"
 license = "MIT OR Apache-2.0"
 publish = false
 
+[features]
+# Temporary measurement seam for the M9 width-selection campaign. It lets the benchmark
+# harness select a match-copy width at run time so the three candidates are measured at one
+# revision. It is removed when the width is selected.
+width-selection = []
+
 [lints]
 workspace = true
