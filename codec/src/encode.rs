@@ -23,7 +23,8 @@ use crate::format::{
     BLOCK_HEADER_BYTES, BlockHeader, BlockType, DecoderPolicy, Error, IntegrityMode,
     MAX_BLOCK_BYTES, RegionHeader,
 };
-use crate::parser::{MAX_PARSE_BYTES, Parser};
+use crate::parser::{MAX_PARSE_BYTES, Parser, step_capacity};
+use crate::sequence::Alphabet;
 
 /// The input bytes one region holds before the encoder closes it.
 ///
@@ -48,6 +49,43 @@ const EARLY_RAW_MATCHED_LIMIT: usize = 128;
 /// A block aborts to RAW only when its lower-bound code size reaches the input length minus
 /// this tolerance.
 const EARLY_RAW_TOLERANCE: usize = 512;
+
+/// The suffix bits one coded symbol carries at most.
+///
+/// Every bucketed domain ends below two to the seventeenth, and the decomposition
+/// promotes two mantissa bits into the symbol, so no symbol's raw suffix passes
+/// sixteen bits. The memory tests hold every symbol of every alphabet to this.
+const MAX_SUFFIX_BITS: u32 = 16;
+
+/// The payload bytes one coded symbol costs at most.
+///
+/// A Huffman code word stays inside the fifteen-bit length limit. A rANS symbol
+/// coded under the ten-bit table-log preference renormalizes at most two bytes:
+/// the state entering renormalization stays below two to the thirty-second while
+/// the smallest limit it is tested against stays above two to the nineteenth.
+/// The memory tests pin both caps beside the formula that reads them.
+const MAX_PAYLOAD_BYTES_PER_SYMBOL: usize = 2;
+
+/// The bytes the alphabet-scale build scratch costs at most.
+///
+/// Package-merge temporaries, encoder tables, the prologue, and the section
+/// vector headers all scale with an alphabet span and never with a block: every
+/// span stays below three hundred symbols. The memory tests measure the whole
+/// transient against the formula, so a site outgrowing this fails there.
+const BUILD_SCRATCH_BYTES: usize = 16_384;
+
+/// A policy ceiling in table units, narrowed into address units.
+///
+/// Values past the address width saturate rather than wrap. Every admitted ceiling sits far
+/// below it; the saturating arm exists so the bound stays total on any input.
+#[allow(clippy::cast_possible_truncation)]
+const fn narrow_ceiling(ceiling: u64) -> usize {
+    if ceiling > usize::MAX as u64 {
+        usize::MAX
+    } else {
+        ceiling as usize
+    }
+}
 
 /// The fractional bits the integer base-2 logarithm carries.
 const LOG_FRAC_BITS: u32 = 8;
@@ -296,7 +334,7 @@ fn abort_to_raw(matched_bytes: usize, literals: &[u8], input_len: usize) -> bool
 pub enum Mode {
     /// The shipped single-table greedy path.
     Fast,
-    /// The bounded chain at depth 32 behind the chain parse.
+    /// The bounded chain at depth 32 behind the length-lazy parse.
     Balanced,
 }
 
@@ -376,10 +414,13 @@ impl Emitter {
     ///
     /// The parse state and the payload scratch are allocated once and never grow. The tables
     /// in force are replaced per block and are counted at the ceiling the policy admits, which
-    /// is what bounds them, rather than at whatever the last block left.
+    /// is what bounds them, rather than at whatever the last block left. FAST counts the
+    /// single-table parse, BALANCED the chain parse; the payload scratch, the table ceiling,
+    /// and everything downstream are shared and named once here.
     ///
     /// This is not the peak. Assembling one block allocates in proportion to that block and
-    /// frees it before the call returns, and those bytes are outside this figure.
+    /// frees it before the call returns; `peak_bytes` bounds those bytes and `transient_bytes`
+    /// states them per site, so the two figures together are the whole of what one block costs.
     #[must_use]
     pub fn steady_state_bytes(&self) -> usize {
         let declared = match self.mode {
@@ -389,6 +430,80 @@ impl Emitter {
         declared
             .saturating_add(self.block_bytes)
             .saturating_add(usize::try_from(self.policy.max_table_bytes()).unwrap_or(0))
+    }
+
+    /// The transient bytes one block allocates and frees, for a block of `block_bytes`
+    /// under a table ceiling of `table_ceiling`.
+    ///
+    /// Every term names the production site it covers, sized from what that site reserves
+    /// or from a cap the memory tests pin beside this formula:
+    ///
+    /// ```text
+    /// symbol vectors    2 bytes per literal and per step symbol, the capacities Streams sizes
+    /// suffix buffers    3 streams, at most MAX_SUFFIX_BITS per symbol, doubled for growth
+    /// histograms        one u64 per alphabet symbol, the spans added, sized exactly
+    /// descriptions      one table per stream, at most 2 bytes per symbol of the widest span,
+    ///                   doubled for growth
+    /// payloads          fresh and one trial, at most MAX_PAYLOAD_BYTES_PER_SYMBOL per coded
+    ///                   symbol plus the per-stream flush, doubled for growth
+    /// tables            fresh tables inside the four shares, plus the held clones the reuse
+    ///                   decision carries beside them
+    /// scratch           the alphabet-scale build sites BUILD_SCRATCH_BYTES names
+    /// ```
+    ///
+    /// The formula is mode independent: both modes assemble through the same machinery and
+    /// differ only in the parse state `steady_state_bytes` already counts. It counts requested
+    /// bytes, the unit the steady-state figures use, and not resident pages.
+    // The ceiling arrives in policy units and the spans in symbols; the ceiling narrows through
+    // the check below and the spans are const-known below three hundred, so no supported
+    // target loses a bit. The divisors are non-zero consts, so the divisions are total.
+    #[allow(clippy::cast_possible_truncation, clippy::arithmetic_side_effects)]
+    #[must_use]
+    pub const fn transient_bytes(block_bytes: usize, table_ceiling: u64) -> usize {
+        let steps = step_capacity(block_bytes);
+        let symbols = block_bytes.saturating_add(steps.saturating_mul(3));
+        let symbol_vectors = block_bytes
+            .saturating_mul(2)
+            .saturating_add(steps.saturating_mul(6));
+        let suffix = steps
+            .saturating_mul(3)
+            .saturating_mul((MAX_SUFFIX_BITS as usize) / 8)
+            .saturating_add(4)
+            .saturating_mul(2);
+        let histograms = (Alphabet::total_size() as usize).saturating_mul(size_of::<u64>());
+        let descriptions = (Alphabet::max_size() as usize)
+            .saturating_mul(2)
+            .saturating_mul(4)
+            .saturating_mul(2);
+        let payloads = symbols
+            .saturating_mul(MAX_PAYLOAD_BYTES_PER_SYMBOL)
+            .saturating_add(64)
+            .saturating_add(block_bytes.saturating_mul(2).saturating_add(16))
+            .saturating_mul(2);
+        let ceiling = narrow_ceiling(table_ceiling);
+        let tables = ceiling.saturating_add(ceiling / 4);
+        symbol_vectors
+            .saturating_add(suffix)
+            .saturating_add(histograms)
+            .saturating_add(descriptions)
+            .saturating_add(payloads)
+            .saturating_add(tables)
+            .saturating_add(BUILD_SCRATCH_BYTES)
+    }
+
+    /// The bytes one block costs at most: what this emitter holds plus what it transiently
+    /// allocates while assembling that block.
+    ///
+    /// The held figure is exact from construction capacities; the transient figure is the
+    /// per-site ceiling `transient_bytes` states for this emitter's block size and policy.
+    /// A block that takes the early-RAW path costs less, never more.
+    #[must_use]
+    pub fn peak_bytes(&self) -> usize {
+        self.steady_state_bytes()
+            .saturating_add(Self::transient_bytes(
+                self.block_bytes,
+                self.policy.max_table_bytes(),
+            ))
     }
 
     /// Discards everything a region boundary discards: the parse history, the tables in force,
@@ -525,15 +640,18 @@ impl Emitter {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_BLOCK_BYTES, DEFAULT_REGION_BYTES, Emitter, Layout, Mode, abort_to_raw, log2_fixed,
+        BUILD_SCRATCH_BYTES, DEFAULT_BLOCK_BYTES, DEFAULT_REGION_BYTES, Emitter, Layout,
+        MAX_PAYLOAD_BYTES_PER_SYMBOL, MAX_SUFFIX_BITS, Mode, abort_to_raw, log2_fixed,
         shannon_scaled,
     };
     use crate::block;
+    use crate::entropy::{huffman, rans};
     use crate::format::{
         BLOCK_HEADER_BYTES, BLOCK_STREAMS, BlockHeader, BlockType, DecoderPolicy, Error,
         IntegrityMode, MAX_BLOCK_BYTES,
     };
     use crate::parser::Parser;
+    use crate::sequence::Alphabet;
 
     fn header_cost(blocks: u64) -> u64 {
         blocks.saturating_mul(BLOCK_HEADER_BYTES as u64)
@@ -1159,6 +1277,75 @@ mod tests {
                 class.name()
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn the_transient_allowances_hold_their_production_caps() -> Result<(), Error> {
+        // The two caps the payload allowance is derived under: Huffman code words stay inside
+        // the length limit, and a validated rANS table never passes the widest table log.
+        assert_eq!(huffman::LENGTH_LIMIT, 15);
+        assert_eq!(rans::TABLE_LOG_MAX, 12);
+        // The suffix allowance: no symbol carries more raw suffix than this.
+        for alphabet in Alphabet::ALL {
+            for index in 0..alphabet.size() {
+                let symbol = u16::try_from(index).map_err(|_| Error::InvalidParameter)?;
+                if alphabet.terminal() == Some(symbol) {
+                    continue;
+                }
+                let width = alphabet.suffix_width(symbol)?;
+                assert!(
+                    width <= MAX_SUFFIX_BITS,
+                    "{alphabet:?} symbol {symbol} carries {width} suffix bits"
+                );
+            }
+        }
+        // The spans the histogram and description allowances scale with: the literal byte
+        // alphabet names 256 symbols, and the run, length, and distance alphabets name 60, 28,
+        // and 61 over their coded domains.
+        assert_eq!(Alphabet::max_size(), 256);
+        assert_eq!(Alphabet::total_size(), 405);
+        assert_eq!(MAX_PAYLOAD_BYTES_PER_SYMBOL, 2);
+        assert_eq!(BUILD_SCRATCH_BYTES, 16_384);
+        Ok(())
+    }
+
+    #[test]
+    fn the_transient_formula_states_every_site_it_covers() {
+        // The composition at the default block size and ceiling, pinned so a site that moves
+        // re-pins here deliberately rather than drifting silently: symbol vectors 229 382,
+        // suffix buffers 196 628, histograms 3 240, descriptions 4 096, payloads 721 068,
+        // tables 81 920, scratch 16 384.
+        assert_eq!(Emitter::transient_bytes(65_536, 65_536), 1_252_718);
+        assert_eq!(Emitter::transient_bytes(0, 65_536), 105_838);
+    }
+
+    #[test]
+    fn the_peak_is_the_steady_state_and_the_transient() -> Result<(), Error> {
+        for mode in [Mode::Fast, Mode::Balanced] {
+            let emitter = Emitter::with_mode(DecoderPolicy::CONSERVATIVE, 65_536, mode)?;
+            assert_eq!(
+                emitter.peak_bytes(),
+                emitter
+                    .steady_state_bytes()
+                    .saturating_add(Emitter::transient_bytes(
+                        65_536,
+                        DecoderPolicy::CONSERVATIVE.max_table_bytes()
+                    )),
+                "{mode:?} peak is not its steady state and its transient"
+            );
+        }
+        let balanced = Emitter::with_mode(DecoderPolicy::CONSERVATIVE, 65_536, Mode::Balanced)?;
+        assert_eq!(balanced.steady_state_bytes(), 983_056);
+        assert_eq!(balanced.peak_bytes(), 2_235_774);
+        assert!(
+            Emitter::transient_bytes(65_536, 65_536) > Emitter::transient_bytes(1_024, 65_536),
+            "the transient does not grow with the block"
+        );
+        assert!(
+            Emitter::transient_bytes(65_536, 65_536) > Emitter::transient_bytes(65_536, 64),
+            "the transient does not grow with the ceiling"
+        );
         Ok(())
     }
 }

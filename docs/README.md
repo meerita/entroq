@@ -19,10 +19,12 @@ A page here states what Entroq does now. A page that would state intent is not w
 |---|---|---|
 | [benchmarks.md](benchmarks.md) | reference | the measurement laboratory, the corpus, the metric set, the tiers, the measurement of Entroq beside the pinned competitors, and what a number from each tier licenses |
 | [format.md](format.md) | reference | the frame, region, and block structure of a stream, the compressed block and the symbol model it carries, and what a conforming decoder accepts, refuses, and ignores |
+| [memory.md](memory.md) | explanation | the memory bound each mode declares, what the figures cover, and how they are measured |
 
 ## Pages that do not exist yet
 
-Entroq admits no mode and ships no command line tool. `benchmarks.md` carries its numbers with
+Entroq admits two encoder modes, FAST and BALANCED, and ships no command line tool.
+`benchmarks.md` carries its numbers with
 the scope they were measured under, and none of them has left a publication-tier record. The
 pages below state behavior that does not exist, so they are named here and not written.
 
@@ -30,7 +32,6 @@ pages below state behavior that does not exist, so they are named here and not w
 |---|---|---|
 | `architecture.md` | the model behind the codec | an admitted mode, and the measurements that admitted it |
 | `streaming.md` | the streaming execution model and its bounds | a measured bound for each mode |
-| `memory.md` | the memory bound each mode declares | a mode |
 | `security.md` | behavior on malformed input, and the decoder resource policy | a decoder whose hardening has been campaigned, not sampled |
 | `compatibility.md` | format versions, feature bits, and encoder generations | a frozen format version |
 | `guide/` | tasks that reach a working result | something to compress |

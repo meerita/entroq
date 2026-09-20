@@ -150,9 +150,22 @@ fn scramble(value: u64) -> u8 {
 /// Parses `total` bytes of one class in whole blocks, and reports what the interval held and
 /// how many allocations it made.
 fn parse_class(class: &str, total: u64) -> Result<(u64, u64), Error> {
+    parse_with(class, total, Parser::new)
+}
+
+/// Parses `total` bytes of one class through the parser `construct` builds, and reports what
+/// the interval held and how many allocations it made.
+///
+/// The parser is built inside the interval, so its setup allocations are in the figure and a
+/// per-block allocation would show as a count that moves with the length.
+fn parse_with(
+    class: &str,
+    total: u64,
+    construct: impl Fn() -> Parser,
+) -> Result<(u64, u64), Error> {
     let mut block = vec![0u8; MAX_PARSE_BYTES];
     let baseline = begin();
-    let mut parser = Parser::new();
+    let mut parser = construct();
     let mut done = 0u64;
     while done < total {
         let len = usize::try_from(total.saturating_sub(done))
@@ -225,6 +238,63 @@ fn the_parse_holds_no_more_than_it_declared_and_does_not_grow_with_the_input() -
         assert!(*held <= declared, "the peak passed the declared bound");
         assert_eq!(
             *made, SETUP_ALLOCATIONS,
+            "the allocation count moved with the input length at {length} bytes"
+        );
+    }
+    Ok(())
+}
+
+/// The allocations one BALANCED parser makes, whatever the input is.
+///
+/// The chain's head table and link array, the window buffer, the literal storage and the
+/// step storage: five, all at setup, and none per block. One more than the FAST figure, and
+/// the link array is the allocation.
+const BALANCED_SETUP_ALLOCATIONS: u64 = 5;
+
+#[test]
+fn the_balanced_parse_holds_no_more_than_it_declared_and_does_not_grow_with_the_input()
+-> Result<(), Error> {
+    let declared =
+        u64::try_from(Parser::balanced_declared_bytes(MAX_PARSE_BYTES)).unwrap_or(u64::MAX);
+    let state = u64::try_from(Parser::balanced_state_bytes()).unwrap_or(0);
+
+    // The declared BALANCED bound, on every input class, at one mebibyte each. The parser
+    // allocates once and reuses its storage, so the allocation count is the same on every
+    // class and the same as it is at every length below.
+    for class in CLASSES {
+        let (held, made) = parse_with(class, MIB, Parser::balanced)?;
+        assert!(
+            held <= declared,
+            "{class} held {held} bytes against a declared {declared}"
+        );
+        assert!(
+            held >= state,
+            "{class} held {held} bytes, which is less than the state the parser keeps"
+        );
+        assert_eq!(
+            made, BALANCED_SETUP_ALLOCATIONS,
+            "{class} allocated {made} times rather than once per buffer at setup"
+        );
+        println!("class {class:<16} held {held} of {declared} declared, in {made} allocations");
+    }
+
+    // The growth curve. The peak is the same figure at every length, which is what makes the
+    // bound a property of the configuration rather than of the input.
+    let mut curve = Vec::new();
+    for length in [MIB, MIB.saturating_mul(4), MIB.saturating_mul(16)] {
+        let (held, made) = parse_with("random", length, Parser::balanced)?;
+        println!("length {length:>9} held {held} of {declared} declared, in {made} allocations");
+        curve.push((length, held, made));
+    }
+    let first = curve.first().map(|point| point.1).unwrap_or_default();
+    for (length, held, made) in &curve {
+        assert_eq!(
+            *held, first,
+            "the peak moved with the input length at {length} bytes"
+        );
+        assert!(*held <= declared, "the peak passed the declared bound");
+        assert_eq!(
+            *made, BALANCED_SETUP_ALLOCATIONS,
             "the allocation count moved with the input length at {length} bytes"
         );
     }
