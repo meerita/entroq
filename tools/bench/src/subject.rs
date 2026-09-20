@@ -25,16 +25,7 @@ use crate::catalog::{self, Codec, PointGroup};
 /// shipped mode and the one the dev tier measures.
 const ENTROQ_POINTS: &[PointGroup] = &[PointGroup {
     name: "default",
-    points: &[
-        "fast",
-        "balanced",
-        "fast16",
-        "balanced16",
-        "fast64",
-        "balanced64",
-        "fastR",
-        "balancedR",
-    ],
+    points: &["fast", "balanced"],
 }];
 
 /// The identifier a segment, a directory, and a result use for this repository's codec.
@@ -209,19 +200,7 @@ mod tests {
 
     #[test]
     fn the_codec_exposes_both_modes_and_defaults_to_the_shipped_one() {
-        assert_eq!(
-            Subject::Entroq.operating_points(),
-            vec![
-                "fast",
-                "balanced",
-                "fast16",
-                "balanced16",
-                "fast64",
-                "balanced64",
-                "fastR",
-                "balancedR"
-            ]
-        );
+        assert_eq!(Subject::Entroq.operating_points(), vec!["fast", "balanced"]);
         assert_eq!(Subject::Entroq.default_point(), "fast");
         assert!(
             Subject::Entroq

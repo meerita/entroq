@@ -56,13 +56,22 @@ use crate::sequence::{Alphabet, Match, Sequences};
 /// ceiling whatever the streams of one block carry.
 const TABLE_SHARES: u64 = BLOCK_STREAMS as u64;
 
-/// The width of one match-copy chunk.
+/// The wide match-copy chunk, and the match length that admits it.
 ///
-/// Provisional at 32, pending the width measurement the selection phase runs; the kernel shape
-/// does not change with the width. A match whose distance is at least this width reads only
-/// bytes the region has already produced, so no chunk read reaches a byte the match is still
-/// to write.
-const COPY_WIDTH: usize = 32;
+/// A match whose length and validated distance are both at least these copies in wide chunks;
+/// every other eligible match copies in `SHORT_CHUNK`-byte chunks. A width is admitted only
+/// when both the match and the distance reach it, so a chunk read ends at or before the write
+/// cursor and a chunk write ends at or before the match end.
+///
+/// Measured, complete decode through the decoder over the eight registered entries at the M9
+/// selection campaign: the derived rule is the best aggregate arm in both modes. It is within
+/// one per cent of the best fixed width overall while about 20 per cent faster than it on the
+/// long-repetition entry, about 5 per cent over the fixed 32-byte width, and it adds no
+/// measurable cost on the short-match entries.
+const LONG_CHUNK: usize = 64;
+
+/// The narrow match-copy chunk.
+const SHORT_CHUNK: usize = 16;
 
 /// One COMPRESSED block, as a decoder meets it inside its region.
 #[derive(Clone, Copy, Debug)]
@@ -1036,23 +1045,18 @@ fn frequencies(symbols: &[u16], alphabet: Alphabet) -> Result<Vec<u64>, Error> {
 pub fn expand(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(), Error> {
     #[cfg(test)]
     capture::record(sequences, history, out.len());
-    #[cfg(feature = "width-selection")]
-    match crate::width_selection::selected() {
-        16 => return expand_width::<16>(sequences, history, out),
-        64 => return expand_width::<64>(sequences, history, out),
-        0 => return expand_rule(sequences, history, out),
-        _ => {}
-    }
-    expand_width::<COPY_WIDTH>(sequences, history, out)
+    expand_selected(sequences, history, out)
 }
 
-/// Temporary: the length-directed rule arm of the width-selection campaign.
+/// Expands one block, choosing the chunk width from each match's length and distance.
 ///
-/// A match of at least 64 bytes at a distance of at least 64 copies in 64-byte chunks; a
-/// shorter one copies in 16-byte chunks; a match with a distance below 16 takes the scalar
-/// path. Removed when the width is selected.
-#[cfg(feature = "width-selection")]
-fn expand_rule(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(), Error> {
+/// A match whose length and validated distance both reach a width is copied in that width's
+/// chunks, widest first; a shorter one falls to the narrower width; a match with a distance or
+/// a length below the narrow width, a true overlap, and a source that crosses the history
+/// boundary without being wholly on one side all take the scalar oracle. Every chunk read ends
+/// at or before the write cursor and every chunk write ends at or before the match end, so
+/// nothing reaches past either.
+fn expand_selected(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(), Error> {
     let literals = sequences.literals();
     let logical = out.len();
     let h = history.len();
@@ -1072,10 +1076,10 @@ fn expand_rule(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<
         let length = end
             .checked_sub(written)
             .ok_or(Error::CorruptData(Corruption::BlockContent))?;
-        let done = if length >= 64 && distance >= 64 {
-            converge::<64>(history, out, written, from, end, h)?
-        } else if length >= 16 && distance >= 16 {
-            converge::<16>(history, out, written, from, end, h)?
+        let done = if length >= LONG_CHUNK && distance >= LONG_CHUNK {
+            converge::<LONG_CHUNK>(history, out, written, from, end, h)?
+        } else if length >= SHORT_CHUNK && distance >= SHORT_CHUNK {
+            converge::<SHORT_CHUNK>(history, out, written, from, end, h)?
         } else {
             written
         };
@@ -1093,8 +1097,10 @@ fn expand_rule(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<
     Ok(())
 }
 
-/// Temporary: the bulk half of one rule arm, answering the destination it reached.
-#[cfg(feature = "width-selection")]
+/// Bulk-copies whole `K`-byte chunks of one match and answers the destination it reached.
+///
+/// A source wholly in the block output and one wholly in history have their own bulk bodies; a
+/// source that crosses the boundary is left to the caller's scalar tail.
 fn converge<const K: usize>(
     history: &[u8],
     out: &mut [u8],
@@ -1371,67 +1377,6 @@ fn copy_history_bulk<const K: usize>(
         at = at_end;
     }
     Ok(dst)
-}
-
-/// Expands one block through a width-chunked match copy with a bounded exact scalar tail.
-///
-/// A match whose validated distance is at least `K` is copied `K` bytes at a time while a
-/// whole chunk fits inside the match end; the shorter final tail, every match with a smaller
-/// distance, every true overlap, and every source that crosses the history boundary without
-/// being wholly in one of the two is copied by the scalar oracle. Every chunk read ends at or
-/// before the write cursor and every chunk write ends at or before the match end, which is the
-/// logical block output end at most. The two paths agree on every accepted byte and every
-/// refusal.
-fn expand_width<const K: usize>(
-    sequences: &Sequences,
-    history: &[u8],
-    out: &mut [u8],
-) -> Result<(), Error> {
-    let literals = sequences.literals();
-    let logical = out.len();
-    let h = history.len();
-    let mut taken = 0usize;
-    let mut written = 0usize;
-    for step in sequences.steps() {
-        let run =
-            usize::try_from(step.run).map_err(|_| Error::CorruptData(Corruption::BlockContent))?;
-        taken = copy_literals(literals, out, taken, written, run)?;
-        written = written
-            .checked_add(run)
-            .ok_or(Error::CorruptData(Corruption::BlockContent))?;
-        let Some(matched) = step.matched else {
-            continue;
-        };
-        let (from, end, distance) = admit_match(h, written, logical, matched)?;
-        let length = end
-            .checked_sub(written)
-            .ok_or(Error::CorruptData(Corruption::BlockContent))?;
-        if distance >= K {
-            let done = if from >= h {
-                copy_out_bulk::<K>(out, written, from.saturating_sub(h), end)?
-            } else if from
-                .checked_add(length)
-                .is_some_and(|source_end| source_end <= h)
-            {
-                copy_history_bulk::<K>(history, out, written, from, end)?
-            } else {
-                written
-            };
-            if done < end {
-                let rest = from
-                    .checked_add(done.saturating_sub(written))
-                    .ok_or(Error::CorruptData(Corruption::MatchReach))?;
-                copy_match_scalar(history, out, done, end, rest)?;
-            }
-        } else {
-            copy_match_scalar(history, out, written, end, from)?;
-        }
-        written = end;
-    }
-    if written != logical {
-        return Err(Error::CorruptData(Corruption::BlockContent));
-    }
-    Ok(())
 }
 
 /// Records every block expansion a test drives, so the differential can replay the exact
@@ -3699,53 +3644,54 @@ mod tests {
         Some((Sequences::new_unchecked(literals, steps), out_len))
     }
 
-    /// The kernel agrees with the oracle at every chunk boundary.
+    /// The selected width rule agrees with the oracle at every chunk boundary.
     ///
-    /// Lengths cover shorter than a chunk, exactly a chunk, one past a chunk, an exact multiple,
-    /// a remainder of one, and a remainder of `K - 1`. Distances cover below the width, exactly
-    /// the width, one past it, and a wide distance. A history of zero, one, several, and more
-    /// than a chunk covers a source entirely in the block output, entirely in history, and
-    /// crossing the boundary. A tail after the match puts the match end inside the block rather
-    /// than exactly at it, so the final partial chunk is exercised.
+    /// For each admitted width, lengths and distances cover below it, exactly it, one past it,
+    /// an exact multiple, a remainder of one, and a remainder of `K - 1`. A history of zero,
+    /// one, several, and more than a chunk covers a source entirely in the block output,
+    /// entirely in history, and crossing the boundary. A tail after the match puts the match
+    /// end inside the block rather than exactly at it, so the final partial chunk is exercised.
     #[test]
     fn the_width_chunked_kernel_agrees_at_every_chunk_boundary() {
-        let k = super::COPY_WIDTH;
-        let distances = [
-            1,
-            k.saturating_sub(1),
-            k,
-            k.saturating_add(1),
-            k.saturating_mul(2),
-        ];
-        let lengths = [
-            1,
-            k.saturating_sub(1),
-            k,
-            k.saturating_add(1),
-            k.saturating_mul(2),
-            k.saturating_mul(2).saturating_add(1),
-            k.saturating_mul(3).saturating_sub(1),
-            k.saturating_mul(3),
-        ];
         let mut cases = 0usize;
-        for history_len in [0usize, 1, 8, 64, k.saturating_add(3)] {
-            let history: Vec<u8> = (0..history_len)
-                .map(|at| u8::try_from(at & 0xFF).unwrap_or(0))
-                .collect();
-            for distance in distances {
-                for length in lengths {
-                    for run in [0usize, 1, 8, k] {
-                        for tail in [0usize, 1] {
-                            let Some((sequences, out_len)) = synthetic(run, length, distance, tail)
-                            else {
-                                continue;
-                            };
-                            assert!(
-                                agree(&sequences, &history, out_len),
-                                "distance {distance} length {length} run {run} tail {tail} \
-                                 history {history_len} diverged"
-                            );
-                            cases = cases.saturating_add(1);
+        for k in [super::SHORT_CHUNK, super::LONG_CHUNK] {
+            let distances = [
+                1,
+                k.saturating_sub(1),
+                k,
+                k.saturating_add(1),
+                k.saturating_mul(2),
+            ];
+            let lengths = [
+                1,
+                k.saturating_sub(1),
+                k,
+                k.saturating_add(1),
+                k.saturating_mul(2),
+                k.saturating_mul(2).saturating_add(1),
+                k.saturating_mul(3).saturating_sub(1),
+                k.saturating_mul(3),
+            ];
+            for history_len in [0usize, 1, 8, 64, k.saturating_add(3)] {
+                let history: Vec<u8> = (0..history_len)
+                    .map(|at| u8::try_from(at & 0xFF).unwrap_or(0))
+                    .collect();
+                for distance in distances {
+                    for length in lengths {
+                        for run in [0usize, 1, 8, k] {
+                            for tail in [0usize, 1] {
+                                let Some((sequences, out_len)) =
+                                    synthetic(run, length, distance, tail)
+                                else {
+                                    continue;
+                                };
+                                assert!(
+                                    agree(&sequences, &history, out_len),
+                                    "width {k} distance {distance} length {length} run {run} \
+                                     tail {tail} history {history_len} diverged"
+                                );
+                                cases = cases.saturating_add(1);
+                            }
                         }
                     }
                 }

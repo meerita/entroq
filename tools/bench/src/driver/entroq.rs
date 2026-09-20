@@ -54,15 +54,9 @@ impl Session {
     /// Fails when `point` names no mode this revision admits. The caller has already checked
     /// the name against the subject's declared points, so this is a guard and not a lookup.
     pub fn open(point: &str) -> Result<Self> {
-        let (balanced, width) = match point {
-            "fast" => (false, 32_usize),
-            "balanced" => (true, 32),
-            "fast16" => (false, 16),
-            "balanced16" => (true, 16),
-            "fast64" => (false, 64),
-            "balanced64" => (true, 64),
-            "fastR" => (false, 0),
-            "balancedR" => (true, 0),
+        let balanced = match point {
+            "fast" => false,
+            "balanced" => true,
             _ => {
                 return Err(Error::measure(
                     "the Entroq operating point",
@@ -70,11 +64,6 @@ impl Session {
                 ));
             }
         };
-        // Temporary: the width-selection seam. Removed when the width is selected.
-        #[cfg(feature = "width-selection")]
-        codec::width_selection::select(width);
-        #[cfg(not(feature = "width-selection"))]
-        let _ = width;
         Ok(Self {
             header: FrameHeader::new(
                 CLASS,
