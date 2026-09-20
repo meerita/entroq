@@ -47,13 +47,27 @@ fn input() -> Vec<u8> {
         .collect()
 }
 
+/// The fingerprints of both modes, over every literal byte and every step of every block.
+///
+/// The mode the parse serves is part of the identity: a fingerprint pair that moves between
+/// processes or between modes fails.
+fn fingerprints() -> Result<String, String> {
+    let fast = fingerprint(false)?;
+    let balanced = fingerprint(true)?;
+    Ok(format!("{fast:016x}-{balanced:016x}"))
+}
+
 /// A fingerprint over every literal byte and every step of every block.
 ///
 /// FNV-1a, because the value only has to differ when the parse differs and has to be the same
 /// arithmetic in both processes.
-fn fingerprint() -> Result<u64, String> {
+fn fingerprint(balanced: bool) -> Result<u64, String> {
     let data = input();
-    let mut parser = Parser::new();
+    let mut parser = if balanced {
+        Parser::balanced()
+    } else {
+        Parser::new()
+    };
     let mut hash = 0xCBF2_9CE4_8422_2325u64;
     let mut mix = |value: u64| {
         for shift in 0..8u32 {
@@ -84,13 +98,13 @@ fn fingerprint() -> Result<u64, String> {
 
 #[test]
 fn the_same_input_produces_the_same_sequences_in_another_process() -> Result<(), String> {
-    let here = fingerprint()?;
+    let here = fingerprints()?;
     if std::env::var_os(CHILD).is_some() {
-        println!("{MARKER}{here:016x}");
+        println!("{MARKER}{here}");
         return Ok(());
     }
 
-    assert_eq!(here, fingerprint()?, "two runs in one process disagree");
+    assert_eq!(here, fingerprints()?, "two runs in one process disagree");
 
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let output = Command::new(exe)
@@ -108,10 +122,6 @@ fn the_same_input_produces_the_same_sequences_in_another_process() -> Result<(),
         .lines()
         .find_map(|line| line.strip_prefix(MARKER))
         .ok_or_else(|| format!("the second process printed no fingerprint:\n{printed}"))?;
-    assert_eq!(
-        reported,
-        format!("{here:016x}"),
-        "two processes parsed one input differently"
-    );
+    assert_eq!(reported, here, "two processes parsed one input differently");
     Ok(())
 }
