@@ -100,6 +100,9 @@ pub struct Parser {
     /// The first position of `window` the chain has not been given. The FAST path inserts
     /// inline and leaves this alone.
     inserted: usize,
+    /// Whether the BALANCED parse carries the FAST skip schedule. Always true in production;
+    /// the test-only no-skip constructor clears it for the preservation comparison.
+    balanced_skip: bool,
     /// The sequences of the block last parsed. Emptied and refilled, never reallocated.
     sequences: Sequences,
 }
@@ -157,6 +160,20 @@ impl Parser {
             CHAIN_DEPTH_BALANCED,
             kernel,
         )))
+    }
+
+    /// A BALANCED parser without the skip schedule, on the kernel this build selected.
+    ///
+    /// Test-only: the preservation comparison measures the production skip path against
+    /// this no-skip path on the same inputs.
+    #[cfg(test)]
+    #[must_use]
+    pub fn balanced_without_skip() -> Self {
+        let mut parser = Self::of(Matcher::Balanced(BoundedHashChain::with_depth(
+            CHAIN_DEPTH_BALANCED,
+        )));
+        parser.balanced_skip = false;
+        parser
     }
 
     /// The kernel the matcher compares candidates with.
@@ -272,6 +289,7 @@ impl Parser {
             matcher,
             window,
             inserted,
+            balanced_skip,
             sequences,
             ..
         } = self;
@@ -285,7 +303,15 @@ impl Parser {
                 parse_chain(matcher, data, start, end, inserted, sequences)?;
             }
             Matcher::Balanced(matcher) => {
-                parse_balanced(matcher, data, start, end, inserted, sequences)?;
+                parse_balanced(
+                    matcher,
+                    data,
+                    start,
+                    end,
+                    inserted,
+                    *balanced_skip,
+                    sequences,
+                )?;
             }
         }
         Ok(sequences)
@@ -302,6 +328,7 @@ impl Parser {
             window: vec![0u8; CAPACITY].into_boxed_slice(),
             filled: 0,
             inserted: 0,
+            balanced_skip: true,
             sequences: Sequences::with_capacity(MAX_PARSE_BYTES, step_capacity(MAX_PARSE_BYTES)),
         }
     }
@@ -381,18 +408,30 @@ fn parse_fast(
 /// The insertion discipline matches the greedy chain catch-up: every position before a
 /// search is inserted exactly once, covered positions of a taken match are inserted,
 /// and tail positions the hash cannot read follow the `insertable_end` re-offer rule.
-/// There is no skip in this phase; skipped positions do not exist yet.
+///
+/// When `skip` holds, the parse carries the FAST schedule verbatim: consecutive searched
+/// misses advance the search by `skip_jump(streak)`, a taken match and each block start
+/// reset the streak, and skipped positions are never searched nor inserted. The schedule
+/// reads the streak and nothing else, so the parse stays deterministic. When `skip` is
+/// cleared the parse searches every position; only the test-only no-skip constructor
+/// clears it, for the preservation comparison.
+// The seven arguments are the block window every parse function takes, plus the skip
+// switch this parse carries for its preservation comparison: the same shape as
+// `parse_chain`, not a wider contract.
+#[allow(clippy::too_many_arguments)]
 fn parse_balanced(
     chain: &mut BoundedHashChain,
     data: &[u8],
     start: usize,
     end: usize,
     inserted: &mut usize,
+    skip: bool,
     sequences: &mut Sequences,
 ) -> Result<(), Error> {
     sequences.clear();
     let mut run_start = start;
     let mut at = start;
+    let mut streak = 0_u32;
     let mut delayed = false;
     let mut pending: Option<Option<crate::sequence::Match>> = None;
     while at < end {
@@ -406,7 +445,16 @@ fn parse_balanced(
         let Some(current) = current.filter(|found| found.length >= MIN_MATCH) else {
             chain.insert(data, at);
             *inserted = at.saturating_add(1);
-            at = at.saturating_add(1);
+            if skip {
+                streak = streak.saturating_add(1);
+                let jump = skip_jump(streak);
+                at = at.saturating_add(jump).min(end);
+                // Skipped positions stay out of the chain: the miss was searched and
+                // inserted, the jump-over positions are neither.
+                *inserted = at;
+            } else {
+                at = at.saturating_add(1);
+            }
             delayed = false;
             continue;
         };
@@ -424,6 +472,7 @@ fn parse_balanced(
             }
             at = take_end;
             run_start = at;
+            streak = 0;
             delayed = false;
             continue;
         }
@@ -446,6 +495,7 @@ fn parse_balanced(
             }
             at = take_end;
             run_start = at;
+            streak = 0;
             delayed = false;
             continue;
         };
@@ -466,6 +516,7 @@ fn parse_balanced(
         }
         at = take_end;
         run_start = at;
+        streak = 0;
         delayed = false;
     }
     if run_start < end {
@@ -523,9 +574,9 @@ fn parse_chain(
 /// least the minimum match length, so a block holds at most one step per minimum match plus
 /// the step a trailing literal run closes.
 // The divisor is the minimum match length, a non-zero format constant, so the division is
-// total.
+// total. The per-block transient sizes one vector per step, so the emitter reads this with it.
 #[allow(clippy::arithmetic_side_effects)]
-const fn step_capacity(block_bytes: usize) -> usize {
+pub(crate) const fn step_capacity(block_bytes: usize) -> usize {
     (block_bytes / MIN_MATCH as usize).saturating_add(1)
 }
 
@@ -1305,7 +1356,7 @@ mod tests {
                 }
                 previous = Some(delay.at);
             }
-            let mut parser = Parser::balanced();
+            let mut parser = Parser::balanced_without_skip();
             let parsed = parser.parse(data)?.clone();
             assert_eq!(
                 parsed, oracle_sequences,
@@ -1344,7 +1395,7 @@ mod tests {
                     delay.at
                 );
             }
-            let mut parser = Parser::balanced();
+            let mut parser = Parser::balanced_without_skip();
             let parsed = parser.parse(&data)?.clone();
             assert_eq!(
                 parsed, sequences,
@@ -1375,10 +1426,357 @@ mod tests {
                 delay.at
             );
         }
-        let mut parser = Parser::balanced();
+        let mut parser = Parser::balanced_without_skip();
         let parsed = parser.parse(&equal)?.clone();
         let (oracle_sequences, _) = lazy_oracle(&equal)?;
         assert_eq!(parsed, oracle_sequences, "equal-length tie diverged");
+        Ok(())
+    }
+
+    /// Parses `data` in one call per block through the production skip path.
+    fn parse_all_balanced_skip(data: &[u8]) -> Result<Vec<Sequences>, Error> {
+        let mut parser = Parser::balanced();
+        let mut out = Vec::new();
+        for chunk in data.chunks(MAX_PARSE_BYTES) {
+            out.push(parser.parse(chunk)?.clone());
+        }
+        Ok(out)
+    }
+
+    /// Parses `data` in one call per block through the test-only no-skip path.
+    fn parse_all_balanced_no_skip(data: &[u8]) -> Result<Vec<Sequences>, Error> {
+        let mut parser = Parser::balanced_without_skip();
+        let mut out = Vec::new();
+        for chunk in data.chunks(MAX_PARSE_BYTES) {
+            out.push(parser.parse(chunk)?.clone());
+        }
+        Ok(out)
+    }
+
+    /// The first position where the skip and no-skip parses part ways.
+    ///
+    /// Answers `None` when every block agrees. Otherwise names the block, the step,
+    /// the input position, and the expected vs produced run and match, so a structured
+    /// divergence classifies before anything changes.
+    fn skip_divergence(expected: &[Sequences], produced: &[Sequences]) -> Option<String> {
+        if expected.len() != produced.len() {
+            return Some(format!(
+                "block count differs: no-skip {} vs skip {}",
+                expected.len(),
+                produced.len()
+            ));
+        }
+        for (block, (want, got)) in expected.iter().zip(produced.iter()).enumerate() {
+            if want.steps().len() != got.steps().len() {
+                return Some(format!(
+                    "block {block}: step count differs: no-skip {} vs skip {}",
+                    want.steps().len(),
+                    got.steps().len()
+                ));
+            }
+            let mut position = block.saturating_mul(MAX_PARSE_BYTES);
+            for (step, (want, got)) in want.steps().iter().zip(got.steps().iter()).enumerate() {
+                if want == got {
+                    position =
+                        position.saturating_add(usize::try_from(want.run).unwrap_or(usize::MAX));
+                    if let Some(matched) = want.matched {
+                        position = position
+                            .saturating_add(usize::try_from(matched.length).unwrap_or(usize::MAX));
+                    }
+                    continue;
+                }
+                return Some(format!(
+                    "block {block} step {step} at {position}: no-skip run {} len {} dist {} \
+                     vs skip run {} len {} dist {}",
+                    want.run,
+                    want.matched.map_or(0, |matched| matched.length),
+                    want.matched.map_or(0, |matched| matched.distance),
+                    got.run,
+                    got.matched.map_or(0, |matched| matched.length),
+                    got.matched.map_or(0, |matched| matched.distance),
+                ));
+            }
+            if want.literals() != got.literals() {
+                return Some(format!(
+                    "block {block}: literal bytes differ ({} vs {} bytes)",
+                    want.literals().len(),
+                    got.literals().len()
+                ));
+            }
+        }
+        None
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn balanced_fast_skip_sequences_hold_the_accepted_drift() -> Result<(), Error> {
+        // The FAST schedule carried verbatim moves the structured operating point by
+        // the accepted, bounded amount: identical sequence decisions where the skip
+        // stays inert, and exactly the documented first divergence where coverage
+        // loss steps over a match start. A new divergent fixture, or a moved first
+        // divergence, is a gate failure, not a silent absorption.
+        //
+        // The byte cost is pinned by the BALANCED byte oracle; what is pinned here
+        // is where the decisions drift, including database-rows, whose block bytes
+        // keep byte identity while the sequences part ways.
+        // The accepted first divergences, no-skip vs skip, per fixture. `None`
+        // means the skip is inert there and the sequences must agree exactly.
+        const EXPECTED: [(&str, usize, Option<&str>); 8] = [
+            ("project-source-medium.rs", 65_536, None),
+            (
+                "project-logs-medium.log",
+                65_536,
+                Some(
+                    "block 0 step 0 at 0: no-skip run 122 len 6 dist 122 vs skip run 123 len 5 dist 122",
+                ),
+            ),
+            ("project-json-medium.json", 65_536, None),
+            (
+                "project-database-rows-medium.tsv",
+                65_536,
+                Some(
+                    "block 0 step 0 at 0: no-skip run 90 len 7 dist 70 vs skip run 91 len 6 dist 70",
+                ),
+            ),
+            (
+                "project-long-repetitions-medium.bin",
+                65_536,
+                Some(
+                    "block 0 step 0 at 0: no-skip run 4096 len 256 dist 4096 vs skip run 4102 len 256 dist 4096",
+                ),
+            ),
+            (
+                "project-serialized-binary-medium.bin",
+                65_536,
+                Some("block 0: step count differs: no-skip 1943 vs skip 1935"),
+            ),
+            ("project-json-medium.json", 262_144, None),
+            (
+                "project-database-rows-medium.tsv",
+                262_144,
+                Some(
+                    "block 0 step 0 at 0: no-skip run 90 len 7 dist 70 vs skip run 91 len 6 dist 70",
+                ),
+            ),
+        ];
+        let cache = corpus_cache();
+        if !cache.is_dir() {
+            println!(
+                "skip-preservation: {} does not hold the corpus, so nothing was measured",
+                cache.display()
+            );
+            return Ok(());
+        }
+        for (name, len, expected) in EXPECTED {
+            let path = cache.join(name);
+            let Ok(whole) = std::fs::read(&path) else {
+                println!(
+                    "skip-preservation: {} is not in the corpus, so nothing was measured",
+                    path.display()
+                );
+                return Ok(());
+            };
+            let data = whole
+                .get(..len.min(whole.len()))
+                .ok_or(Error::InvalidParameter)?;
+            assert_eq!(data.len(), len, "{name} holds {} bytes", whole.len());
+            let unskipped = parse_all_balanced_no_skip(data)?;
+            let skipped = parse_all_balanced_skip(data)?;
+            let divergence = skip_divergence(&unskipped, &skipped);
+            match expected {
+                None => assert!(
+                    divergence.is_none(),
+                    "{name} ({len} bytes): a new skip divergence appeared: {}",
+                    divergence.unwrap_or_default()
+                ),
+                Some(want) => assert_eq!(
+                    divergence.as_deref(),
+                    Some(want),
+                    "{name} ({len} bytes): the accepted drift moved or healed"
+                ),
+            }
+            if expected.is_none() {
+                println!(
+                    "skip-preservation: {name} {len} identical in {} blocks",
+                    skipped.len()
+                );
+            }
+        }
+        // Determinism of the pinned path itself: the same input cut into the
+        // same blocks produces the same skip sequences on every run.
+        for (name, data) in [
+            ("zeros", vec![0u8; 65_536]),
+            ("one-byte", vec![0x5Au8; 65_536]),
+            (
+                "periodic",
+                (0..65_536usize)
+                    .map(|at| crate::entropy::low_byte(u64::try_from(at % 7).unwrap_or(0)))
+                    .collect::<Vec<u8>>(),
+            ),
+            ("noise", noise(65_536, SEED)),
+            ("repetitive", Shape::Repetitive.content(65_536)),
+            ("incompressible", Shape::Incompressible.content(65_536)),
+        ] {
+            let first = parse_all_balanced_skip(&data)?;
+            let second = parse_all_balanced_skip(&data)?;
+            assert_eq!(first, second, "{name}: the skip parse is not deterministic");
+            let mut out = vec![0u8; data.len()];
+            let mut done = 0_usize;
+            for sequences in &first {
+                let len = usize::try_from(sequences.decoded_len()).unwrap_or(usize::MAX);
+                let (history, room) = out.split_at_mut(done);
+                let target = room.get_mut(..len).ok_or(Error::InvalidParameter)?;
+                expand(sequences, history, target)?;
+                done = done.saturating_add(len);
+            }
+            assert_eq!(
+                out, data,
+                "{name}: the skip parse did not expand to its content"
+            );
+        }
+        Ok(())
+    }
+
+    /// Samples per arm. The repository trusts a timing whose spread against the median stays
+    /// inside 0.15; the spread is printed here and the release run of this test is what the
+    /// RAW gate records, because a debug build's absolute figures are not a throughput.
+    const SAMPLES: usize = 7;
+
+    /// The spread of one timing series: slowest minus fastest over the median.
+    #[allow(clippy::arithmetic_side_effects, clippy::cast_precision_loss)]
+    fn spread(fastest: u128, slowest: u128, median: u128) -> f64 {
+        slowest.saturating_sub(fastest) as f64 / median.max(1) as f64
+    }
+
+    /// One throughput figure against another, for the printed record.
+    #[allow(clippy::cast_precision_loss)]
+    fn ratio(baseline: u64, measured: u64) -> f64 {
+        baseline as f64 / measured.max(1) as f64
+    }
+
+    /// One arm's timing: its median in picoseconds per byte and its spread.
+    type Timing = (u64, f64);
+
+    /// The median and the spread of one timing series, printed under its label.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn summarize(series: &mut [u128], label: &str) -> Timing {
+        series.sort_unstable();
+        let median = series.get(series.len() / 2).copied().unwrap_or(u128::MAX);
+        let fastest = series.first().copied().unwrap_or(0);
+        let slowest = series.last().copied().unwrap_or(0);
+        let spread = spread(fastest, slowest, median);
+        println!(
+            "raw-gate parse {label}: median {median} ps/B, min {fastest}, max {slowest}, \
+             spread {spread:.3}",
+        );
+        (u64::try_from(median).unwrap_or(u64::MAX), spread)
+    }
+
+    /// Both arms' parse cost over one input, as integer picoseconds per input byte.
+    ///
+    /// Every sample is one complete parse of the input, cut into whole blocks exactly as the
+    /// encoder cuts it, on a fresh parser so setup is included as the caller pays it. The
+    /// arms alternate inside the sample loop, so host drift lands on both rather than on one.
+    ///
+    /// Returns `(FAST_SKIP, NO_SKIP)` as one `Timing` each.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn timed_pair(data: &[u8]) -> Result<(Timing, Timing), Error> {
+        let mut skip_series = Vec::with_capacity(SAMPLES);
+        let mut no_skip_series = Vec::with_capacity(SAMPLES);
+        let bytes = u128::try_from(data.len()).map_err(|_| Error::InvalidParameter)?;
+        // One untimed pass per arm first: the pages, the branch predictors, and
+        // the allocator caches warm once, then the timed samples read steady
+        // state rather than a first-run fault.
+        for skip in [true, false] {
+            let mut parser = if skip {
+                Parser::balanced()
+            } else {
+                Parser::balanced_without_skip()
+            };
+            for chunk in data.chunks(MAX_PARSE_BYTES) {
+                let _ = parser.parse(chunk)?;
+            }
+        }
+        for sample in 0..SAMPLES {
+            let order = if sample % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            };
+            for skip in order {
+                let mut parser = if skip {
+                    Parser::balanced()
+                } else {
+                    Parser::balanced_without_skip()
+                };
+                let started = std::time::Instant::now();
+                for chunk in data.chunks(MAX_PARSE_BYTES) {
+                    let _ = parser.parse(chunk)?;
+                }
+                // Picoseconds per byte, so a release build's sub-nanosecond
+                // figure keeps its resolution instead of flooring to zero.
+                let per_byte = started.elapsed().as_nanos().saturating_mul(1_000) / bytes;
+                if skip {
+                    skip_series.push(per_byte);
+                } else {
+                    no_skip_series.push(per_byte);
+                }
+            }
+        }
+        let skip = summarize(&mut skip_series, "FAST_SKIP");
+        let no_skip = summarize(&mut no_skip_series, "NO_SKIP");
+        Ok((skip, no_skip))
+    }
+
+    /// The RAW CPU gate of the accepted skip: the production `FAST_SKIP` parse against the
+    /// test-only no-skip arm on incompressible input.
+    ///
+    /// The gate names high-entropy and already-compressed inputs at 64 KiB and 1 MiB. Both
+    /// arms run the production chain32 + length-lazy1 parse on the same bytes; the only
+    /// difference is the skip schedule. The recorded no-skip chain32 baseline this must
+    /// erase was 17.5 to 29 ns/B end to end (M27 Stage J); the gate requires a factor of at
+    /// least ten, with the environment and the spread recorded.
+    #[test]
+    fn balanced_fast_skip_recovers_the_raw_parse_cost() -> Result<(), Error> {
+        const RAW: [(&str, usize); 4] = [
+            ("project-high-entropy-medium.bin", 65_536),
+            ("project-already-compressed-medium.bin", 65_536),
+            ("project-high-entropy-medium.bin", 1_048_576),
+            ("project-already-compressed-medium.bin", 1_048_576),
+        ];
+        let cache = corpus_cache();
+        if !cache.is_dir() {
+            println!(
+                "raw-gate: {} does not hold the corpus, so nothing was measured",
+                cache.display()
+            );
+            return Ok(());
+        }
+        for (name, len) in RAW {
+            let path = cache.join(name);
+            let Ok(whole) = std::fs::read(&path) else {
+                println!(
+                    "raw-gate: {} is not in the corpus, so nothing was measured",
+                    path.display()
+                );
+                return Ok(());
+            };
+            let data = whole
+                .get(..len.min(whole.len()))
+                .ok_or(Error::InvalidParameter)?;
+            assert_eq!(data.len(), len, "{name} holds {} bytes", whole.len());
+            let ((skip_ps, skip_spread), (no_skip_ps, no_skip_spread)) = timed_pair(data)?;
+            println!(
+                "raw-gate {name} {len}: FAST_SKIP {skip_ps} ps/B (spread {skip_spread:.3}) vs \
+                 NO_SKIP {no_skip_ps} ps/B (spread {no_skip_spread:.3}), ratio {:.1}x",
+                ratio(no_skip_ps, skip_ps),
+            );
+            assert!(
+                skip_ps.saturating_mul(10) <= no_skip_ps,
+                "{name} {len}: FAST_SKIP is {skip_ps} ps/B against the no-skip {no_skip_ps}, \
+                 short of the tenfold the RAW gate requires"
+            );
+        }
         Ok(())
     }
 }

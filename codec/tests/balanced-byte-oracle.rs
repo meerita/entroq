@@ -1,16 +1,23 @@
-//! The BALANCED byte oracle before skip.
+//! The BALANCED byte oracle with the FAST skip.
 //!
-//! Pins the production chain32 + length-lazy1 path (no skip) to its recorded
+//! Pins the production chain32 + length-lazy1 + `FAST_SKIP` path to its recorded
 //! oracle block bytes: the block bytes (headers + payloads) the frozen inputs
 //! compress to, and the greedy control bytes on the same inputs. Every entry
 //! is one region cut into 64 KiB blocks, so multi-block entries prove the
 //! carried chain state, tables, and offset cache reproduce the oracle on
 //! every block, not only in total.
 //!
+//! The no-skip values stay the mechanism-selection evidence for chain32 +
+//! length-lazy1; they are not the production oracle. The accepted cost of the
+//! skip on the frozen corpus is +3 B on logs, +59 B on serialized binary,
+//! +67 B on long repetitions, 0 B on the remaining byte fixtures, with
+//! database-rows sequence drift at byte identity.
+//!
 //! A mismatch stops here: the failure names the first divergent match
 //! (position, expected vs produced length/distance) so the semantic
 //! difference is classified before anything changes. Tuning around a
-//! mismatch is forbidden.
+//! mismatch is forbidden. Sequence equality is always asserted, because byte
+//! equality hides decision drift.
 //!
 //! The corpus lives outside the repository and is materialized by the corpus
 //! tooling. A host that does not hold it reports so and measures nothing,
@@ -61,8 +68,8 @@ const ENTRIES: [Entry; 8] = [
         file: "project-logs-medium.log",
         len: 65_536,
         greedy: 15_130,
-        balanced: 14_166,
-        delta: -964,
+        balanced: 14_169,
+        delta: -961,
     },
     Entry {
         file: "project-json-medium.json",
@@ -82,15 +89,15 @@ const ENTRIES: [Entry; 8] = [
         file: "project-long-repetitions-medium.bin",
         len: 65_536,
         greedy: 4_405,
-        balanced: 4_405,
-        delta: 0,
+        balanced: 4_472,
+        delta: 67,
     },
     Entry {
         file: "project-serialized-binary-medium.bin",
         len: 65_536,
         greedy: 48_407,
-        balanced: 47_954,
-        delta: -453,
+        balanced: 48_013,
+        delta: -394,
     },
     Entry {
         file: "project-json-medium.json",
@@ -280,65 +287,104 @@ fn capped_peek(chain: &BoundedHashChain, data: &[u8], at: usize, end: usize) -> 
     }
 }
 
-/// The independent length-lazy depth-1 oracle over the whole entry.
+/// The independent length-lazy depth-1 oracle with the FAST skip, over the
+/// whole entry.
 ///
-/// One chain32 carried across the entry's 64 KiB blocks, matches capped at
-/// each block end, tail positions re-offered per the `insertable_end` rule.
-/// Written separately from the production parse so a byte mismatch has a
-/// second implementation to diverge against.
+/// One chain32 carried across the entry's 64 KiB blocks inside a sliding
+/// window staged exactly as the production parser stages it (three windows
+/// of room, slide by one window when full), so chain coordinates, the match
+/// cap at each block end, and the tail re-offer per the `insertable_end`
+/// rule all agree with production. Consecutive searched misses advance by
+/// `1 + (streak >> 6)` with the streak reset on a taken match and at each
+/// block start; skipped positions are never searched nor inserted. Written
+/// separately from the production parse so a byte mismatch has a second
+/// implementation to diverge against, and so sequence drift that keeps the
+/// bytes is still caught.
+/// The shift ramps the skip one step per sixty-four consecutive misses.
 // The division sizes one step per shortest match: the block holds at most
-// 64 KiB, so the quotient and its successor cannot overflow.
-#[allow(clippy::arithmetic_side_effects)]
+// 64 KiB, so the quotient and its successor cannot overflow. The length is the
+// whole schedule: windowing, lazy lookahead, skip, and the block tail.
+#[allow(clippy::arithmetic_side_effects, clippy::too_many_lines)]
 fn oracle_blocks(data: &[u8]) -> Result<Vec<Sequences>, Error> {
+    const WINDOW_BYTES: usize = 65_536;
+    const CAPACITY: usize = WINDOW_BYTES * 3;
+    let mut window = vec![0_u8; CAPACITY];
     let mut chain = BoundedHashChain::with_depth(CHAIN_DEPTH_BALANCED);
     let mut out = Vec::new();
+    let mut filled = 0_usize;
     let mut inserted = 0_usize;
-    let mut start = 0_usize;
-    while start < data.len() {
-        let end = start.saturating_add(BLOCK_BYTES).min(data.len());
-        let mut sequences =
-            Sequences::with_capacity(end.saturating_sub(start), end.saturating_sub(start) / 4 + 1);
+    let mut fed = 0_usize;
+    while fed < data.len() {
+        let len = data.len().saturating_sub(fed).min(BLOCK_BYTES);
+        if filled.saturating_add(len) > CAPACITY {
+            window.copy_within(WINDOW_BYTES..filled, 0);
+            filled = filled.saturating_sub(WINDOW_BYTES);
+            inserted = inserted.saturating_sub(WINDOW_BYTES);
+            chain.slide();
+        }
+        let start = filled;
+        window
+            .get_mut(start..start.saturating_add(len))
+            .ok_or(Error::InvalidParameter)?
+            .copy_from_slice(
+                data.get(fed..fed.saturating_add(len))
+                    .ok_or(Error::InvalidParameter)?,
+            );
+        filled = filled.saturating_add(len);
+        let end = filled;
+        let view = window.get(..end).ok_or(Error::InvalidParameter)?;
+        let mut sequences = Sequences::with_capacity(len, len / 4 + 1);
         let mut run_start = start;
         let mut at = start;
+        let mut streak = 0_u32;
         let mut delayed = false;
         let mut pending: Option<Option<Match>> = None;
         while at < end {
             while inserted < at {
-                chain.insert(data, inserted);
+                chain.insert(view, inserted);
                 inserted = inserted.saturating_add(1);
             }
             let current = pending
                 .take()
-                .unwrap_or_else(|| capped_peek(&chain, data, at, end));
+                .unwrap_or_else(|| capped_peek(&chain, view, at, end));
             let Some(current) = current else {
-                chain.insert(data, at);
-                inserted = at.saturating_add(1);
-                at = at.saturating_add(1);
+                chain.insert(view, at);
+                streak = streak.saturating_add(1);
+                at = at
+                    .saturating_add(
+                        1_usize.saturating_add(usize::try_from(streak >> 6).unwrap_or(usize::MAX)),
+                    )
+                    .min(end);
+                // Skipped positions stay out of the chain: the miss was searched and
+                // inserted, the jumped-over positions are neither.
+                inserted = at;
                 delayed = false;
                 continue;
             };
             if delayed {
-                let run = data.get(run_start..at).ok_or(Error::InvalidParameter)?;
+                let run = view.get(run_start..at).ok_or(Error::InvalidParameter)?;
                 sequences.push(run, Some(current))?;
-                chain.insert(data, at);
+                chain.insert(view, at);
                 inserted = at.saturating_add(1);
-                at = commit_covered(&mut chain, data, at, current, end, &mut inserted);
+                at = commit_covered(&mut chain, view, at, current, end, &mut inserted);
                 run_start = at;
+                streak = 0;
                 delayed = false;
                 continue;
             }
-            chain.insert(data, at);
+            chain.insert(view, at);
             inserted = at.saturating_add(1);
             let next = if at.saturating_add(1) < end {
-                capped_peek(&chain, data, at.saturating_add(1), end)
+                capped_peek(&chain, view, at.saturating_add(1), end)
             } else {
                 None
             };
             let Some(next) = next else {
-                let run = data.get(run_start..at).ok_or(Error::InvalidParameter)?;
+                let run = view.get(run_start..at).ok_or(Error::InvalidParameter)?;
                 sequences.push(run, Some(current))?;
-                at = commit_covered(&mut chain, data, at, current, end, &mut inserted);
+                at = commit_covered(&mut chain, view, at, current, end, &mut inserted);
                 run_start = at;
+                streak = 0;
                 delayed = false;
                 continue;
             };
@@ -348,19 +394,20 @@ fn oracle_blocks(data: &[u8]) -> Result<Vec<Sequences>, Error> {
                 delayed = true;
                 continue;
             }
-            let run = data.get(run_start..at).ok_or(Error::InvalidParameter)?;
+            let run = view.get(run_start..at).ok_or(Error::InvalidParameter)?;
             sequences.push(run, Some(current))?;
-            at = commit_covered(&mut chain, data, at, current, end, &mut inserted);
+            at = commit_covered(&mut chain, view, at, current, end, &mut inserted);
             run_start = at;
+            streak = 0;
             delayed = false;
         }
         if run_start < end {
-            let run = data.get(run_start..end).ok_or(Error::InvalidParameter)?;
+            let run = view.get(run_start..end).ok_or(Error::InvalidParameter)?;
             sequences.push(run, None)?;
         }
         inserted = inserted.min(BoundedHashChain::insertable_end(end));
         out.push(sequences);
-        start = end;
+        fed = fed.saturating_add(len);
     }
     Ok(out)
 }
@@ -389,8 +436,8 @@ fn commit_covered(
 
 /// The production BALANCED sequences over the entry's 64 KiB blocks.
 ///
-/// One parser fed block by block, so its window history carries exactly as
-/// the encoder's does.
+/// One skip-carrying parser fed block by block, so its window history
+/// carries exactly as the encoder's does.
 fn production_blocks(data: &[u8]) -> Result<Vec<Sequences>, Error> {
     let mut parser = Parser::balanced();
     let mut out = Vec::new();
@@ -459,7 +506,7 @@ fn first_divergence(expected: &[Sequences], produced: &[Sequences]) -> Option<St
 }
 
 #[test]
-fn balanced_block_bytes_match_the_oracle_before_skip() -> Result<(), Error> {
+fn balanced_block_bytes_match_the_fast_skip_oracle() -> Result<(), Error> {
     let cache = cache();
     if !cache.is_dir() {
         println!(
@@ -492,6 +539,19 @@ fn balanced_block_bytes_match_the_oracle_before_skip() -> Result<(), Error> {
         let stream = encode_balanced(data, data.len())?;
         let blocks = extract_blocks(&stream)?;
         let total: usize = blocks.iter().map(Vec::len).sum();
+        // Sequence equality is asserted on every entry, not only when the
+        // bytes move: database-rows keeps the bytes while drifting the
+        // decisions, so bytes alone cannot pin the operating point.
+        let sequences = oracle_blocks(data)?;
+        let produced = production_blocks(data)?;
+        let divergence = first_divergence(&sequences, &produced);
+        assert!(
+            divergence.is_none(),
+            "{} ({} bytes): the FAST_SKIP sequences moved: {}",
+            entry.file,
+            entry.len,
+            divergence.unwrap_or_default()
+        );
         if total != entry.balanced {
             let oracle = oracle_blocks(data).map_or_else(
                 |error| format!("the oracle itself failed: {error:?}"),
