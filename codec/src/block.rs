@@ -61,7 +61,8 @@ const TABLE_SHARES: u64 = BLOCK_STREAMS as u64;
 /// A match whose length and validated distance are both at least these copies in wide chunks;
 /// every other eligible match copies in `SHORT_CHUNK`-byte chunks. A width is admitted only
 /// when both the match and the distance reach it, so a chunk read ends at or before the write
-/// cursor and a chunk write ends at or before the match end.
+/// cursor. The final chunk may extend past the match end while it stays inside the logical
+/// block output, as the bulk bodies below state.
 ///
 /// Measured, complete decode through the decoder over the eight registered entries at the M9
 /// selection campaign: the derived rule is the best aggregate arm in both modes. It is within
@@ -1054,8 +1055,9 @@ pub fn expand(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(
 /// chunks, widest first; a shorter one falls to the narrower width; a match with a distance or
 /// a length below the narrow width, a true overlap, and a source that crosses the history
 /// boundary without being wholly on one side all take the scalar oracle. Every chunk read ends
-/// at or before the write cursor and every chunk write ends at or before the match end, so
-/// nothing reaches past either.
+/// at or before the write cursor, and every chunk write ends at or before the logical block
+/// output, so nothing reaches past either. The write cursor advances by the match length alone
+/// and never by a chunk that extended past the match end.
 fn expand_selected(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(), Error> {
     let literals = sequences.literals();
     let logical = out.len();
@@ -1100,7 +1102,10 @@ fn expand_selected(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Res
 /// Bulk-copies whole `K`-byte chunks of one match and answers the destination it reached.
 ///
 /// A source wholly in the block output and one wholly in history have their own bulk bodies; a
-/// source that crosses the boundary is left to the caller's scalar tail.
+/// source that crosses the boundary is left to the caller's scalar tail. A bulk body copies
+/// while the destination has not reached the match end and the whole chunk still ends at or
+/// before the logical block output, so the last chunk may write past the match end. The caller
+/// advances the write cursor by the match end alone, so those bytes stay logically unproduced.
 fn converge<const K: usize>(
     history: &[u8],
     out: &mut [u8],
@@ -1298,22 +1303,30 @@ fn copy_out_chunk<const K: usize>(out: &mut [u8], dst: usize, src: usize) -> Res
 
 /// Bulk-copies whole chunks of a match whose source is the current block output.
 ///
-/// Every chunk read ends at or before the write cursor because the distance is at least `K`.
-/// Only chunks whose write ends at or before the match end are copied; the caller scalars the
-/// remainder, so no write reaches past the match end. Answers the destination it reached.
+/// Because the distance is at least `K`, a chunk's source range ends at or before the current
+/// write cursor, so a chunk never reads a byte a previous chunk wrote past the match end. The
+/// final chunk may write past the match end while the whole write stays inside the logical
+/// block output; the caller scalars the remainder when a chunk would reach past it. Answers the
+/// destination it reached.
 fn copy_out_bulk<const K: usize>(
     out: &mut [u8],
     written: usize,
     src: usize,
     end: usize,
 ) -> Result<usize, Error> {
+    let block_end = out.len();
     let mut dst = written;
     let mut at = src;
-    while dst.checked_add(K).is_some_and(|chunk_end| chunk_end <= end) {
-        copy_out_chunk::<K>(out, dst, at)?;
-        dst = dst
+    while dst < end {
+        let chunk_end = dst
             .checked_add(K)
             .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+        // A chunk that would reach past the block output is the caller's scalar remainder.
+        if chunk_end > block_end {
+            break;
+        }
+        copy_out_chunk::<K>(out, dst, at)?;
+        dst = chunk_end;
         at = at
             .checked_add(K)
             .ok_or(Error::CorruptData(Corruption::MatchReach))?;
@@ -1325,8 +1338,10 @@ fn copy_out_bulk<const K: usize>(
 ///
 /// A chunk read that crosses the history/output boundary is split into a history half and an
 /// output half. The output half reads bytes at or before the write cursor because the distance
-/// is at least `K`, so no read touches a byte the match is still to write. Answers the
-/// destination it reached.
+/// is at least `K`, so no read touches a byte the match is still to write, and none touches a
+/// byte a previous chunk wrote past the match end. The final chunk may write past the match
+/// end while the whole write stays inside the logical block output. Answers the destination it
+/// reached.
 fn copy_history_bulk<const K: usize>(
     history: &[u8],
     out: &mut [u8],
@@ -1335,15 +1350,20 @@ fn copy_history_bulk<const K: usize>(
     end: usize,
 ) -> Result<usize, Error> {
     let h = history.len();
+    let block_end = out.len();
     let mut dst = written;
     let mut at = from;
-    while dst.checked_add(K).is_some_and(|chunk_end| chunk_end <= end) {
+    while dst < end {
         let at_end = at
             .checked_add(K)
             .ok_or(Error::CorruptData(Corruption::MatchReach))?;
         let dst_end = dst
             .checked_add(K)
             .ok_or(Error::CorruptData(Corruption::BlockContent))?;
+        // A chunk that would reach past the block output is the caller's scalar remainder.
+        if dst_end > block_end {
+            break;
+        }
         if at_end <= h {
             let source = history
                 .get(at..at_end)
@@ -3650,7 +3670,10 @@ mod tests {
     /// an exact multiple, a remainder of one, and a remainder of `K - 1`. A history of zero,
     /// one, several, and more than a chunk covers a source entirely in the block output,
     /// entirely in history, and crossing the boundary. A tail after the match puts the match
-    /// end inside the block rather than exactly at it, so the final partial chunk is exercised.
+    /// end inside the block rather than exactly at it. A tail of at least one chunk lets the
+    /// final chunk write past the match end, and a tail of zero or one byte keeps the match at
+    /// or within a chunk of the block end, so both the write-ahead span and its refusal are
+    /// exercised.
     #[test]
     fn the_width_chunked_kernel_agrees_at_every_chunk_boundary() {
         let mut cases = 0usize;
@@ -3679,7 +3702,14 @@ mod tests {
                 for distance in distances {
                     for length in lengths {
                         for run in [0usize, 1, 8, k] {
-                            for tail in [0usize, 1] {
+                            for tail in [
+                                0usize,
+                                1,
+                                k.saturating_sub(1),
+                                k,
+                                k.saturating_add(1),
+                                k.saturating_mul(2),
+                            ] {
                                 let Some((sequences, out_len)) =
                                     synthetic(run, length, distance, tail)
                                 else {
@@ -3698,5 +3728,49 @@ mod tests {
             }
         }
         assert!(cases > 0, "no boundary case was checked");
+    }
+
+    /// A later step never reads a byte an earlier chunk wrote past its match end.
+    ///
+    /// The first match copies one whole chunk past its end. The literal run after it overwrites
+    /// that span. The second match reads from the overwritten span. Both paths must agree with
+    /// the oracle, whose produced cursor never covered the speculative bytes.
+    #[test]
+    fn a_match_never_reads_the_span_an_earlier_chunk_wrote_past_its_end() {
+        let k = super::SHORT_CHUNK;
+        let distance = k;
+        let first_length = k.saturating_mul(3).saturating_add(1);
+        let tail = k.saturating_mul(2);
+        let second_length = k;
+        let run = k;
+        let mut literals = Vec::new();
+        for index in 0..run.saturating_add(tail) {
+            literals.push(u8::try_from((index & 0xFF) ^ 0x5A).unwrap_or(0));
+        }
+        let steps = vec![
+            Step {
+                run: u32::try_from(run).unwrap_or(0),
+                matched: Some(Match {
+                    length: u32::try_from(first_length).unwrap_or(0),
+                    distance: u32::try_from(distance).unwrap_or(0),
+                }),
+            },
+            Step {
+                run: u32::try_from(tail).unwrap_or(0),
+                matched: Some(Match {
+                    length: u32::try_from(second_length).unwrap_or(0),
+                    distance: u32::try_from(distance).unwrap_or(0),
+                }),
+            },
+        ];
+        let out_len = run
+            .saturating_add(first_length)
+            .saturating_add(tail)
+            .saturating_add(second_length);
+        let sequences = Sequences::new_unchecked(literals, steps);
+        let history: Vec<u8> = (0..k.saturating_mul(2))
+            .map(|at| u8::try_from(at & 0xFF).unwrap_or(0))
+            .collect();
+        assert!(agree(&sequences, &history, out_len));
     }
 }
