@@ -6,11 +6,14 @@
 //! One strategy: greedy over a single-entry table with an adaptive skip. The parser searches
 //! at the position it stands on, takes the match the table reports when it reaches the
 //! minimum, and never revisits the decision. Consecutive searched misses advance the search
-//! by `1 + (streak >> 6)`, so barren input costs few searches; a taken match and each block
-//! start reset the streak. Skipped positions are never searched nor inserted, and the choice
-//! between a match and a literal is the minimum match length. The reference chain at search
-//! depth 8 stays available behind a constructor, and the FAST trade it lost is measured
-//! elsewhere: shorter mean match length for an order of magnitude less search work.
+//! by `1 + (streak >> 6)`, so barren input costs few searches. The streak is scoped to the
+//! region: an accepted match resets it and the region boundary resets it, so it carries across
+//! the blocks of one region rather than restarting at each block. The table and the window
+//! already cross those block boundaries, so the streak is not a new dependency. Skipped
+//! positions are never searched nor inserted, and the choice between a match and a literal is
+//! the minimum match length. The reference chain at search depth 8 stays available behind a
+//! constructor, and the FAST trade it lost is measured elsewhere: shorter mean match length
+//! for an order of magnitude less search work.
 //!
 //! # What the parser holds
 //!
@@ -362,9 +365,9 @@ impl Parser {
 
 /// The sequences of the FAST parse of the bytes the caller staged at `start..end`.
 ///
-/// The skip schedule resets at each block start: a streak never crosses a block boundary,
-/// which is what keeps two blocks of one input parsing the same in any order the stream
-/// cuts them.
+/// The skip schedule is scoped to the region: the streak enters each block carrying the
+/// prior block's state and is written back on exit, so only an accepted match and the region
+/// boundary reset it. A block boundary resets neither.
 fn parse_fast(
     table: &mut SingleHash,
     data: &[u8],
@@ -376,7 +379,6 @@ fn parse_fast(
     sequences.clear();
     let mut run_start = start;
     let mut at = start;
-    *streak = 0;
     while at < end {
         let Some(matched) = table.search(data, at) else {
             *streak = streak.saturating_add(1);
@@ -418,11 +420,13 @@ fn parse_fast(
 /// and tail positions the hash cannot read follow the `insertable_end` re-offer rule.
 ///
 /// When `skip` holds, the parse carries the FAST schedule verbatim: consecutive searched
-/// misses advance the search by `skip_jump(streak)`, a taken match and each block start
-/// reset the streak, and skipped positions are never searched nor inserted. The schedule
-/// reads the streak and nothing else, so the parse stays deterministic. When `skip` is
-/// cleared the parse searches every position; only the test-only no-skip constructor
-/// clears it, for the preservation comparison.
+/// misses advance the search by `skip_jump(streak)`, an accepted match and the region
+/// boundary reset the streak, and skipped positions are never searched nor inserted. The
+/// streak is the same persisted field the FAST parse uses, so it carries across the blocks
+/// of one region; a block boundary resets neither. The schedule reads the streak and nothing
+/// else, so the parse stays deterministic. When `skip` is cleared the parse searches every
+/// position; only the test-only no-skip constructor clears it, for the preservation
+/// comparison.
 // The seven arguments are the block window every parse function takes, plus the skip
 // switch this parse carries for its preservation comparison: the same shape as
 // `parse_chain`, not a wider contract.
@@ -440,7 +444,6 @@ fn parse_balanced(
     sequences.clear();
     let mut run_start = start;
     let mut at = start;
-    *streak = 0;
     let mut delayed = false;
     let mut pending: Option<Option<crate::sequence::Match>> = None;
     while at < end {
