@@ -322,7 +322,9 @@ impl Encoder {
             return Err(Error::InvalidParameter);
         }
         let mut state = [RANS_L; MAX_STATES];
-        let mut out: Vec<u8> = Vec::new();
+        // An rANS stream is about one byte per symbol; reserving that leaves at most one
+        // doubling for a denser stream and none for a typical one.
+        let mut out: Vec<u8> = Vec::with_capacity(symbols.len().saturating_add(FLUSH_BYTES));
         let interleave = states.saturating_sub(1);
 
         let mut at = symbols.len();
