@@ -155,7 +155,7 @@ meaning.
 
 ## Measured numbers
 
-Source: a gate-tier campaign sealed at one revision, 48 of 48 segments, 541 seconds. It holds
+Source: a gate-tier campaign sealed at one revision, 48 of 48 segments, 516 seconds. It holds
 594 measured rows over 22 corpus entries: 44 Entroq rows, two per entry at the two operating
 points this revision exposes, and 550 competitor rows. The six tables below are the entries
 that show the most about codec behavior; the campaign measured the rest.
@@ -284,8 +284,8 @@ throughput beside it did not repeat closely even within its own segment.
 
 | Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Entroq | `fast` | 1.000 | 1048674 | 1384.9 | 0.165 | 20132.8 | 0.099 |
-| Entroq | `balanced` | 1.000 | 1048674 | 616.6 | 0.153 | 20245.9 | 0.113 |
+| Entroq | `fast` | 1.000 | 1048674 | 1896.4 | 0.166 | 20132.8 | 0.099 |
+| Entroq | `balanced` | 1.000 | 1048674 | 835.6 | 0.196 | 20245.9 | 0.113 |
 | LZ4 | `fast-1` | 0.996 | 1052690 | 27746.0 | 0.184 | 58796.5 | 0.633 |
 | LZ4 | `fast-3` | 0.996 | 1052690 | 28959.0 | 0.125 | 55069.4 | 0.120 |
 | LZ4 | `fast-5` | 0.996 | 1052690 | 26829.5 | 0.543 | 56423.6 | 0.157 |
@@ -429,8 +429,8 @@ gutenberg-shakespeare. This project's stated priority is decode-first, and the b
 buys decoder throughput as well as ratio: fewer, longer steps to expand.
 
 **Incompressible input costs the parse and nothing after it.** FAST encodes
-project-high-entropy-medium at 1385 MB/s and BALANCED at 617 MB/s, where LZ4 `fast-1` reaches
-27 746 MB/s and Snappy 33 916 MB/s. A block whose bytes are all equal is stored as RLE without
+project-high-entropy-medium at 1 896 MB/s and BALANCED at 836 MB/s, where LZ4 `fast-1` reaches
+27 931 MB/s and Snappy 33 780 MB/s. A block whose bytes are all equal is stored as RLE without
 assembly, and a block the parse finds few matches in is stored as RAW when its literal
 distribution leaves no room to code, so such a block never assembles the entropy-coded
 candidate streams. It stores the right bytes: the ratio is 1.000 and the frame is 98 bytes
@@ -612,9 +612,9 @@ Blocks:
 GAP: the encoder still parses a block it will store raw.
 
 Known:
-- Measured above: FAST at 1 385 MB/s and BALANCED at 617 MB/s on
-  incompressible input, against 27 746 MB/s for LZ4 fast-1 and 33 916 MB/s
-  for Snappy, a gap of about 20 times for FAST.
+- Measured above: FAST at 1 896 MB/s and BALANCED at 836 MB/s on
+  incompressible input, against 27 931 MB/s for LZ4 fast-1 and 33 780 MB/s
+  for Snappy, a gap of about 15 times for FAST.
 - A block the parse finds few matches in is stored as RAW without assembling
   the entropy-coded candidate streams, and a block whose bytes are all equal
   is stored as RLE without assembly. The parse itself runs either way, so the
@@ -636,8 +636,8 @@ GAP: the two operating points this revision exposes are dominated on the through
 
 Known:
 - Measured above, by the Pareto report over this campaign: FAST is dominated on 22 of 22
-  entries for ratio against encode throughput and for ratio against encoder memory, and on
-  21 of 22 for ratio against decode throughput. BALANCED is dominated on the throughput axes
+  entries for ratio against encode throughput, for ratio against encoder memory, and for ratio
+  against decode throughput. BALANCED is dominated on the throughput axes
   on every compressible entry, and non-dominated on ratio against encoder memory on seven.
 - The FAST encoder steady state is 2 818 164 bytes and the BALANCED one is 3 080 308, against
   582 680 for Zstandard level-1 and 262 200 for LZ4 hc-4, both of which also reach a higher

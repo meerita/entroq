@@ -295,8 +295,9 @@ fn capped_peek(chain: &BoundedHashChain, data: &[u8], at: usize, end: usize) -> 
 /// of room, slide by one window when full), so chain coordinates, the match
 /// cap at each block end, and the tail re-offer per the `insertable_end`
 /// rule all agree with production. Consecutive searched misses advance by
-/// `1 + (streak >> 6)` with the streak reset on a taken match and at each
-/// block start; skipped positions are never searched nor inserted. Written
+/// `1 + (streak >> 6)` with the streak reset on a taken match and at the
+/// region boundary, carried across the entry's blocks; skipped positions are
+/// never searched nor inserted. Written
 /// separately from the production parse so a byte mismatch has a second
 /// implementation to diverge against, and so sequence drift that keeps the
 /// bytes is still caught.
@@ -314,6 +315,7 @@ fn oracle_blocks(data: &[u8]) -> Result<Vec<Sequences>, Error> {
     let mut filled = 0_usize;
     let mut inserted = 0_usize;
     let mut fed = 0_usize;
+    let mut streak = 0_u32;
     while fed < data.len() {
         let len = data.len().saturating_sub(fed).min(BLOCK_BYTES);
         if filled.saturating_add(len) > CAPACITY {
@@ -336,7 +338,6 @@ fn oracle_blocks(data: &[u8]) -> Result<Vec<Sequences>, Error> {
         let mut sequences = Sequences::with_capacity(len, len / 4 + 1);
         let mut run_start = start;
         let mut at = start;
-        let mut streak = 0_u32;
         let mut delayed = false;
         let mut pending: Option<Option<Match>> = None;
         while at < end {
