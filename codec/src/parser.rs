@@ -813,9 +813,13 @@ mod tests {
         let data = Shape::Repetitive.content(120_000);
         let fresh = parse_all(&data)?;
         let mut parser = Parser::new();
-        for chunk in Shape::Random.content(120_000).chunks(MAX_PARSE_BYTES) {
+        for chunk in matchless(120_000).chunks(MAX_PARSE_BYTES) {
             let _ = parser.parse(chunk)?;
         }
+        assert!(
+            parser.streak > 0,
+            "the all-miss feed left no streak to discard"
+        );
         parser.reset();
         assert!(parser.history().is_empty());
         assert_eq!(parser.streak, 0, "reset left a miss streak behind");
@@ -870,6 +874,12 @@ mod tests {
         assert_eq!(Parser::balanced_state_bytes(), 524_288);
         assert_eq!(Parser::balanced_declared_bytes(MAX_PARSE_BYTES), 851_984);
         assert_eq!(LOOKAHEAD_BYTES, MAX_MATCH_LENGTH as usize);
+        // The struct's own size is a diagnostic, never the contract: the declared figures
+        // above are what the parser promises to hold.
+        println!(
+            "declared-bound: size_of::<Parser>() = {}",
+            size_of::<Parser>()
+        );
     }
 
     #[test]
@@ -1123,12 +1133,21 @@ mod tests {
         for chunk in data.chunks(MAX_PARSE_BYTES) {
             first_out.push(whole.parse(chunk)?.clone());
         }
+        // A region that ends mid-miss, so the reset has a large carried streak to discard.
+        for chunk in matchless(120_000).chunks(1_019) {
+            let _ = split.parse(chunk)?.clone();
+        }
+        assert!(
+            split.streak > 0,
+            "the all-miss feed left no streak to discard"
+        );
         let mut second_out = Vec::new();
         for chunk in data.chunks(1_019) {
             let _ = split.parse(chunk)?.clone();
         }
         split.reset();
         assert_eq!(split.streak, 0, "reset left a miss streak behind");
+        assert!(split.history().is_empty(), "reset kept history");
         for chunk in data.chunks(MAX_PARSE_BYTES) {
             second_out.push(split.parse(chunk)?.clone());
         }
@@ -1137,6 +1156,138 @@ mod tests {
             "a reset balanced parser is a fresh one"
         );
         let _ = second_out;
+        Ok(())
+    }
+
+    /// A deterministic sequence no match finder can match.
+    ///
+    /// The bytes are the top byte of a maximal-length 32-bit LFSR advanced one byte per
+    /// output. Every nonzero 32-bit window appears once per period, so every four-byte
+    /// window is unique over any region shorter than the period and the table reports no
+    /// candidate anywhere. That is what an all-miss schedule needs; a pseudo-random byte
+    /// stream finds four-byte collisions and is not all-miss.
+    fn matchless(len: usize) -> Vec<u8> {
+        let mut state: u32 = 0x1234_5678;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            for _ in 0..8 {
+                let feedback = ((state >> 31) ^ (state >> 21) ^ (state >> 1) ^ state) & 1;
+                state = state.wrapping_shl(1) | feedback;
+            }
+            out.push(u8::try_from(state >> 24).unwrap_or(0));
+        }
+        out
+    }
+
+    /// Simulates the region-scoped skip schedule over an all-miss region.
+    ///
+    /// Returns the streak after each block under the carry, the region's total searches under
+    /// the carry, and its total under a per-block reset. The schedule reads the streak and
+    /// nothing else, so the figures are timing-independent.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn simulate_miss_schedule(region: usize, block: usize) -> (Vec<u32>, u32, u32) {
+        let mut streaks = Vec::new();
+        let mut carry_searches = 0_u32;
+        let mut reset_searches = 0_u32;
+        let mut carry = 0_u32;
+        let mut start = 0_usize;
+        while start < region {
+            let end = start.saturating_add(block).min(region);
+            let mut at = start;
+            while at < end {
+                carry = carry.saturating_add(1);
+                carry_searches = carry_searches.saturating_add(1);
+                at = at.saturating_add(
+                    1_usize.saturating_add(usize::try_from(carry >> 6).unwrap_or(usize::MAX)),
+                );
+            }
+            streaks.push(carry);
+
+            let mut reset = 0_u32;
+            let mut at = start;
+            while at < end {
+                reset = reset.saturating_add(1);
+                reset_searches = reset_searches.saturating_add(1);
+                at = at.saturating_add(
+                    1_usize.saturating_add(usize::try_from(reset >> 6).unwrap_or(usize::MAX)),
+                );
+            }
+            start = end;
+        }
+        (streaks, carry_searches, reset_searches)
+    }
+
+    #[test]
+    fn the_region_streak_follows_the_carry_schedule_on_all_miss_input() -> Result<(), Error> {
+        const REGION: usize = 1_048_576;
+        let data = matchless(REGION);
+        let (carry_streaks, carry_searches, reset_searches) =
+            simulate_miss_schedule(REGION, MAX_PARSE_BYTES);
+        // The first block searches 2 864 positions whether or not the streak carries. The
+        // carry spends 11 557 searches over the region where a per-block reset spends 45 824,
+        // and leaves an 11 557 streak at the region end. A return to the per-block reset does
+        // not reproduce this trajectory.
+        assert_eq!(carry_streaks.first().copied(), Some(2_864));
+        assert_eq!(carry_searches, 11_557);
+        assert_eq!(reset_searches, 45_824);
+        assert_eq!(carry_streaks.last().copied(), Some(11_557));
+
+        let mut fast = Parser::new();
+        let mut balanced = Parser::balanced();
+        for (block_index, chunk) in data.chunks(MAX_PARSE_BYTES).enumerate() {
+            let expected = *carry_streaks
+                .get(block_index)
+                .ok_or(Error::InvalidParameter)?;
+            for (label, parser) in [("fast", &mut fast), ("balanced", &mut balanced)] {
+                let sequences = parser.parse(chunk)?;
+                assert!(
+                    sequences.steps().iter().all(|step| step.matched.is_none()),
+                    "{label} accepted a match on all-miss input at block {block_index}"
+                );
+                assert_eq!(
+                    parser.streak, expected,
+                    "{label} left the carry schedule at block {block_index}: {} against {expected}",
+                    parser.streak
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Parses `data` block by block and checks where an all-miss prefix meets its first match.
+    fn assert_prefix_then_match(
+        parser: &mut Parser,
+        data: &[u8],
+        label: &str,
+    ) -> Result<(), Error> {
+        let mut seen_match = false;
+        for (block_index, chunk) in data.chunks(MAX_PARSE_BYTES).enumerate() {
+            let entering = parser.streak;
+            let sequences = parser.parse(chunk)?;
+            let accepted = sequences.steps().iter().any(|step| step.matched.is_some());
+            if accepted && !seen_match {
+                seen_match = true;
+                assert!(
+                    entering >= 3_000,
+                    "{label}: the prefix built only a {entering} streak before the first match"
+                );
+                assert_eq!(
+                    parser.streak, 0,
+                    "{label}: an accepted match at block {block_index} left the streak at {}",
+                    parser.streak
+                );
+            }
+        }
+        assert!(seen_match, "{label}: no match was accepted");
+        Ok(())
+    }
+
+    #[test]
+    fn an_accepted_match_resets_the_region_streak() -> Result<(), Error> {
+        let mut data = matchless(240_000);
+        data.extend_from_slice(&Shape::Repetitive.content(160_000));
+        assert_prefix_then_match(&mut Parser::new(), &data, "fast")?;
+        assert_prefix_then_match(&mut Parser::balanced(), &data, "balanced")?;
         Ok(())
     }
 

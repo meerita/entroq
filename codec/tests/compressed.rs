@@ -191,7 +191,37 @@ fn encode_all(
     in_chunk: usize,
     out_chunk: usize,
 ) -> Result<Vec<u8>, Error> {
-    let mut encoder = Encoder::with_layout(header, region_bytes, block_bytes)?;
+    encode_all_mode(
+        false,
+        header,
+        region_bytes,
+        block_bytes,
+        data,
+        in_chunk,
+        out_chunk,
+    )
+}
+
+/// Encodes `data` through one mode, one layout, and one input/output chunking.
+///
+/// `balanced` selects the production chain32 path; FAST stays the default a caller who states
+/// no mode gets. The signature mirrors `encode_all` with the mode added, so the mode stays a
+/// parameter rather than a second copy of the drive loop.
+#[allow(clippy::too_many_arguments)]
+fn encode_all_mode(
+    balanced: bool,
+    header: FrameHeader,
+    region_bytes: usize,
+    block_bytes: u32,
+    data: &[u8],
+    in_chunk: usize,
+    out_chunk: usize,
+) -> Result<Vec<u8>, Error> {
+    let mut encoder = if balanced {
+        Encoder::balanced_with_layout(header, region_bytes, block_bytes)?
+    } else {
+        Encoder::with_layout(header, region_bytes, block_bytes)?
+    };
     let mut stream = Vec::new();
     let mut room = vec![0_u8; out_chunk.max(1)];
     let mut at = 0_usize;
@@ -450,6 +480,150 @@ fn report(segment: &str, inputs: usize, bytes: u64, histogram: Histogram) {
         histogram.line(),
         histogram.total()
     );
+}
+
+/// A deterministic sequence no match finder can match.
+///
+/// The bytes are the top byte of a maximal-length 32-bit LFSR advanced one byte per output,
+/// so every four-byte window is unique over any region shorter than the period. A pseudo-random
+/// byte stream collides and is not the all-miss run the transition bound is stated for.
+fn matchless(len: usize) -> Vec<u8> {
+    let mut state: u32 = 0x1234_5678;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        for _ in 0..8 {
+            let feedback = ((state >> 31) ^ (state >> 21) ^ (state >> 1) ^ state) & 1;
+            state = state.wrapping_shl(1) | feedback;
+        }
+        out.push(u8::try_from(state >> 24).unwrap_or(0));
+    }
+    out
+}
+
+/// The small layout the region-streak boundary tests cross.
+const STREAK_REGION_BYTES: usize = 131_072;
+const STREAK_BLOCK_BYTES: u32 = 16_384;
+
+#[test]
+fn region_streak_frames_are_invariant_to_input_chunking() -> Result<(), Error> {
+    // The streak is carried across a region's blocks, so the only cut the encoder may respond
+    // to is its layout, never the rhythm a caller feeds input. A streak that depended on the
+    // call boundary would move the frames with the input chunk size.
+    let fixtures = [
+        ("noise", Shape::Mixed.content(300_000)),
+        ("text", Shape::TextLike.content(300_000)),
+        ("records", Shape::Records.content(300_000)),
+        ("runs", Shape::Runs.content(300_000)),
+    ];
+    let chunks = [
+        300_000,
+        1,
+        7,
+        1_000,
+        STREAK_BLOCK_BYTES as usize,
+        STREAK_REGION_BYTES,
+    ];
+    for balanced in [false, true] {
+        for (name, data) in &fixtures {
+            let mut expected: Option<Vec<u8>> = None;
+            for chunk in chunks {
+                let stream = encode_all_mode(
+                    balanced,
+                    plain_header(),
+                    STREAK_REGION_BYTES,
+                    STREAK_BLOCK_BYTES,
+                    data,
+                    chunk,
+                    8_192,
+                )?;
+                match &expected {
+                    None => expected = Some(stream),
+                    Some(first) => assert_eq!(
+                        &stream, first,
+                        "{name} moved with an input chunk of {chunk} bytes (balanced {balanced})"
+                    ),
+                }
+            }
+            let stream = expected.ok_or(Error::InvalidParameter)?;
+            assert_eq!(
+                decode_all(permissive(), &stream, 8_192, 8_192)?,
+                *data,
+                "{name} did not round trip"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn the_all_miss_transition_stays_within_its_bound() -> Result<(), Error> {
+    // A long all-miss run immediately followed by a compressible run, inside one region and
+    // across a region boundary. The carried streak can skip the first searches of the
+    // compressible run, so the marginal cost of the run is compared against the same run
+    // encoded alone. The extra is bounded by the carried jump the region's own end produces,
+    // because the streak cannot exceed the misses of one region and the region boundary resets
+    // it; the across-boundary case therefore does not carry the first region's streak into the
+    // second. The measured figures are printed, not retyped.
+    let jump_bound = 1 + (STREAK_REGION_BYTES >> 6);
+    for (label, prefix_len) in [("one-region", 65_536usize), ("cross-region", 200_000)] {
+        let prefix = matchless(prefix_len);
+        let suffix = Shape::TextLike.content(400_000);
+        let mut data = prefix.clone();
+        data.extend_from_slice(&suffix);
+        for balanced in [false, true] {
+            let whole = encode_all_mode(
+                balanced,
+                plain_header(),
+                STREAK_REGION_BYTES,
+                STREAK_BLOCK_BYTES,
+                &data,
+                data.len(),
+                8_192,
+            )?;
+            let prefix_only = encode_all_mode(
+                balanced,
+                plain_header(),
+                STREAK_REGION_BYTES,
+                STREAK_BLOCK_BYTES,
+                &prefix,
+                prefix.len(),
+                8_192,
+            )?;
+            let suffix_only = encode_all_mode(
+                balanced,
+                plain_header(),
+                STREAK_REGION_BYTES,
+                STREAK_BLOCK_BYTES,
+                &suffix,
+                suffix.len(),
+                8_192,
+            )?;
+            assert_eq!(
+                decode_all(permissive(), &whole, 8_192, 8_192)?,
+                data,
+                "{label} balanced {balanced} did not round trip"
+            );
+            let transition = whole.len().saturating_sub(prefix_only.len());
+            let extra = transition.saturating_sub(suffix_only.len());
+            let bound = suffix_only.len().saturating_add(jump_bound);
+            println!(
+                "region-streak transition {label} balanced {balanced}: whole {} prefix {} \
+                 suffix {} marginal {transition} extra {extra} bound {bound} \
+                 ({jump_bound} over suffix alone)",
+                whole.len(),
+                prefix_only.len(),
+                suffix_only.len(),
+            );
+            assert!(
+                transition <= bound,
+                "{label} balanced {balanced}: the transition cost {transition} exceeds the \
+                 bound {bound}, {extra} bytes over the suffix alone ({}), above the carried \
+                 jump {jump_bound}",
+                suffix_only.len()
+            );
+        }
+    }
+    Ok(())
 }
 
 #[test]
