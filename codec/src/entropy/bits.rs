@@ -116,6 +116,20 @@ impl BitWriter {
         }
     }
 
+    /// A writer that can hold `bytes` output bytes before its buffer grows.
+    ///
+    /// A caller that knows the symbol count it is about to write reserves against it, so the
+    /// buffer does not grow one doubling at a time on the block path.
+    #[must_use]
+    pub(crate) fn with_capacity(bytes: usize) -> Self {
+        Self {
+            acc: 0,
+            held: 0,
+            out: Vec::with_capacity(bytes),
+            bits: 0,
+        }
+    }
+
     /// The bits written so far.
     #[must_use]
     pub const fn bits(&self) -> u64 {

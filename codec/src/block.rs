@@ -586,7 +586,9 @@ impl Built {
     fn write(&self, symbols: &[u16]) -> Result<BitBuf, Error> {
         match *self {
             Self::Huffman(ref code) => {
-                let mut writer = BitWriter::new();
+                // One byte per symbol is the common payload size, so reserve it and let a
+                // denser stream grow at most once instead of from empty.
+                let mut writer = BitWriter::with_capacity(symbols.len());
                 code.encoder()?.write(symbols, &mut writer)?;
                 Ok(writer.finish())
             }
