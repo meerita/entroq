@@ -56,23 +56,21 @@ use crate::sequence::{Alphabet, Match, Sequences};
 /// ceiling whatever the streams of one block carry.
 const TABLE_SHARES: u64 = BLOCK_STREAMS as u64;
 
-/// The wide match-copy chunk, and the match length that admits it.
+/// The match-copy chunk width.
 ///
-/// A match whose length and validated distance are both at least these copies in wide chunks;
-/// every other eligible match copies in `SHORT_CHUNK`-byte chunks. A width is admitted only
-/// when both the match and the distance reach it, so a chunk read ends at or before the write
-/// cursor. The final chunk may extend past the match end while it stays inside the logical
-/// block output, as the bulk bodies below state.
+/// A match whose validated distance reaches this width copies in whole chunks of it; every
+/// other match takes the scalar oracle. The distance is the only gate: the match length
+/// controls the logical production alone, and the final chunk may write past the match end
+/// while it stays inside the logical block output, as the bulk bodies below state. A width is
+/// admitted only when the distance reaches it, so a chunk read ends at or before the write
+/// cursor.
 ///
-/// Measured, complete decode through the decoder over the eight registered entries at the M9
-/// selection campaign: the derived rule is the best aggregate arm in both modes. It is within
-/// one per cent of the best fixed width overall while about 20 per cent faster than it on the
-/// long-repetition entry, about 5 per cent over the fixed 32-byte width, and it adds no
-/// measurable cost on the short-match entries.
-const LONG_CHUNK: usize = 64;
-
-/// The narrow match-copy chunk.
-const SHORT_CHUNK: usize = 16;
+/// Measured, complete decode through the decoder over the eight registered entries at one
+/// revision, interleaved against the scalar oracle: it is the simplest non-dominated policy,
+/// the best aggregate width in FAST, and within two per cent of the best in BALANCED. It
+/// removes every short-match regression and keeps about 97 per cent of the long-repetition
+/// gain; no registered entry regresses.
+const MATCH_COPY_CHUNK: usize = 32;
 
 /// One COMPRESSED block, as a decoder meets it inside its region.
 #[derive(Clone, Copy, Debug)]
@@ -1049,11 +1047,10 @@ pub fn expand(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Result<(
     expand_selected(sequences, history, out)
 }
 
-/// Expands one block, choosing the chunk width from each match's length and distance.
+/// Expands one block, copying distance-eligible matches through the width-chunked body.
 ///
-/// A match whose length and validated distance both reach a width is copied in that width's
-/// chunks, widest first; a shorter one falls to the narrower width; a match with a distance or
-/// a length below the narrow width, a true overlap, and a source that crosses the history
+/// A match whose validated distance reaches the chunk width is copied in that width's chunks;
+/// a match with a smaller distance, a true overlap, and a source that crosses the history
 /// boundary without being wholly on one side all take the scalar oracle. Every chunk read ends
 /// at or before the write cursor, and every chunk write ends at or before the logical block
 /// output, so nothing reaches past either. The write cursor advances by the match length alone
@@ -1075,13 +1072,8 @@ fn expand_selected(sequences: &Sequences, history: &[u8], out: &mut [u8]) -> Res
             continue;
         };
         let (from, end, distance) = admit_match(h, written, logical, matched)?;
-        let length = end
-            .checked_sub(written)
-            .ok_or(Error::CorruptData(Corruption::BlockContent))?;
-        let done = if length >= LONG_CHUNK && distance >= LONG_CHUNK {
-            converge::<LONG_CHUNK>(history, out, written, from, end, h)?
-        } else if length >= SHORT_CHUNK && distance >= SHORT_CHUNK {
-            converge::<SHORT_CHUNK>(history, out, written, from, end, h)?
+        let done = if distance >= MATCH_COPY_CHUNK {
+            converge::<MATCH_COPY_CHUNK>(history, out, written, from, end, h)?
         } else {
             written
         };
@@ -3664,64 +3656,61 @@ mod tests {
         Some((Sequences::new_unchecked(literals, steps), out_len))
     }
 
-    /// The selected width rule agrees with the oracle at every chunk boundary.
+    /// The width-chunked kernel agrees with the oracle at every chunk boundary.
     ///
-    /// For each admitted width, lengths and distances cover below it, exactly it, one past it,
-    /// an exact multiple, a remainder of one, and a remainder of `K - 1`. A history of zero,
-    /// one, several, and more than a chunk covers a source entirely in the block output,
-    /// entirely in history, and crossing the boundary. A tail after the match puts the match
-    /// end inside the block rather than exactly at it. A tail of at least one chunk lets the
-    /// final chunk write past the match end, and a tail of zero or one byte keeps the match at
-    /// or within a chunk of the block end, so both the write-ahead span and its refusal are
-    /// exercised.
+    /// Lengths and distances cover below the chunk width, exactly it, one past it, an exact
+    /// multiple, a remainder of one, and a remainder of `K - 1`. A history of zero, one,
+    /// several, and more than a chunk covers a source entirely in the block output, entirely
+    /// in history, and crossing the boundary. A tail after the match puts the match end inside
+    /// the block rather than exactly at it. A tail of at least one chunk lets the final chunk
+    /// write past the match end, and a tail of zero or one byte keeps the match at or within a
+    /// chunk of the block end, so both the write-ahead span and its refusal are exercised.
     #[test]
     fn the_width_chunked_kernel_agrees_at_every_chunk_boundary() {
         let mut cases = 0usize;
-        for k in [super::SHORT_CHUNK, super::LONG_CHUNK] {
-            let distances = [
-                1,
-                k.saturating_sub(1),
-                k,
-                k.saturating_add(1),
-                k.saturating_mul(2),
-            ];
-            let lengths = [
-                1,
-                k.saturating_sub(1),
-                k,
-                k.saturating_add(1),
-                k.saturating_mul(2),
-                k.saturating_mul(2).saturating_add(1),
-                k.saturating_mul(3).saturating_sub(1),
-                k.saturating_mul(3),
-            ];
-            for history_len in [0usize, 1, 8, 64, k.saturating_add(3)] {
-                let history: Vec<u8> = (0..history_len)
-                    .map(|at| u8::try_from(at & 0xFF).unwrap_or(0))
-                    .collect();
-                for distance in distances {
-                    for length in lengths {
-                        for run in [0usize, 1, 8, k] {
-                            for tail in [
-                                0usize,
-                                1,
-                                k.saturating_sub(1),
-                                k,
-                                k.saturating_add(1),
-                                k.saturating_mul(2),
-                            ] {
-                                let Some((sequences, out_len)) =
-                                    synthetic(run, length, distance, tail)
-                                else {
-                                    continue;
-                                };
-                                assert!(
-                                    agree(&sequences, &history, out_len),
-                                    "width {k} distance {distance} length {length} run {run} \
-                                     tail {tail} history {history_len} diverged"
-                                );
-                                cases = cases.saturating_add(1);
-                            }
+        let k = super::MATCH_COPY_CHUNK;
+        let distances = [
+            1,
+            k.saturating_sub(1),
+            k,
+            k.saturating_add(1),
+            k.saturating_mul(2),
+        ];
+        let lengths = [
+            1,
+            k.saturating_sub(1),
+            k,
+            k.saturating_add(1),
+            k.saturating_mul(2),
+            k.saturating_mul(2).saturating_add(1),
+            k.saturating_mul(3).saturating_sub(1),
+            k.saturating_mul(3),
+        ];
+        for history_len in [0usize, 1, 8, 64, k.saturating_add(3)] {
+            let history: Vec<u8> = (0..history_len)
+                .map(|at| u8::try_from(at & 0xFF).unwrap_or(0))
+                .collect();
+            for distance in distances {
+                for length in lengths {
+                    for run in [0usize, 1, 8, k] {
+                        for tail in [
+                            0usize,
+                            1,
+                            k.saturating_sub(1),
+                            k,
+                            k.saturating_add(1),
+                            k.saturating_mul(2),
+                        ] {
+                            let Some((sequences, out_len)) = synthetic(run, length, distance, tail)
+                            else {
+                                continue;
+                            };
+                            assert!(
+                                agree(&sequences, &history, out_len),
+                                "width {k} distance {distance} length {length} run {run} \
+                                 tail {tail} history {history_len} diverged"
+                            );
+                            cases = cases.saturating_add(1);
                         }
                     }
                 }
@@ -3737,7 +3726,7 @@ mod tests {
     /// the oracle, whose produced cursor never covered the speculative bytes.
     #[test]
     fn a_match_never_reads_the_span_an_earlier_chunk_wrote_past_its_end() {
-        let k = super::SHORT_CHUNK;
+        let k = super::MATCH_COPY_CHUNK;
         let distance = k;
         let first_length = k.saturating_mul(3).saturating_add(1);
         let tail = k.saturating_mul(2);
