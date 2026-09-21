@@ -491,6 +491,16 @@ impl Sequences {
         Ok(Self { literals, steps })
     }
 
+    /// The sequences a differential test hands both expansions, unchecked.
+    ///
+    /// The mutation matrix carries values no valid stream produces, so the domains `new`
+    /// enforces are deliberately bypassed. Test-only: production sequences always come
+    /// through `new`, `push`, or the stream decoder.
+    #[cfg(test)]
+    pub(crate) const fn new_unchecked(literals: Vec<u8>, steps: Vec<Step>) -> Self {
+        Self { literals, steps }
+    }
+
     /// Empty sequences whose storage is sized once and never grows.
     ///
     /// A producer that emits one block after another builds its storage here and reuses it,

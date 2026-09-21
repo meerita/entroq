@@ -155,7 +155,7 @@ meaning.
 
 ## Measured numbers
 
-Source: a gate-tier campaign sealed at one revision, 48 of 48 segments, 197 seconds. It holds
+Source: a gate-tier campaign sealed at one revision, 48 of 48 segments, 541 seconds. It holds
 594 measured rows over 22 corpus entries: 44 Entroq rows, two per entry at the two operating
 points this revision exposes, and 550 competitor rows. The six tables below are the entries
 that show the most about codec behavior; the campaign measured the rest.
@@ -188,8 +188,8 @@ throughput beside it did not repeat closely even within its own segment.
 
 | Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Entroq | `fast` | 10.719 | 3057 | 307.5 | 0.203 | 517.5 | 0.274 |
-| Entroq | `balanced` | 18.094 | 1811 | 141.1 | 0.189 | 807.4 | 0.151 |
+| Entroq | `fast` | 10.719 | 3057 | 288.2 | 0.327 | 784.0 | 0.200 |
+| Entroq | `balanced` | 18.094 | 1811 | 139.7 | 0.103 | 1703.6 | 0.092 |
 | LZ4 | `fast-1` | 5.587 | 5865 | 1880.6 | 0.157 | 6879.7 | 0.232 |
 | LZ4 | `fast-3` | 5.599 | 5852 | 1960.5 | 0.148 | 7246.4 | 0.196 |
 | LZ4 | `fast-5` | 5.496 | 5962 | 1921.8 | 0.155 | 7294.7 | 0.155 |
@@ -220,8 +220,8 @@ throughput beside it did not repeat closely even within its own segment.
 
 | Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Entroq | `fast` | 4.863 | 53905 | 141.8 | 0.096 | 268.5 | 0.181 |
-| Entroq | `balanced` | 6.521 | 40202 | 52.1 | 0.143 | 389.6 | 0.216 |
+| Entroq | `fast` | 4.863 | 53905 | 137.0 | 0.086 | 366.1 | 0.088 |
+| Entroq | `balanced` | 6.521 | 40202 | 53.7 | 0.131 | 512.8 | 0.125 |
 | LZ4 | `fast-1` | 3.641 | 71999 | 878.8 | 0.211 | 4411.9 | 0.092 |
 | LZ4 | `fast-3` | 3.455 | 75871 | 986.9 | 0.113 | 4688.2 | 0.055 |
 | LZ4 | `fast-5` | 3.396 | 77203 | 975.1 | 0.296 | 4762.6 | 0.049 |
@@ -252,8 +252,8 @@ throughput beside it did not repeat closely even within its own segment.
 
 | Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Entroq | `fast` | 12.233 | 85717 | 287.9 | 0.137 | 488.9 | 0.109 |
-| Entroq | `balanced` | 27.881 | 37609 | 117.3 | 0.085 | 919.9 | 0.093 |
+| Entroq | `fast` | 12.233 | 85717 | 286.4 | 0.083 | 723.6 | 0.049 |
+| Entroq | `balanced` | 27.881 | 37609 | 106.2 | 0.238 | 2012.9 | 0.113 |
 | LZ4 | `fast-1` | 6.026 | 174021 | 1784.4 | 0.076 | 6010.5 | 0.082 |
 | LZ4 | `fast-3` | 6.015 | 174315 | 1873.0 | 0.040 | 5566.4 | 0.272 |
 | LZ4 | `fast-5` | 6.005 | 174622 | 1860.6 | 0.063 | 6247.7 | 0.109 |
@@ -284,8 +284,8 @@ throughput beside it did not repeat closely even within its own segment.
 
 | Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Entroq | `fast` | 1.000 | 1048674 | 1418.3 | 0.237 | 19166.8 | 0.164 |
-| Entroq | `balanced` | 1.000 | 1048674 | 654.2 | 0.165 | 19225.5 | 0.082 |
+| Entroq | `fast` | 1.000 | 1048674 | 1384.9 | 0.165 | 20132.8 | 0.099 |
+| Entroq | `balanced` | 1.000 | 1048674 | 616.6 | 0.153 | 20245.9 | 0.113 |
 | LZ4 | `fast-1` | 0.996 | 1052690 | 27746.0 | 0.184 | 58796.5 | 0.633 |
 | LZ4 | `fast-3` | 0.996 | 1052690 | 28959.0 | 0.125 | 55069.4 | 0.120 |
 | LZ4 | `fast-5` | 0.996 | 1052690 | 26829.5 | 0.543 | 56423.6 | 0.157 |
@@ -316,8 +316,8 @@ throughput beside it did not repeat closely even within its own segment.
 
 | Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Entroq | `fast` | 2.337 | 2412291 | 73.1 | 0.018 | 153.5 | 0.036 |
-| Entroq | `balanced` | 2.685 | 2100016 | 24.8 | 0.062 | 182.0 | 0.036 |
+| Entroq | `fast` | 2.337 | 2412291 | 71.6 | 0.015 | 176.4 | 0.020 |
+| Entroq | `balanced` | 2.685 | 2100016 | 24.9 | 0.017 | 212.4 | 0.029 |
 | LZ4 | `fast-1` | 1.598 | 3527975 | 456.6 | 0.041 | 3706.0 | 0.216 |
 | LZ4 | `fast-3` | 1.455 | 3874515 | 536.7 | 0.045 | 3761.0 | 0.121 |
 | LZ4 | `fast-5` | 1.345 | 4191284 | 617.7 | 0.312 | 3615.7 | 0.141 |
@@ -348,8 +348,8 @@ throughput beside it did not repeat closely even within its own segment.
 
 | Codec | Point | Ratio | Compressed bytes | Encode MB/s | Encode spread | Decode MB/s | Decode spread |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Entroq | `fast` | 3.920 | 2139704 | 118.9 | 0.097 | 249.1 | 0.067 |
-| Entroq | `balanced` | 4.891 | 1714939 | 47.8 | 0.062 | 312.6 | 0.069 |
+| Entroq | `fast` | 3.920 | 2139704 | 121.3 | 0.017 | 302.0 | 0.014 |
+| Entroq | `balanced` | 4.891 | 1714939 | 48.7 | 0.081 | 382.2 | 0.023 |
 | LZ4 | `fast-1` | 2.874 | 2918436 | 811.2 | 0.083 | 4810.4 | 0.063 |
 | LZ4 | `fast-3` | 2.667 | 3144767 | 898.1 | 0.090 | 4911.1 | 0.099 |
 | LZ4 | `fast-5` | 2.716 | 3089031 | 914.4 | 0.217 | 4941.6 | 0.107 |
@@ -415,21 +415,21 @@ than FAST on four of the five compressible entries above. BALANCED exceeds Zstan
 on all five. Every Zstandard level above `level-1` reaches a higher ratio than FAST on all
 five, and BALANCED exceeds Zstandard up to `level-6` on project-source-medium.
 
-**FAST encodes six to nine times below LZ4 `fast-1` and Snappy, and BALANCED costs about two to
-three times FAST.** On the five compressible entries above the FAST encode gap against LZ4
-`fast-1` runs from 6.1 to 6.8 times, and against Snappy from 7.0 to 8.7 times: on
-project-source-medium FAST encodes at 288 MB/s against LZ4 `fast-1` at 1784 MB/s and Snappy at
-2427 MB/s. BALANCED encodes at 117 MB/s on the same entry.
+**FAST encodes six to seven times below LZ4 `fast-1` and seven to nine times below Snappy, and
+BALANCED costs about two to three times FAST.** On the five compressible entries above the FAST
+encode gap against LZ4 `fast-1` runs from 6.2 to 6.7 times, and against Snappy from 7.1 to 9.0
+times: on project-source-medium FAST encodes at 286 MB/s against LZ4 `fast-1` at 1784 MB/s and
+Snappy at 2427 MB/s. BALANCED encodes at 106 MB/s on the same entry.
 
 **Decode is the widest gap, and BALANCED narrows it.** Against Zstandard `level-1`, FAST
-decodes between 5.7 and 9.5 times slower on the five compressible entries and BALANCED between
-3.7 and 8.0 times slower. BALANCED decodes faster than FAST on every compressible entry:
-920 MB/s against 489 MB/s on project-source-medium, and 182 MB/s against 154 MB/s on
+decodes between 3.8 and 8.3 times slower on the five compressible entries and BALANCED between
+1.7 and 6.9 times slower. BALANCED decodes faster than FAST on every compressible entry:
+2013 MB/s against 724 MB/s on project-source-medium, and 212 MB/s against 176 MB/s on
 gutenberg-shakespeare. This project's stated priority is decode-first, and the better parse
 buys decoder throughput as well as ratio: fewer, longer steps to expand.
 
 **Incompressible input costs the parse and nothing after it.** FAST encodes
-project-high-entropy-medium at 1418 MB/s and BALANCED at 654 MB/s, where LZ4 `fast-1` reaches
+project-high-entropy-medium at 1385 MB/s and BALANCED at 617 MB/s, where LZ4 `fast-1` reaches
 27 746 MB/s and Snappy 33 916 MB/s. A block whose bytes are all equal is stored as RLE without
 assembly, and a block the parse finds few matches in is stored as RAW when its literal
 distribution leaves no room to code, so such a block never assembles the entropy-coded
@@ -445,8 +445,8 @@ four publish an encoder state size and one publishes a decoder state size.
 The Pareto report over this campaign marks a point dominated when another point for the same
 entry is equal or better in compression ratio and in the other axis of the chart, and strictly
 better in at least one of them. FAST is dominated on all 22 entries for ratio against encode
-throughput, on all 22 for ratio against encoder memory, and on 21 of the 22 for ratio against
-decode throughput; the one exception is project-zeros-medium on the decode axis. BALANCED is
+throughput, on all 22 for ratio against encoder memory, and on all 22 for ratio against
+decode throughput. BALANCED is
 dominated on the throughput axes on every compressible entry and stays non-dominated on ratio
 against encoder memory on gutenberg-shakespeare, project-large-blob,
 project-database-rows-medium, project-json-medium, project-mixed-medium,
@@ -592,8 +592,8 @@ GAP: the decode throughput is below every competitor at a comparable ratio.
 
 Known:
 - Measured above, on the five compressible entries tabled: FAST decodes
-  between 5.7 and 9.5 times below Zstandard level-1 at a ratio at or below
-  Zstandard level-1's own, and BALANCED between 3.7 and 8.0 times below it at
+  between 3.8 and 8.3 times below Zstandard level-1 at a ratio at or below
+  Zstandard level-1's own, and BALANCED between 1.7 and 6.9 times below it at
   a ratio above Zstandard level-1's own on all five.
 - Nothing in the format requires it. This revision's decoder allocates a
   symbol vector per stream, per block.
@@ -612,7 +612,7 @@ Blocks:
 GAP: the encoder still parses a block it will store raw.
 
 Known:
-- Measured above: FAST at 1 418 MB/s and BALANCED at 654 MB/s on
+- Measured above: FAST at 1 385 MB/s and BALANCED at 617 MB/s on
   incompressible input, against 27 746 MB/s for LZ4 fast-1 and 33 916 MB/s
   for Snappy, a gap of about 20 times for FAST.
 - A block the parse finds few matches in is stored as RAW without assembling
