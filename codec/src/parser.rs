@@ -103,6 +103,9 @@ pub struct Parser {
     /// Whether the BALANCED parse carries the FAST skip schedule. Always true in production;
     /// the test-only no-skip constructor clears it for the preservation comparison.
     balanced_skip: bool,
+    /// The persisted match-search miss streak, scoped to the region and reset by `reset()`.
+    /// An accepted match also zeroes it.
+    streak: u32,
     /// The sequences of the block last parsed. Emptied and refilled, never reallocated.
     sequences: Sequences,
 }
@@ -258,6 +261,7 @@ impl Parser {
         }
         self.filled = 0;
         self.inserted = 0;
+        self.streak = 0;
     }
 
     /// The sequences of one block of input.
@@ -290,6 +294,7 @@ impl Parser {
             window,
             inserted,
             balanced_skip,
+            streak,
             sequences,
             ..
         } = self;
@@ -298,7 +303,7 @@ impl Parser {
         };
 
         match matcher {
-            Matcher::Fast(matcher) => parse_fast(matcher, data, start, end, sequences)?,
+            Matcher::Fast(matcher) => parse_fast(matcher, data, start, end, streak, sequences)?,
             Matcher::Chain(matcher) => {
                 parse_chain(matcher, data, start, end, inserted, sequences)?;
             }
@@ -310,6 +315,7 @@ impl Parser {
                     end,
                     inserted,
                     *balanced_skip,
+                    streak,
                     sequences,
                 )?;
             }
@@ -329,6 +335,7 @@ impl Parser {
             filled: 0,
             inserted: 0,
             balanced_skip: true,
+            streak: 0,
             sequences: Sequences::with_capacity(MAX_PARSE_BYTES, step_capacity(MAX_PARSE_BYTES)),
         }
     }
@@ -363,19 +370,20 @@ fn parse_fast(
     data: &[u8],
     start: usize,
     end: usize,
+    streak: &mut u32,
     sequences: &mut Sequences,
 ) -> Result<(), Error> {
     sequences.clear();
     let mut run_start = start;
     let mut at = start;
-    let mut streak = 0_u32;
+    *streak = 0;
     while at < end {
         let Some(matched) = table.search(data, at) else {
-            streak = streak.saturating_add(1);
-            at = at.saturating_add(skip_jump(streak));
+            *streak = streak.saturating_add(1);
+            at = at.saturating_add(skip_jump(*streak));
             continue;
         };
-        streak = 0;
+        *streak = 0;
         let run = data.get(run_start..at).ok_or(Error::InvalidParameter)?;
         sequences.push(run, Some(matched))?;
         let from = at.saturating_add(1);
@@ -426,12 +434,13 @@ fn parse_balanced(
     end: usize,
     inserted: &mut usize,
     skip: bool,
+    streak: &mut u32,
     sequences: &mut Sequences,
 ) -> Result<(), Error> {
     sequences.clear();
     let mut run_start = start;
     let mut at = start;
-    let mut streak = 0_u32;
+    *streak = 0;
     let mut delayed = false;
     let mut pending: Option<Option<crate::sequence::Match>> = None;
     while at < end {
@@ -446,8 +455,8 @@ fn parse_balanced(
             chain.insert(data, at);
             *inserted = at.saturating_add(1);
             if skip {
-                streak = streak.saturating_add(1);
-                let jump = skip_jump(streak);
+                *streak = streak.saturating_add(1);
+                let jump = skip_jump(*streak);
                 at = at.saturating_add(jump).min(end);
                 // Skipped positions stay out of the chain: the miss was searched and
                 // inserted, the jump-over positions are neither.
@@ -472,7 +481,7 @@ fn parse_balanced(
             }
             at = take_end;
             run_start = at;
-            streak = 0;
+            *streak = 0;
             delayed = false;
             continue;
         }
@@ -495,7 +504,7 @@ fn parse_balanced(
             }
             at = take_end;
             run_start = at;
-            streak = 0;
+            *streak = 0;
             delayed = false;
             continue;
         };
@@ -516,7 +525,7 @@ fn parse_balanced(
         }
         at = take_end;
         run_start = at;
-        streak = 0;
+        *streak = 0;
         delayed = false;
     }
     if run_start < end {
@@ -806,6 +815,7 @@ mod tests {
         }
         parser.reset();
         assert!(parser.history().is_empty());
+        assert_eq!(parser.streak, 0, "reset left a miss streak behind");
         let mut after = Vec::new();
         for chunk in data.chunks(MAX_PARSE_BYTES) {
             after.push(parser.parse(chunk)?.clone());
@@ -1115,6 +1125,7 @@ mod tests {
             let _ = split.parse(chunk)?.clone();
         }
         split.reset();
+        assert_eq!(split.streak, 0, "reset left a miss streak behind");
         for chunk in data.chunks(MAX_PARSE_BYTES) {
             second_out.push(split.parse(chunk)?.clone());
         }
