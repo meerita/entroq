@@ -427,9 +427,9 @@ fn parse_fast(
 /// else, so the parse stays deterministic. When `skip` is cleared the parse searches every
 /// position; only the test-only no-skip constructor clears it, for the preservation
 /// comparison.
-// The seven arguments are the block window every parse function takes, plus the skip
-// switch this parse carries for its preservation comparison: the same shape as
-// `parse_chain`, not a wider contract.
+// The eight arguments are the block window every parse function takes, plus the skip
+// switch this parse carries for its preservation comparison and the persisted streak it
+// shares with the FAST path: the same shape as `parse_chain`, not a wider contract.
 #[allow(clippy::too_many_arguments)]
 fn parse_balanced(
     chain: &mut BoundedHashChain,
